@@ -1,0 +1,67 @@
+{
+  "project_info": {
+    "project_number": "50258061076",
+    "project_id": "taskazurah",
+    "storage_bucket": "taskazurah.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:50258061076:android:24e9e86b7e3bb441648401",
+        "android_client_info": {
+          "package_name": "com.example.parent_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD84FOaSO-9UDDOpN452qIgROtMpaoz6SI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:50258061076:android:5b72fc193b032d2e648401",
+        "android_client_info": {
+          "package_name": "com.example.parent_app_fixed"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD84FOaSO-9UDDOpN452qIgROtMpaoz6SI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:50258061076:android:99bf7d3fc09f0d2f648401",
+        "android_client_info": {
+          "package_name": "com.example.teacher_app_taskahzuhrah"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD84FOaSO-9UDDOpN452qIgROtMpaoz6SI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

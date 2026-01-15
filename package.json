@@ -1,0 +1,28 @@
+{
+  "name": "teacher_app_taskazurah",
+  "version": "1.0.0",
+  "description": "A new Flutter project.",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/myrz4/teacher_app_taskazurah.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/myrz4/teacher_app_taskazurah/issues"
+  },
+  "homepage": "https://github.com/myrz4/teacher_app_taskazurah#readme",
+  "dependencies": {
+    "firebase-admin": "^13.5.0",
+    "firebase-functions": "^6.6.0"
+  }
+}
