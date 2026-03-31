@@ -1,0 +1,256 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Custom claims (set via Admin SDK on your admin machine, NOT in JavaFX)
+    function role() {
+      return signedIn() ? request.auth.token.role : null;
+    }
+
+    function isAdmin() {
+      return role() == 'admin';
+    }
+
+    // Teacher should be recognized by custom claim only.
+    // IMPORTANT: Do NOT rely on derived-email patterns for authorization, because anyone could
+    // create an email/password account like t_<digits>@taskazurah.local and escalate privileges.
+    function isTeacher() {
+      return role() == 'teacher';
+    }
+
+    function isTeacherForTeacherDoc() {
+      return isTeacher()
+        && matchesPhoneFields(resource.data.phone, resource.data.phoneTail, resource.data.phoneE164);
+    }
+
+    function isTeacherUpdatingOwnToken() {
+      return isTeacherForTeacherDoc()
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['fcmToken']);
+    }
+
+    // Parent users typically have no custom role claim.
+    // This is used for features like "parents can view teacher directory".
+    function isParent() {
+      // Some deployments set an explicit role=parent claim.
+      return signedIn() && (role() == null || role() == 'parent');
+    }
+
+    // Parent derived email support: p_<digits>@taskazurah.local
+    function isDerivedParentEmail(email) {
+      return email != null && email.matches('^p_[0-9]+@taskazurah\\.local$');
+    }
+
+    // Helper: does the signed-in user match a phone stored in a document?
+    // Supports both:
+    // - derived email: p_<phone>@taskazurah.local (legacy email/PIN flow)
+    // - phone auth token: exact match against stored phoneE164 OR suffix match against phone/phoneTail
+    function matchesPhoneFields(phone, phoneTail, phoneE164) {
+      return signedIn() && (
+        // Derived email legacy support (parents PIN/email flow)
+        (
+          request.auth.token.email is string
+          && (
+            (
+              phone is string
+              && phone.size() > 0
+              && request.auth.token.email == ('p_' + phone + '@taskazurah.local')
+            )
+            // Robust fallback: allow derived-email access via phoneTail.
+            // Supports p_0<tail>@taskazurah.local and legacy p_60<tail>@taskazurah.local
+            || (
+              phoneTail is string
+              && phoneTail.size() > 0
+              && request.auth.token.email.matches('^p_(0|60)?' + phoneTail + '@taskazurah\\.local$')
+            )
+          )
+        )
+        || (
+          request.auth.token.phone_number is string
+          && (
+            (phoneE164 is string && phoneE164.size() > 0 && request.auth.token.phone_number == phoneE164)
+            || (phoneTail is string && phoneTail.size() > 0 && request.auth.token.phone_number.matches('.*' + phoneTail + '$'))
+            || (phone is string && phone.size() > 0 && request.auth.token.phone_number.matches('.*' + phone + '$'))
+          )
+        )
+      );
+    }
+
+    function phoneAuthEndsWith(tail) {
+      return request.auth.token.phone_number is string
+        && tail is string
+        && request.auth.token.phone_number.matches('.*' + tail + '$');
+    }
+
+    // Fallback for legacy child docs that only have parentPhoneTails[].
+    // No loops in rules, so we support up to 6 cached tails.
+    function listHasTailSuffix(tails) {
+      return tails != null && (
+        (tails.size() > 0 && phoneAuthEndsWith(tails[0]))
+        || (tails.size() > 1 && phoneAuthEndsWith(tails[1]))
+        || (tails.size() > 2 && phoneAuthEndsWith(tails[2]))
+        || (tails.size() > 3 && phoneAuthEndsWith(tails[3]))
+        || (tails.size() > 4 && phoneAuthEndsWith(tails[4]))
+        || (tails.size() > 5 && phoneAuthEndsWith(tails[5]))
+      );
+    }
+
+    function isParentForParentDoc() {
+      // parents docs in your DB use a `phone` field
+      return matchesPhoneFields(resource.data.phone, resource.data.phoneTail, resource.data.phoneE164);
+    }
+
+    // When matching a nested document (e.g. /parents/{docId}/tokens/{tokenId}),
+    // `resource` refers to the nested doc, not the parent doc.
+    // Use this helper to authorize against the actual parent document.
+    function isParentOwnerOfParentId(parentId) {
+      return signedIn()
+        && parentId is string
+        && exists(/databases/$(database)/documents/parents/$(parentId))
+        && matchesPhoneFields(
+          get(/databases/$(database)/documents/parents/$(parentId)).data.phone,
+          get(/databases/$(database)/documents/parents/$(parentId)).data.phoneTail,
+          get(/databases/$(database)/documents/parents/$(parentId)).data.phoneE164
+        );
+    }
+
+    function isParentForChildDoc() {
+      // Preferred cache field: parentPhonesE164[]
+      return (
+        signedIn()
+        && request.auth.token.phone_number is string
+        && resource.data.parentPhonesE164 != null
+        && resource.data.parentPhonesE164.hasAny([request.auth.token.phone_number])
+      )
+      || (
+        signedIn()
+        && request.auth.token.phone_number is string
+        && resource.data.parentPhoneTails != null
+        && listHasTailSuffix(resource.data.parentPhoneTails)
+      )
+      || matchesPhoneFields(resource.data.parentContact, '', '');
+    }
+
+    function isParentForAttendanceDoc() {
+      // attendance docs have `childId` and children docs are keyed by that id
+      return resource.data.childId != null
+        && exists(/databases/$(database)/documents/children/$(resource.data.childId))
+        && (
+          (
+            signedIn()
+            && request.auth.token.phone_number is string
+            && get(/databases/$(database)/documents/children/$(resource.data.childId)).data.parentPhonesE164 != null
+            && get(/databases/$(database)/documents/children/$(resource.data.childId)).data.parentPhonesE164.hasAny([request.auth.token.phone_number])
+          )
+          || (
+            signedIn()
+            && request.auth.token.phone_number is string
+            && get(/databases/$(database)/documents/children/$(resource.data.childId)).data.parentPhoneTails != null
+            && listHasTailSuffix(get(/databases/$(database)/documents/children/$(resource.data.childId)).data.parentPhoneTails)
+          )
+          || matchesPhoneFields(
+            get(/databases/$(database)/documents/children/$(resource.data.childId)).data.parentContact,
+            '',
+            ''
+          )
+        );
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Admin profiles (NOTE: do NOT store passwords here going forward)
+    match /admins/{docId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Teachers collection
+    match /teachers/{docId} {
+      // Allow a signed-in phone-auth user to read ONLY their own teacher profile,
+      // so the app can show "registered / pending approval" without exposing teacher lists.
+      // For chat + teacher directory, allow parents to read teacher list.
+      // In practice, multiple client apps may attach different role claims.
+      // Teacher directory is safe for any authenticated user (not public).
+      allow read: if signedIn();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || isTeacherUpdatingOwnToken();
+    }
+
+    // Parents collection
+    match /parents/{docId} {
+      allow read: if isAdmin() || isTeacher() || isParentForParentDoc();
+      // Let parents update their own record (optional). Admin can do all CRUD.
+      allow create: if isAdmin();
+      allow update: if isAdmin() || isParentForParentDoc();
+      allow delete: if isAdmin();
+    }
+
+    // Parent pickup QR tokens (subcollection)
+    match /parents/{docId}/tokens/{tokenId} {
+      // Parents generate tokens for themselves; teachers read+mark used when scanning.
+      allow read: if isAdmin() || isTeacher() || isParentOwnerOfParentId(docId);
+      allow create: if isAdmin() || isParentOwnerOfParentId(docId);
+      allow update: if isAdmin() || isTeacher() || isParentOwnerOfParentId(docId);
+      allow delete: if isAdmin();
+    }
+
+    // Children collection
+    match /children/{docId} {
+      allow read: if isAdmin() || isTeacher() || isParentForChildDoc();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Attendance: teachers can write attendance for all children; parents read only their kids
+    match /attendance/{docId} {
+      allow read: if isAdmin() || isTeacher() || isParentForAttendanceDoc();
+      allow create, update: if isAdmin() || isTeacher();
+      allow delete: if isAdmin();
+    }
+
+    // Salary: admin-only by default
+    match /salary/{docId} {
+      allow read, create, update, delete: if isAdmin();
+    }
+
+    // ------------------ Billing / Payments (demo path on dummy provider now, real-ready later) ------------------
+    // Public-to-authenticated price list (admin manages)
+    match /billingCatalog/{itemId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Parent invoices (server/admin-managed). Parents can read their own.
+    match /parents/{docId}/invoices/{invoiceId} {
+      allow read: if isAdmin() || isTeacher() || isParentOwnerOfParentId(docId);
+      allow create, update, delete: if isAdmin();
+
+      // Checkout sessions are created/updated by server/admin.
+      match /sessions/{sessionId} {
+        allow read: if isAdmin() || isTeacher() || isParentOwnerOfParentId(docId);
+        allow create, update, delete: if isAdmin();
+      }
+    }
+
+    // Payment records (server/admin-managed). Parents can read their own.
+    match /parents/{docId}/payments/{paymentId} {
+      allow read: if isAdmin() || isTeacher() || isParentOwnerOfParentId(docId);
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Chats + memory: at least require authentication to avoid public DB.
+    // Tighten later if you want per-user/per-room privacy.
+    match /chats/{document=**} {
+      allow read, write: if signedIn();
+    }
+
+    match /memory/{document=**} {
+      allow read, write: if signedIn();
+    }
+  }
+}

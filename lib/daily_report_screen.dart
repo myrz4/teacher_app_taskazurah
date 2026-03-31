@@ -16,13 +16,11 @@ import 'package:intl/intl.dart';
 class DailyReportScreen extends StatefulWidget {
   final String teacherName;
   final String teacherUsername;
-  final String teacherClass;
 
   const DailyReportScreen({
     super.key,
     required this.teacherName,
     required this.teacherUsername,
-    required this.teacherClass,
   });
 
   @override
@@ -162,7 +160,6 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
               builder: (context) => AddMemoryPage(
                 teacherName: widget.teacherName,
                 teacherUsername: widget.teacherUsername,
-                teacherClass: widget.teacherClass,
               ),
             ),
           );
@@ -178,13 +175,11 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
 class AddMemoryPage extends StatefulWidget {
   final String teacherName;
   final String teacherUsername;
-  final String teacherClass;
 
   const AddMemoryPage({
     super.key,
     required this.teacherName,
     required this.teacherUsername,
-    required this.teacherClass,
   });
 
   @override
@@ -217,10 +212,8 @@ class _AddMemoryPageState extends State<AddMemoryPage> {
       final children = snapshot.docs.map((doc) {
         final data = doc.data();
         final name = data['name']?.toString() ?? 'Unnamed';
-        final teacher = data['teacher_username']?.toString() ?? 'Unassigned';
         return {
           'name': name,
-          'teacher': teacher,
         };
       }).toList();
 
@@ -272,7 +265,7 @@ class _AddMemoryPageState extends State<AddMemoryPage> {
 
       final childDoc = childSnapshot.docs.first;
       final childId = childDoc.id;
-      final childData = childDoc.data() as Map<String, dynamic>;
+      final childData = childDoc.data();
 
       // Build teacher reference dynamically
       final teacherRef = '/teachers/${widget.teacherUsername}';
@@ -324,8 +317,7 @@ class _AddMemoryPageState extends State<AddMemoryPage> {
               items: _childList
                   .map((child) => DropdownMenuItem(
                         value: child['name'],
-                        child: Text(
-                            "${child['name']} (${child['teacher'] ?? 'Unassigned'})"),
+                    child: Text("${child['name']}"),
                       ))
                   .toList(),
               onChanged: (val) => setState(() => _selectedChild = val),

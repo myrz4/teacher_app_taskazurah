@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 
+import 'set_login_pin_screen.dart';
+
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
@@ -23,6 +25,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
+          ListTile(
+            leading: const Icon(Icons.lock_outline, color: Colors.green),
+            title: const Text('Change PIN'),
+            subtitle: const Text('PIN is mandatory'),
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const SetLoginPinScreen()),
+              );
+            },
+          ),
+          const Divider(),
           SwitchListTile(
             value: _darkMode,
             title: const Text("Dark Mode"),

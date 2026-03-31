@@ -1,7 +1,7 @@
 // 🧑‍🏫 File: profile_screen.dart
 //
 // ✅ Firestore SDK version (uses FirebaseFirestore directly)
-// ✅ Automatically links tips_total with sum(bonus) from 'salary' collection
+// ✅ Reads teacher profile directly from Firestore under current teacher permissions
 // ✅ Fixes Timestamp display issue for join_date
 // ✅ Displays profile photo, name, email, phone, class, experience, join date, salary & tips
 
@@ -12,8 +12,9 @@ import 'package:intl/intl.dart';
 
 class ProfileScreen extends StatefulWidget {
   final String teacherUsername;
+  final String teacherDocId;
 
-  const ProfileScreen({super.key, required this.teacherUsername});
+  const ProfileScreen({super.key, required this.teacherUsername, required this.teacherDocId});
 
   @override
   State<ProfileScreen> createState() => _ProfileScreenState();
@@ -32,47 +33,30 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _loadTeacherProfile();
   }
 
-  /// ✅ Fetch teacher profile and calculate total bonus (tips)
+  /// ✅ Fetch teacher profile allowed by current teacher rules
   Future<void> _loadTeacherProfile() async {
     try {
-      // Step 1: Load teacher info
-      final teacherQuery = await _firestore
-          .collection('teachers')
-          .where('username', isEqualTo: widget.teacherUsername)
-          .limit(1)
-          .get();
-
-      if (teacherQuery.docs.isEmpty) {
+      final docId = widget.teacherDocId.trim();
+      if (docId.isEmpty) {
         Fluttertoast.showToast(msg: "Profile not found.");
         setState(() => _isLoading = false);
         return;
       }
 
-      teacherData = teacherQuery.docs.first.data();
-      final teacherDocId = teacherQuery.docs.first.id;
-
-      // Step 2: Load salary records for this teacher
-      final salaryQuery = await _firestore
-          .collection('salary')
-          .where('teacher_username', isEqualTo: widget.teacherUsername)
-          .get();
-
-      // Step 3: Sum up all bonus values
-      double sumBonus = 0.0;
-      for (var doc in salaryQuery.docs) {
-        final data = doc.data();
-        sumBonus += _safeToDouble(data['bonus']);
+      final snap = await _firestore.collection('teachers').doc(docId).get();
+      if (!snap.exists) {
+        Fluttertoast.showToast(msg: "Profile not found.");
+        setState(() => _isLoading = false);
+        return;
       }
 
-      // Step 4: Update tips_total field in Firestore
-      await _firestore
-          .collection('teachers')
-          .doc(teacherDocId)
-          .update({'tips_total': sumBonus});
+      teacherData = snap.data();
 
-      // Step 5: Update UI
+      // Teacher app rules currently allow reading teacher docs but not salary/admin writes.
+      final storedTipsTotal = _safeToDouble(teacherData?['tips_total']);
+
       setState(() {
-        totalBonus = sumBonus;
+        totalBonus = storedTipsTotal;
         _isLoading = false;
       });
     } catch (e, st) {
@@ -125,12 +109,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       CircleAvatar(
                         radius: 55,
                         backgroundColor: const Color(0xFFA8E6A3),
-                        backgroundImage: (data['image'] != null &&
-                                (data['image'] as String).isNotEmpty)
-                            ? NetworkImage(data['image'])
-                            : null,
                         child: (data['image'] == null ||
-                                (data['image'] as String).isEmpty)
+                                data['image'].toString().trim().isEmpty)
                             ? Text(
                                 (data['name'] ?? 'T')
                                     .toString()
@@ -142,7 +122,27 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                   color: Color(0xFF2E7D32),
                                 ),
                               )
-                            : null,
+                            : ClipOval(
+                                child: Image.network(
+                                  data['image'].toString().trim(),
+                                  width: 110,
+                                  height: 110,
+                                  fit: BoxFit.cover,
+                                  errorBuilder: (_, __, ___) => Center(
+                                    child: Text(
+                                      (data['name'] ?? 'T')
+                                          .toString()
+                                          .substring(0, 1)
+                                          .toUpperCase(),
+                                      style: const TextStyle(
+                                        fontSize: 40,
+                                        fontWeight: FontWeight.bold,
+                                        color: Color(0xFF2E7D32),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
                       ),
                       const SizedBox(height: 20),
 
@@ -170,13 +170,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       // 📋 Info Tiles
                       _infoTile("Email", data['email'] ?? '-'),
                       _infoTile("Phone", data['phone'] ?? '-'),
-                      _infoTile("Class", data['class'] ?? '-'),
                       _infoTile("Experience", data['experience'] ?? '-'),
                       _infoTile("Joined Date", _formatDate(data['join_date'])),
                       _infoTile("Base Salary",
                           "RM${data['base_salary']?.toString() ?? '0'}"),
 
-                      // 💰 Tips (calculated from salary collection)
+                        // 💰 Tips value already stored on teacher profile if available
                       _infoTile("Tips (Total Bonus)",
                           "RM${totalBonus.toStringAsFixed(2)}"),
                     ],
@@ -195,7 +194,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         borderRadius: BorderRadius.circular(12),
         boxShadow: [
           BoxShadow(
-            color: Colors.grey.withOpacity(0.2),
+            color: Colors.grey.withValues(alpha: 0.2),
             blurRadius: 6,
             offset: const Offset(0, 4),
           ),

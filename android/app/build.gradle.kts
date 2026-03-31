@@ -73,30 +73,18 @@ dependencies {
     // ❌ Removed Firestore, Auth, Analytics SDKs — handled via REST API now
 }
 
-// ✅ Auto-copy & rename built APK for convenience
-afterEvaluate {
-    tasks.matching { it.name.startsWith("assemble") }.configureEach {
-        doLast {
-            val apkSource = file("${buildDir}/outputs/apk")
-            val flutterTarget = file("${rootProject.projectDir}/../build/app/outputs/flutter-apk")
-            if (!flutterTarget.exists()) flutterTarget.mkdirs()
+// Keep Flutter tooling happy: copy APKs to the standard Flutter output folder
+// (../build/app/outputs/flutter-apk) without renaming.
+val flutterApkOutDir = rootProject.projectDir.parentFile
+    .resolve("build/app/outputs/flutter-apk")
 
-            val variant = name.replace("assemble", "").lowercase()
-            val apkName = if (variant.contains("release")) "app-release.apk" else "app-debug.apk"
+val copyFlutterApks by tasks.registering(Copy::class) {
+    val fromDir = layout.buildDirectory.dir("outputs/flutter-apk")
+    from(fromDir)
+    include("*.apk")
+    into(flutterApkOutDir)
+}
 
-            val apkFiles = apkSource.walkTopDown().filter { it.extension == "apk" }.toList()
-
-            if (apkFiles.isNotEmpty()) {
-                val builtApk = apkFiles.first()
-                copy {
-                    from(builtApk)
-                    into(flutterTarget)
-                    rename { apkName }
-                }
-                println("✅ APK renamed to: ${flutterTarget.absolutePath}\\$apkName")
-            } else {
-                println("⚠️ No .apk file found in ${apkSource.absolutePath}")
-            }
-        }
-    }
+tasks.matching { it.name.startsWith("assemble") }.configureEach {
+    finalizedBy(copyFlutterApks)
 }

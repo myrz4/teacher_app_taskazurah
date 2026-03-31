@@ -12,8 +12,9 @@ import 'package:intl/intl.dart';
 
 class QRScannerScreen extends StatefulWidget {
   final String teacherUsername;
+  final String teacherName;
 
-  const QRScannerScreen({Key? key, required this.teacherUsername})
+  const QRScannerScreen({Key? key, required this.teacherUsername, required this.teacherName})
       : super(key: key);
 
   @override
@@ -21,34 +22,16 @@ class QRScannerScreen extends StatefulWidget {
 }
 
 class _QRScannerScreenState extends State<QRScannerScreen> {
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final GlobalKey qrKey = GlobalKey(debugLabel: 'QR');
   QRViewController? controller;
   bool scanned = false;
   String teacherName = '';
 
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-
   @override
   void initState() {
     super.initState();
-    _loadTeacherName();
-  }
-
-  Future<void> _loadTeacherName() async {
-    try {
-      final query = await _firestore
-          .collection('teachers')
-          .where('username', isEqualTo: widget.teacherUsername)
-          .limit(1)
-          .get();
-      if (query.docs.isNotEmpty) {
-        setState(() {
-          teacherName = query.docs.first['name'] ?? widget.teacherUsername;
-        });
-      }
-    } catch (_) {
-      teacherName = widget.teacherUsername;
-    }
+    teacherName = widget.teacherName;
   }
 
   @override
@@ -138,9 +121,8 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
 
         final parentName = parentData['parentName'] ?? '-';
         final phone = parentData['phone'] ?? '-';
-        final childName = parentData['childName'] ?? '-';
-        final className = parentData['className'] ?? '-';
-        final representative = parentData['representativeName'] ?? '-';
+        final parentChildName = parentData['childName'] ?? '-';
+        final representativeFromParent = parentData['representativeName'] ?? '-';
 
         // 2️⃣ Dapatkan dokumen token sebenar
         final tokenRef = parentRef.collection('tokens').doc(tokenValue);
@@ -165,6 +147,23 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
 
         // Ambil child ID dari token (NFC UID)
         final String childId = tokenData['childId'] ?? '';
+
+        String childName = (tokenData['childName'] ?? parentChildName ?? '-').toString();
+        if ((childName.trim().isEmpty || childName.trim() == '-') && childId.trim().isNotEmpty) {
+          try {
+            final childSnap = await _firestore.collection('children').doc(childId.trim()).get();
+            final childData = childSnap.data();
+            if (childData != null && (childData['name'] ?? '').toString().trim().isNotEmpty) {
+              childName = (childData['name'] ?? childName).toString();
+            }
+          } catch (_) {
+            // ignore lookup errors
+          }
+        }
+
+        // Per-token representative details (for unregistered relatives)
+        final representativeName = (tokenData['representativeName'] ?? representativeFromParent ?? '-').toString();
+        final representativeRole = (tokenData['representativeRole'] ?? '-').toString();
 
         // 3️⃣ Tentukan hasil verification
         final bool verified = !used && !expired;
@@ -205,9 +204,9 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
                 parentName: parentName,
                 phone: phone,
                 childName: childName,
-                className: className,
                 teacher: teacherName,
-                representative: representative,
+                representativeName: representativeName,
+                representativeRole: representativeRole,
                 expiryDate: expiredAt,
                 teacherUsername: widget.teacherUsername,
               ),
@@ -266,9 +265,9 @@ class VerificationResultScreen extends StatelessWidget {
   final String parentName;
   final String phone;
   final String childName;
-  final String className;
   final String teacher;
-  final String representative;
+  final String representativeName;
+  final String representativeRole;
   final DateTime? expiryDate;
   final String teacherUsername;
 
@@ -278,9 +277,9 @@ class VerificationResultScreen extends StatelessWidget {
     required this.parentName,
     required this.phone,
     required this.childName,
-    required this.className,
     required this.teacher,
-    required this.representative,
+    required this.representativeName,
+    required this.representativeRole,
     required this.expiryDate,
     required this.teacherUsername,
   }) : super(key: key);
@@ -370,7 +369,8 @@ class VerificationResultScreen extends StatelessWidget {
                   _infoRow("Parent Name", parentName),
                   _infoRow("Phone", phone),
                   _infoRow("Child Name", childName),
-                  _infoRow("Class", className),
+                  _infoRow("Pickup By", representativeName),
+                  _infoRow("Relationship", representativeRole),
                   _infoRow("Teacher", teacher),
                   _infoRow(
                     "QR Expiry",
@@ -427,7 +427,7 @@ class VerificationResultScreen extends StatelessWidget {
                       context,
                       MaterialPageRoute(
                         builder: (_) =>
-                            QRScannerScreen(teacherUsername: teacherUsername),
+                            QRScannerScreen(teacherUsername: teacherUsername, teacherName: teacher),
                       ),
                     ),
                   ),

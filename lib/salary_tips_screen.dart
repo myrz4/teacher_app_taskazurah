@@ -53,7 +53,7 @@ class _SalaryTipsScreenState extends State<SalaryTipsScreen> {
         final data = doc.data();
         final baseSalary = _safeToDouble(data['base_salary']);
         final bonus = _safeToDouble(data['bonus']);
-        final total = _safeToDouble(data['total']) ?? (baseSalary + bonus);
+        final total = data['total'] == null ? (baseSalary + bonus) : _safeToDouble(data['total']);
         final payDate = _formatDateValue(data['pay_date']);
 
         return {

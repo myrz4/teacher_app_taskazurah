@@ -41,13 +41,14 @@ class _AttendanceListScreenState extends State<AttendanceListScreen> {
 
       final childrenList = snapshot.docs.map((doc) {
         final data = doc.data();
+        final photoUrl = (data['photoUrl'] ?? '').toString().trim();
         return {
           'id': doc.id,
+          'child_id': data['child_id'],
           'name': data['name'] ?? '-',
           'nfc_uid': data['nfc_uid'] ?? '-',
           'parentName': data['parentName'] ?? '-',
-          'teacher_username': data['teacher_username'] ?? '-',
-          'photoUrl': data['photoUrl'] ?? '',
+          'photoUrl': photoUrl,
         };
       }).toList();
 
@@ -108,11 +109,11 @@ class _AttendanceListScreenState extends State<AttendanceListScreen> {
                         itemBuilder: (context, index) {
                           final child = _children[index];
                           final childName = child['name'] ?? '-';
-                          final childId = child['nfc_uid'] ?? '-';
+                          final childId = child['id'] ?? '-';
+                          final childNumericId = child['child_id'];
                           final parentName = child['parentName'] ?? '-';
-                          final teacherUsername =
-                              child['teacher_username'] ?? '-';
-                          final photoUrl = child['photoUrl'] ?? '';
+                          final photoUrl =
+                              (child['photoUrl'] ?? '').toString().trim();
 
                           return Card(
                             margin: const EdgeInsets.symmetric(
@@ -125,15 +126,24 @@ class _AttendanceListScreenState extends State<AttendanceListScreen> {
                               leading: CircleAvatar(
                                 radius: 26,
                                 backgroundColor: const Color(0xFFE8F5E9),
-                                backgroundImage: (photoUrl.isNotEmpty)
-                                    ? NetworkImage(photoUrl)
-                                    : null,
-                                child: (photoUrl.isEmpty)
+                                child: photoUrl.isEmpty
                                     ? const Icon(
                                         Icons.child_care,
                                         color: Color(0xFF2E7D32),
                                       )
-                                    : null,
+                                    : ClipOval(
+                                        child: Image.network(
+                                          photoUrl,
+                                          width: 52,
+                                          height: 52,
+                                          fit: BoxFit.cover,
+                                          errorBuilder: (_, __, ___) =>
+                                              const Icon(
+                                            Icons.child_care,
+                                            color: Color(0xFF2E7D32),
+                                          ),
+                                        ),
+                                      ),
                               ),
                               title: Text(
                                 childName,
@@ -146,7 +156,6 @@ class _AttendanceListScreenState extends State<AttendanceListScreen> {
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   Text("Parent: $parentName"),
-                                  Text("Teacher: $teacherUsername"),
                                 ],
                               ),
                               trailing:
@@ -158,6 +167,14 @@ class _AttendanceListScreenState extends State<AttendanceListScreen> {
                                     builder: (context) =>
                                         StudentAttendanceDetailScreen(
                                       childId: childId,
+                                      childNumericId: (childNumericId is int)
+                                          ? childNumericId
+                                          : (childNumericId is num)
+                                              ? childNumericId.toInt()
+                                              : int.tryParse(
+                                                  (childNumericId ?? '')
+                                                      .toString(),
+                                                ),
                                       childName: childName,
                                     ),
                                   ),

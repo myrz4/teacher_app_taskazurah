@@ -7,10 +7,12 @@
 
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter/foundation.dart';
 import 'firebase_options.dart';
-import 'login_screen.dart';
+import 'auth_gate.dart';
 
 // 🟢 Background message handler (runs even when app is terminated)
 @pragma('vm:entry-point')
@@ -46,6 +48,12 @@ Future<void> main() async {
 
   // ✅ Initialize Firebase
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  // ✅ Dev-only: keep emulator / debug builds reliable.
+  // This DOES NOT affect release builds.
+  if (kDebugMode) {
+    await FirebaseAuth.instance.setSettings(appVerificationDisabledForTesting: true);
+  }
 
   // ✅ Register background message handler
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
@@ -116,7 +124,7 @@ class MyApp extends StatelessWidget {
           elevation: 2,
         ),
       ),
-      home: const LoginScreen(),
+      home: const TeacherAuthGate(),
     );
   }
 }

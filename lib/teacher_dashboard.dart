@@ -1,7 +1,7 @@
 // 🌿 File: teacher_dashboard.dart
 //
 // ✅ Taska Zurah Teacher Dashboard (Firestore SDK Version + FCM Chat Notifications)
-// ✅ Reads teacher profile photo, class, salary, and attendance
+// ✅ Reads teacher profile photo, salary, and attendance
 // ✅ Includes smart Attendance Analysis Bar (Present vs Absent)
 // ✅ Uses Firestore SDK for live data
 // ✅ Push Notification integrated for chat (FCM + local popup)
@@ -12,8 +12,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-
-import 'login_screen.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'qr_scanner_screen.dart';
 import 'attendance_list_screen.dart';
 import 'salary_tips_screen.dart';
@@ -30,11 +29,13 @@ final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
 class TeacherDashboard extends StatefulWidget {
   final String name;
   final String username;
+  final String teacherDocId;
 
   const TeacherDashboard({
     super.key,
     required this.name,
     required this.username,
+    required this.teacherDocId,
   });
 
   @override
@@ -49,7 +50,6 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
   bool _isLoading = true;
   double _baseSalary = 0.0;
   double _bonus = 0.0;
-  String _teacherClass = "Unknown";
   String? _profileImageUrl;
 
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -57,28 +57,65 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
   // 🔁 LIVE attendance listeners
   StreamSubscription<QuerySnapshot>? _childrenSub;
   StreamSubscription<QuerySnapshot>? _attendanceSub;
+  Timer? _midnightTimer;
 
   List<QueryDocumentSnapshot> _childrenDocs = [];
   List<QueryDocumentSnapshot> _attendanceDocs = [];
+
+  String _todayDocPrefix() {
+    // Attendance doc IDs are formatted as: yyyy-MM-dd_<childId>
+    return "${DateFormat('yyyy-MM-dd').format(DateTime.now())}_";
+  }
 
   @override
   void dispose() {
     _childrenSub?.cancel();
     _attendanceSub?.cancel();
+    _midnightTimer?.cancel();
     super.dispose();
   }
 
   @override
   void initState() {
     super.initState();
-    print("🟢 TeacherDashboard loaded");
+    debugPrint("🟢 TeacherDashboard loaded");
 
     // 🔔 Initialize Firebase Messaging
     _initNotificationSystem();
 
     _startLiveAttendanceListeners();
+    _scheduleMidnightRolloverRefresh();
     _loadSalaryData();
     _loadTeacherProfile();
+  }
+
+  void _scheduleMidnightRolloverRefresh() {
+    _midnightTimer?.cancel();
+
+    final now = DateTime.now();
+    final nextMidnight = DateTime(now.year, now.month, now.day).add(const Duration(days: 1));
+    final delay = nextMidnight.difference(now) + const Duration(seconds: 2);
+
+    _midnightTimer = Timer(delay, () {
+      if (!mounted) return;
+
+      // Re-subscribe attendance listener to the new day's prefix
+      _attendanceSub?.cancel();
+      final prefix = _todayDocPrefix();
+      _attendanceSub = _firestore
+          .collection('attendance')
+          .orderBy(FieldPath.documentId)
+          .startAt([prefix])
+          .endAt(["$prefix\uf8ff"])
+          .snapshots()
+          .listen((snap) {
+        _attendanceDocs = snap.docs;
+        _recalculateTodayAttendance();
+      });
+
+      // Re-arm for the next day
+      _scheduleMidnightRolloverRefresh();
+    });
   }
 
   void _startLiveAttendanceListeners() {
@@ -88,8 +125,15 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
       _recalculateTodayAttendance();
     });
 
-    // 📋 Listen to attendance collection
-    _attendanceSub = _firestore.collection('attendance').snapshots().listen((snap) {
+    // 📋 Listen to today's attendance docs only (reliable across timezone + faster)
+    final prefix = _todayDocPrefix();
+    _attendanceSub = _firestore
+        .collection('attendance')
+        .orderBy(FieldPath.documentId)
+        .startAt([prefix])
+        .endAt(["$prefix\uf8ff"])
+        .snapshots()
+        .listen((snap) {
       _attendanceDocs = snap.docs;
       _recalculateTodayAttendance();
     });
@@ -99,7 +143,10 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     if (!mounted) return;
 
     final now = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
+    final todayY = now.year;
+    final todayM = now.month;
+    final todayD = now.day;
+    final todayPrefix = _todayDocPrefix();
 
     final total = _childrenDocs.length;
     final presentIds = <String>{};
@@ -115,14 +162,18 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     for (final doc in _attendanceDocs) {
       final data = doc.data() as Map<String, dynamic>;
 
-      final date = toDate(data['date']);
-      if (date == null) continue;
+      // Prefer docId prefix for matching "today" (avoids timezone issues with Timestamp->DateTime)
+      final bool isTodayById = doc.id.startsWith(todayPrefix);
 
-      final recordDay = DateTime(date.year, date.month, date.day);
-      if (recordDay != today) continue;
+      if (!isTodayById) {
+        final date = toDate(data['date']);
+        if (date == null) continue;
+        if (date.year != todayY || date.month != todayM || date.day != todayD) continue;
+      }
 
-      final childId = data['childId'];
-      if (childId == null) continue;
+      final dynamic rawChildId = data['childId'] ?? data['child_id'];
+      final String childId = (rawChildId ?? '').toString().trim();
+      if (childId.isEmpty) continue;
 
       final isPresent = data['isPresent'] == true;
       final hasCheckIn = data['check_in_time'] != null;
@@ -158,20 +209,32 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     // ✅ Save FCM token into Firestore
     final token = await messaging.getToken();
     if (token != null) {
-      await _firestore
-          .collection('teachers')
-          .doc(widget.username)
-          .set({'fcmToken': token}, SetOptions(merge: true));
-      print("📱 Saved FCM token for ${widget.username}: $token");
+      try {
+        final teacherDocId = widget.teacherDocId.trim();
+        if (teacherDocId.isNotEmpty) {
+          await _firestore
+              .collection('teachers')
+              .doc(teacherDocId)
+              .set({'fcmToken': token}, SetOptions(merge: true));
+        }
+        debugPrint("📱 Saved FCM token for ${widget.username}: $token");
+      } catch (e) {
+        // Most commonly: permission-denied because rules allow only admin writes.
+        // For chat functionality, don't crash the app if we can't persist the token.
+        debugPrint('⚠️ Could not save FCM token to Firestore: $e');
+      }
     }
 
     // ✅ Listen for all incoming messages (foreground/background)
     FirebaseMessaging.onMessage.listen((RemoteMessage message) {
       final notification = message.notification;
       if (notification != null) {
+        if (!mounted) {
+          return;
+        }
         // 🚫 Skip notification ONLY if user currently on ChatScreen
         if (ModalRoute.of(context)?.settings.name == 'ChatScreen') {
-          print("💬 Skipping popup — user already in chat screen");
+          debugPrint("💬 Skipping popup — user already in chat screen");
           return;
         }
 
@@ -214,20 +277,19 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     }
   }
 
-  /// ✅ Load teacher profile (photo + class)
+  /// ✅ Load teacher profile (photo)
   Future<void> _loadTeacherProfile() async {
     try {
-      final query = await _firestore
-          .collection('teachers')
-          .where('username', isEqualTo: widget.username)
-          .limit(1)
-          .get();
+      Map<String, dynamic>? data;
+      final teacherDocId = widget.teacherDocId.trim();
+      if (teacherDocId.isNotEmpty) {
+        final snap = await _firestore.collection('teachers').doc(teacherDocId).get();
+        data = snap.data();
+      }
 
-      if (query.docs.isNotEmpty) {
-        final data = query.docs.first.data();
+      if (data != null) {
         setState(() {
-          _teacherClass = data['class'] ?? 'Unknown';
-          _profileImageUrl = data['image'];
+          _profileImageUrl = (data?['image'] ?? '').toString().trim();
         });
       }
     } catch (e) {
@@ -280,11 +342,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                 decoration: const BoxDecoration(color: Color(0xFF2E7D32)),
                 currentAccountPicture: CircleAvatar(
                   backgroundColor: Colors.white,
-                  backgroundImage:
-                      (_profileImageUrl != null && _profileImageUrl!.isNotEmpty)
-                          ? NetworkImage(_profileImageUrl!)
-                          : null,
-                  child: (_profileImageUrl == null || _profileImageUrl!.isEmpty)
+                  child: (_profileImageUrl == null ||
+                          _profileImageUrl!.trim().isEmpty)
                       ? Text(
                           widget.name.isNotEmpty
                               ? widget.name[0].toUpperCase()
@@ -295,7 +354,26 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                             color: Color(0xFF2E7D32),
                           ),
                         )
-                      : null,
+                      : ClipOval(
+                          child: Image.network(
+                            _profileImageUrl!.trim(),
+                            width: 72,
+                            height: 72,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => Center(
+                              child: Text(
+                                widget.name.isNotEmpty
+                                    ? widget.name[0].toUpperCase()
+                                    : "?",
+                                style: const TextStyle(
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.bold,
+                                  color: Color(0xFF2E7D32),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
                 ),
                 accountName: Text(
                   widget.name,
@@ -312,7 +390,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                     context,
                     MaterialPageRoute(
                       builder: (context) =>
-                          ProfileScreen(teacherUsername: widget.username),
+                          ProfileScreen(teacherUsername: widget.username, teacherDocId: widget.teacherDocId),
                     ),
                   );
                 },
@@ -342,7 +420,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                     context,
                     MaterialPageRoute(
                       builder: (context) => ChatInboxScreen(
-                        teacherUsername: widget.username,
+                        teacherId: widget.teacherDocId,
+                        teacherName: widget.name,
                       ),
                     ),
                   );
@@ -354,13 +433,11 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
               ListTile(
                 leading: const Icon(Icons.logout, color: Colors.red),
                 title: const Text("Logout"),
-                onTap: () {
+                onTap: () async {
                   Navigator.pop(context);
-                  Navigator.pushReplacement(
-                    context,
-                    MaterialPageRoute(
-                        builder: (context) => const LoginScreen()),
-                  );
+                  await FirebaseAuth.instance.signOut();
+                  if (!context.mounted) return;
+                  Navigator.of(context).popUntil((route) => route.isFirst);
                 },
               ),
             ],
@@ -380,11 +457,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                 CircleAvatar(
                   radius: 35,
                   backgroundColor: const Color(0xFFA8E6A3),
-                  backgroundImage:
-                      (_profileImageUrl != null && _profileImageUrl!.isNotEmpty)
-                          ? NetworkImage(_profileImageUrl!)
-                          : null,
-                  child: (_profileImageUrl == null || _profileImageUrl!.isEmpty)
+                  child: (_profileImageUrl == null ||
+                          _profileImageUrl!.trim().isEmpty)
                       ? Text(
                           widget.name.isNotEmpty
                               ? widget.name[0].toUpperCase()
@@ -395,7 +469,26 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                             color: Color(0xFF2E7D32),
                           ),
                         )
-                      : null,
+                      : ClipOval(
+                          child: Image.network(
+                            _profileImageUrl!.trim(),
+                            width: 70,
+                            height: 70,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => Center(
+                              child: Text(
+                                widget.name.isNotEmpty
+                                    ? widget.name[0].toUpperCase()
+                                    : "?",
+                                style: const TextStyle(
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.bold,
+                                  color: Color(0xFF2E7D32),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
                 ),
                 const SizedBox(width: 15),
                 Column(
@@ -411,9 +504,6 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                         color: Color(0xFF2E7D32),
                       ),
                     ),
-                    Text("Class: $_teacherClass",
-                        style: const TextStyle(
-                            fontSize: 13, color: Colors.black54)),
                     Text("Date: $formattedDate",
                         style: const TextStyle(
                             fontSize: 13, color: Colors.black54)),
@@ -466,7 +556,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                   borderRadius: BorderRadius.circular(15),
                   boxShadow: [
                     BoxShadow(
-                      color: Colors.green.withOpacity(0.2),
+                      color: Colors.green.withValues(alpha: 0.2),
                       blurRadius: 8,
                       offset: const Offset(0, 4),
                     ),
@@ -529,7 +619,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                     context,
                     MaterialPageRoute(
                       builder: (context) =>
-                          QRScannerScreen(teacherUsername: widget.username),
+                          QRScannerScreen(teacherUsername: widget.username, teacherName: widget.name),
                     ),
                   );
                 }),
@@ -541,7 +631,6 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                       builder: (context) => DailyReportScreen(
                         teacherName: widget.name,
                         teacherUsername: widget.username,
-                        teacherClass: _teacherClass,
                       ),
                     ),
                   );
@@ -585,7 +674,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
         borderRadius: BorderRadius.circular(15),
         boxShadow: [
           BoxShadow(
-            color: color.withOpacity(0.25),
+            color: color.withValues(alpha: 0.25),
             blurRadius: 6,
             offset: const Offset(0, 4),
           ),
@@ -637,7 +726,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
           borderRadius: BorderRadius.circular(20),
           boxShadow: [
             BoxShadow(
-              color: color.withOpacity(0.2),
+                color: color.withValues(alpha: 0.2),
               blurRadius: 8,
               offset: const Offset(0, 4),
             ),

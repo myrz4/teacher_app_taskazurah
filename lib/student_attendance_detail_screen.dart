@@ -7,11 +7,13 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 
 class StudentAttendanceDetailScreen extends StatefulWidget {
   final String childId;
+  final int? childNumericId;
   final String childName;
 
   const StudentAttendanceDetailScreen({
     super.key,
     required this.childId,
+    this.childNumericId,
     required this.childName,
   });
 
@@ -27,11 +29,169 @@ class _StudentAttendanceDetailScreenState
 
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
-  DateTime _toDate(dynamic val) {
-    if (val == null) return DateTime(1970);
+  String _normalizeId(String id) {
+    return id.trim();
+  }
+
+  List<String> _childIdCandidates(String childId) {
+    final normalized = _normalizeId(childId);
+    if (normalized.isEmpty || normalized == '-') return const [];
+
+    final candidates = <String>{
+      normalized,
+      normalized.replaceAll(' ', ''),
+      normalized.toUpperCase(),
+      normalized.toLowerCase(),
+    };
+    candidates.removeWhere((e) => e.trim().isEmpty || e.trim() == '-');
+    return candidates.toList(growable: false);
+  }
+
+  DateTime? _tryParseDocIdDate(String docId) {
+    // Expected canonical docId: yyyy-MM-dd_<childId>
+    final underscore = docId.indexOf('_');
+    if (underscore <= 0) return null;
+    final datePart = docId.substring(0, underscore);
+    try {
+      final parsed = DateTime.parse(datePart);
+      // Ensure the UI date is stable across device timezones.
+      return DateTime(parsed.year, parsed.month, parsed.day);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<List<DocumentSnapshot<Map<String, dynamic>>>> _fetchTodayDocs({
+    required String childId,
+    required int? childNumericId,
+  }) async {
+    final normalized = _normalizeId(childId);
+    final prefix = DateFormat('yyyy-MM-dd').format(DateTime.now());
+
+    final candidates = <String>{};
+    if (normalized.isNotEmpty) {
+      candidates.addAll({
+        normalized,
+        normalized.replaceAll(' ', ''),
+        normalized.toUpperCase(),
+        normalized.toLowerCase(),
+      });
+    }
+    if (childNumericId != null) {
+      candidates.add(childNumericId.toString());
+    }
+
+    if (candidates.isEmpty) return const [];
+
+    final futures = candidates.map(
+      (c) => _firestore.collection('attendance').doc('${prefix}_$c').get(),
+    );
+
+    final snaps = await Future.wait(futures);
+    final existing = snaps.where((s) => s.exists).toList(growable: false);
+
+    // Fallback: query all today's docs by docId prefix and filter by suffix/fields.
+    final fromPrefix = await _fetchTodayDocsByPrefix(
+      datePrefix: '${prefix}_',
+      childId: normalized,
+      childNumericId: childNumericId,
+    );
+
+    final merged = <DocumentSnapshot<Map<String, dynamic>>>[];
+    final seen = <String>{};
+    for (final d in [...existing, ...fromPrefix]) {
+      if (seen.add(d.id)) merged.add(d);
+    }
+
+    if (merged.isEmpty) {
+      debugPrint(
+        '🟡 No today doc found for childId="$normalized" childNumericId=$childNumericId prefix=$prefix (direct tried ${candidates.length} ids)',
+      );
+    } else {
+      debugPrint(
+        '🟢 Today docs matched for "$normalized": ${merged.map((e) => e.id).join(", ")}',
+      );
+    }
+
+    return merged;
+  }
+
+  Future<List<DocumentSnapshot<Map<String, dynamic>>>> _fetchTodayDocsByPrefix({
+    required String datePrefix,
+    required String childId,
+    required int? childNumericId,
+  }) async {
+    try {
+      final candidates = <String>{};
+      if (childId.isNotEmpty) {
+        candidates.addAll({
+          childId,
+          childId.replaceAll(' ', ''),
+          childId.toUpperCase(),
+          childId.toLowerCase(),
+        });
+      }
+      if (childNumericId != null) {
+        candidates.add(childNumericId.toString());
+      }
+      if (candidates.isEmpty) return const [];
+
+      final qs = await _firestore
+          .collection('attendance')
+          .orderBy(FieldPath.documentId)
+          .startAt([datePrefix])
+          .endAt(['$datePrefix\uf8ff'])
+          .get();
+
+      final matched = <DocumentSnapshot<Map<String, dynamic>>>[];
+
+      for (final doc in qs.docs) {
+        final data = doc.data();
+
+        // Match by docId suffix: yyyy-MM-dd_<id>
+        final underscore = doc.id.indexOf('_');
+        final suffix = (underscore >= 0 && underscore + 1 < doc.id.length)
+            ? doc.id.substring(underscore + 1)
+            : '';
+
+        final docChildId = (data['childId'] ?? data['child_id'] ?? '').toString().trim();
+
+        final isMatch = candidates.contains(suffix) || candidates.contains(docChildId);
+        if (isMatch) {
+          matched.add(doc);
+        }
+      }
+
+      return matched;
+    } catch (e) {
+      debugPrint('⚠ Failed to fetch today docs by prefix "$datePrefix": $e');
+      return const [];
+    }
+  }
+
+  Future<List<QueryDocumentSnapshot<Map<String, dynamic>>>> _fetchHistoryByNumericId(int childNumericId) async {
+    try {
+      final snap = await _firestore
+          .collection('attendance')
+          .where('child_id', isEqualTo: childNumericId)
+          .get();
+      return snap.docs;
+    } catch (e) {
+      debugPrint('⚠ Failed to fetch history by child_id=$childNumericId: $e');
+      return const [];
+    }
+  }
+
+  DateTime? _toDateNullable(dynamic val) {
+    if (val == null) return null;
     if (val is Timestamp) return val.toDate();
-    if (val is String) return DateTime.tryParse(val) ?? DateTime(1970);
-    return DateTime(1970);
+    if (val is DateTime) return val;
+    if (val is String) return DateTime.tryParse(val);
+    return null;
+  }
+
+  DateTime _toDate(dynamic val) {
+    return _toDateNullable(val) ?? DateTime(1970);
   }
 
   String _formatDateOnly(dynamic value) {
@@ -126,6 +286,8 @@ class _StudentAttendanceDetailScreenState
 
   @override
   Widget build(BuildContext context) {
+    final childIdCandidates = _childIdCandidates(widget.childId);
+
     return Scaffold(
       backgroundColor: Colors.grey[50],
       appBar: AppBar(
@@ -141,50 +303,122 @@ class _StudentAttendanceDetailScreenState
           ),
         ],
       ),
-      body: StreamBuilder<QuerySnapshot>(
-        stream: _firestore
-            .collection('attendance')
-            .where('childId', isEqualTo: widget.childId)
-            .snapshots(),
+      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+        stream: childIdCandidates.isEmpty
+            ? const Stream<QuerySnapshot<Map<String, dynamic>>>.empty()
+            : _firestore
+                .collection('attendance')
+                .where('childId', whereIn: childIdCandidates)
+                .snapshots(),
         builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return Center(
+              child: Text(
+                'Failed to load attendance records.\n${snapshot.error}',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.redAccent),
+              ),
+            );
+          }
+
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Center(
               child: CircularProgressIndicator(color: Colors.green),
             );
           }
 
-          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-            return Center(
-              child: Text(
-                "No attendance records found for ${widget.childName}.",
-                style: const TextStyle(fontSize: 16, color: Colors.black54),
-              ),
-            );
-          }
+          return FutureBuilder<List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
+            future: (widget.childNumericId == null)
+                ? Future.value(const [])
+                : _fetchHistoryByNumericId(widget.childNumericId!),
+            builder: (context, todaySnap) {
+                final streamDocs = snapshot.data?.docs ??
+                  const <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+              final numericDocs = todaySnap.data ?? const <QueryDocumentSnapshot<Map<String, dynamic>>>[];
 
-          final records = snapshot.data!.docs.map((doc) {
-            final data = doc.data() as Map<String, dynamic>;
-            return {
-              'date': data['date'],
-              'checkIn': data['check_in_time'],
-              'checkOut': data['check_out_time'],
-              'teacher': data['teacher'] ?? '-',
-              'pickedBy': data['parentName'] ?? '-',
-              'status': data['isPresent'] == true
-                  ? (data['manualCheckout'] == true ? "Manual" : "On Time")
-                  : "Absent",
-            };
-          }).toList();
+              return FutureBuilder<List<DocumentSnapshot<Map<String, dynamic>>>>(
+                future: _fetchTodayDocs(
+                  childId: widget.childId,
+                  childNumericId: widget.childNumericId,
+                ),
+                builder: (context, todayDocSnap) {
+                  final records = <Map<String, dynamic>>[];
+                  final seenDocIds = <String>{};
 
-          records.sort((a, b) {
-            final dtA = _toDate(a['date']);
-            final dtB = _toDate(b['date']);
-            return sortDescending ? dtB.compareTo(dtA) : dtA.compareTo(dtB);
-          });
+                  void addDoc(String docId, Map<String, dynamic> data) {
+                    if (seenDocIds.contains(docId)) return;
+                    seenDocIds.add(docId);
 
-          final filtered = _applyFilter(records);
+                    final docIdDate = _tryParseDocIdDate(docId);
 
-          return _buildTable(filtered);
+                    // Some legacy docs have a non-parseable `date` value; if so,
+                    // fall back to the canonical yyyy-MM-dd part of the docId.
+                    final dateFromField = _toDateNullable(data['date']);
+                    // IMPORTANT: For canonical docs (yyyy-MM-dd_<id>), prefer the
+                    // docId date so UI is stable across device timezones.
+                    final effectiveDate = docIdDate ?? dateFromField;
+
+                    final presentFlag =
+                        (data['isPresent'] == true) || (data['is_present'] == true);
+                    final manualFlag =
+                      (data['manualCheckout'] == true) ||
+                      (data['manual_checkout'] == true) ||
+                      (data['manual_in'] == true) ||
+                      (data['manual_out'] == true);
+
+                    records.add({
+                      'date': effectiveDate,
+                      'checkIn': data['check_in_time'] ??
+                          data['checkInTime'] ??
+                          data['check_in'],
+                      'checkOut': data['check_out_time'] ??
+                          data['checkOutTime'] ??
+                          data['check_out'],
+                      'teacher': data['teacher'] ?? '-',
+                      'pickedBy': data['parentName'] ?? data['pickedBy'] ?? '-',
+                      'status': presentFlag
+                          ? (manualFlag ? "Manual" : "On Time")
+                          : "Absent",
+                    });
+                  }
+
+                  for (final doc in streamDocs) {
+                    addDoc(doc.id, doc.data());
+                  }
+                  for (final doc in numericDocs) {
+                    addDoc(doc.id, doc.data());
+                  }
+
+                  final todayDocs = todayDocSnap.data ??
+                      const <DocumentSnapshot<Map<String, dynamic>>>[];
+                  for (final doc in todayDocs) {
+                    final data = doc.data();
+                    if (data != null) addDoc(doc.id, data);
+                  }
+
+                  if (records.isEmpty) {
+                    return Center(
+                      child: Text(
+                        "No attendance records found for ${widget.childName}.",
+                        style: const TextStyle(fontSize: 16, color: Colors.black54),
+                      ),
+                    );
+                  }
+
+                  records.sort((a, b) {
+                    final dtA = _toDate(a['date']);
+                    final dtB = _toDate(b['date']);
+                    return sortDescending
+                        ? dtB.compareTo(dtA)
+                        : dtA.compareTo(dtB);
+                  });
+
+                  final filtered = _applyFilter(records);
+                  return _buildTable(filtered);
+                },
+              );
+            },
+          );
         },
       ),
     );

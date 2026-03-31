@@ -15,13 +15,17 @@ import 'package:http/http.dart' as http;
 
 class ChatScreen extends StatefulWidget {
   static const routeName = 'ChatScreen';
-  final String teacherUsername;
-  final String parentUsername;
+  final String teacherId;
+  final String teacherName;
+  final String parentId;
+  final String parentName;
 
   const ChatScreen({
     super.key,
-    required this.teacherUsername,
-    required this.parentUsername,
+    required this.teacherId,
+    required this.teacherName,
+    required this.parentId,
+    required this.parentName,
   });
 
   @override
@@ -33,9 +37,23 @@ class _ChatScreenState extends State<ChatScreen> {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final ScrollController _scrollController = ScrollController();
 
-  // 🔹 Unique chat room ID between teacher and parent
-  String get chatRoomId =>
-      "teacher_${widget.teacherUsername}_parent_${widget.parentUsername}";
+    static String _norm(String s) => s.trim().toLowerCase();
+
+    // 🔹 Unique chat room ID between teacher and parent (stable + safe)
+    String get chatRoomId =>
+      "teacher_${_norm(widget.teacherId)}_parent_${_norm(widget.parentId)}";
+
+  @override
+  void initState() {
+    super.initState();
+
+    // Mark as read for this side (best-effort).
+    _firestore
+        .collection('chats')
+        .doc(chatRoomId)
+        .set({'unreadCountTeacher': 0}, SetOptions(merge: true))
+        .catchError((_) {});
+  }
 
   // 🔹 Send message to Firestore + Push notification
   Future<void> _sendMessage() async {
@@ -47,21 +65,34 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       // 🟢 Add message to subcollection
       await chatDoc.collection('messages').add({
-        'sender': widget.teacherUsername, // ✅ teacher sending
+        'senderRole': 'teacher',
+        'senderId': widget.teacherId,
+        'senderName': widget.teacherName,
+        // keep legacy field for older UIs
+        'sender': widget.teacherName,
         'text': text,
         'timestamp': FieldValue.serverTimestamp(),
       });
 
       // 🟢 Update metadata for Inbox
       await chatDoc.set({
-        'teacherUsername': widget.teacherUsername,
-        'parentUsername': widget.parentUsername,
+        'teacherId': widget.teacherId,
+        'teacherUsername': _norm(widget.teacherId),
+        'teacherName': widget.teacherName,
+        'parentId': widget.parentId,
+        'parentUsername': _norm(widget.parentName),
+        'parentName': widget.parentName,
+        'teacherRef': '/teachers/${widget.teacherId}',
+        'parentRef': '/parents/${widget.parentId}',
         'lastMessage': text,
         'lastTimestamp': FieldValue.serverTimestamp(),
+        // Unread counters (for list badge)
+        'unreadCountTeacher': 0,
+        'unreadCountParent': FieldValue.increment(1),
       }, SetOptions(merge: true));
 
       // 🟢 Send push notification to parent
-      await _sendPushNotificationToParent(widget.parentUsername, text);
+      await _sendPushNotificationToParent(widget.parentId, text);
 
       _msgController.clear();
 
@@ -80,25 +111,21 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// 🔔 Send push notification to parent via FCM
   Future<void> _sendPushNotificationToParent(
-      String parentUsername, String message) async {
+      String parentId, String message) async {
     try {
-      // Get parent’s FCM token from Firestore
-      final query = await _firestore
-          .collection('parents')
-          .where('username', isEqualTo: parentUsername)
-          .limit(1)
-          .get();
-
-      if (query.docs.isEmpty) {
-        print("⚠️ Parent not found for $parentUsername");
+      // Get parent’s FCM token from Firestore (by doc id)
+      final snap = await _firestore.collection('parents').doc(parentId).get();
+      if (!snap.exists) {
+        // ignore: avoid_print
+        print("⚠️ Parent not found for $parentId");
         return;
       }
+      final parentData = snap.data() ?? {};
+      final fcmToken = parentData['fcm_token'] ?? parentData['fcmToken'];
 
-      final parentData = query.docs.first.data();
-      final fcmToken = parentData['fcmToken'];
-
-      if (fcmToken == null || fcmToken.isEmpty) {
-        print("⚠️ No FCM token for $parentUsername");
+      if (fcmToken == null || (fcmToken is String && fcmToken.isEmpty)) {
+        // ignore: avoid_print
+        print("⚠️ No FCM token for $parentId");
         return;
       }
 
@@ -111,13 +138,13 @@ class _ChatScreenState extends State<ChatScreen> {
       final payload = {
         'to': fcmToken,
         'notification': {
-          'title': '📩 New Message from ${widget.teacherUsername}',
+          'title': '📩 New Message from ${widget.teacherName}',
           'body': message,
         },
         'data': {
           'click_action': 'FLUTTER_NOTIFICATION_CLICK',
           'screen': 'ChatScreen',
-          'sender': widget.teacherUsername,
+          'sender': widget.teacherId,
         },
       };
 
@@ -131,13 +158,23 @@ class _ChatScreenState extends State<ChatScreen> {
       );
 
       if (response.statusCode == 200) {
-        print("✅ Push notification sent to parent $parentUsername");
+        // ignore: avoid_print
+        print("✅ Push notification sent to parent $parentId");
       } else {
+        // ignore: avoid_print
         print("❌ Failed to send notification: ${response.body}");
       }
     } catch (e) {
+      // ignore: avoid_print
       print("🔥 Error sending push notification: $e");
     }
+  }
+
+  @override
+  void dispose() {
+    _msgController.dispose();
+    _scrollController.dispose();
+    super.dispose();
   }
 
   @override
@@ -152,7 +189,7 @@ class _ChatScreenState extends State<ChatScreen> {
             const Icon(Icons.chat_bubble_outline, size: 20),
             const SizedBox(width: 6),
             Text(
-              "Chat with ${widget.parentUsername}", // ✅ fixed title
+              "Chat with ${widget.parentName}",
               style: const TextStyle(fontWeight: FontWeight.bold),
             ),
           ],
@@ -205,7 +242,12 @@ class _ChatScreenState extends State<ChatScreen> {
                   itemCount: messages.length,
                   itemBuilder: (context, index) {
                     final msg = messages[index].data()! as Map<String, dynamic>;
-                    final isMe = msg['sender'] == widget.teacherUsername;
+                    final senderRole = (msg['senderRole'] ?? '').toString();
+                    final senderId = (msg['senderId'] ?? '').toString();
+                    final legacySender = (msg['sender'] ?? '').toString();
+
+                    final isMe = (senderRole == 'teacher' && senderId == widget.teacherId) ||
+                      (senderRole.isEmpty && (legacySender == widget.teacherId || legacySender == widget.teacherName));
                     final text = msg['text'] ?? '';
                     final timestamp = msg['timestamp'];
 
