@@ -214,9 +214,225 @@ class _StudentAttendanceDetailScreenState
     }
   }
 
+  String _readString(Map<String, dynamic> data, List<String> keys) {
+    for (final key in keys) {
+      final value = (data[key] ?? '').toString().trim();
+      if (value.isNotEmpty) return value;
+    }
+    return '';
+  }
+
+  String _methodLabel(String value, {required bool isCheckout}) {
+    switch (value.trim().toUpperCase()) {
+      case 'NFC':
+        return isCheckout ? 'NFC scan' : 'NFC tap';
+      case 'QR':
+      case 'PARENT_QR':
+        return 'Parent QR';
+      case 'MANUAL':
+      case 'ADMIN_MANUAL':
+        return 'Admin manual';
+      default:
+        return '-';
+    }
+  }
+
+  String _sourceSummary(Map<String, dynamic> data) {
+    final inMethod = _methodLabel(
+      _readString(data, const ['checkInMethod', 'checkin_method']),
+      isCheckout: false,
+    );
+    final outMethod = _methodLabel(
+      _readString(data, const ['checkOutMethod', 'checkout_method']),
+      isCheckout: true,
+    );
+    if (inMethod == '-' && outMethod == '-') return '-';
+    final parts = <String>[];
+    if (inMethod != '-') parts.add('In: $inMethod');
+    if (outMethod != '-') parts.add('Out: $outMethod');
+    return parts.join(' / ');
+  }
+
+  String _manualReason(Map<String, dynamic> data) {
+    return _readString(data, const ['manualEditReason', 'reason']);
+  }
+
+  String _correctionActor(Map<String, dynamic> data) {
+    final auditMetadata = data['auditMetadata'];
+    if (auditMetadata is Map) {
+      final lastActorName = (auditMetadata['lastActorName'] ?? '').toString().trim();
+      if (lastActorName.isNotEmpty) return lastActorName;
+    }
+    return _readString(data, const ['checkedOutByName', 'checkedInByName']);
+  }
+
+  Widget _adminCorrectedBadge() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF4D6),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: const Color(0xFFE2BC55)),
+      ),
+      child: const Text(
+        'Admin corrected',
+        style: TextStyle(
+          color: Color(0xFF7A5C00),
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+
+  String _auditActionLabel(String value) {
+    switch (value.trim().toUpperCase()) {
+      case 'NFC_CHECK_IN':
+        return 'NFC check-in';
+      case 'QR_CHECK_OUT':
+        return 'Parent QR checkout';
+      case 'MANUAL_CHECK_IN':
+        return 'Manual check-in';
+      case 'MANUAL_CHECK_OUT':
+        return 'Manual check-out';
+      case 'EDIT_RECORD':
+        return 'Record edited';
+      case 'REOPEN_RECORD':
+        return 'Record reopened';
+      case 'MARK_ABSENT':
+        return 'Marked absent';
+      default:
+        return value.trim().isEmpty ? 'Unknown action' : value;
+    }
+  }
+
+  String _formatAuditTimestamp(dynamic value) {
+    final dt = _toDateNullable(value);
+    if (dt == null) return '-';
+    return DateFormat('dd MMM yyyy, hh:mm a').format(dt);
+  }
+
+  String _formatAuditTimeRange(Map<String, dynamic> details) {
+    final previousIn = _formatAuditTimestamp(details['previousCheckInAt']);
+    final previousOut = _formatAuditTimestamp(details['previousCheckOutAt']);
+    final nextIn = _formatAuditTimestamp(details['nextCheckInAt']);
+    final nextOut = _formatAuditTimestamp(details['nextCheckOutAt']);
+    return 'Before: in $previousIn, out $previousOut\nAfter: in $nextIn, out $nextOut';
+  }
+
+  void _openAuditDialog({
+    required String attendanceId,
+    required String childName,
+    required String dateLabel,
+  }) {
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('Audit History • $dateLabel'),
+          content: SizedBox(
+            width: 760,
+            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: _firestore
+                  .collection('attendanceAudit')
+                  .where('attendanceId', isEqualTo: attendanceId)
+                  .snapshots(),
+              builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return Text('Failed to load audit history.\n${snapshot.error}');
+                }
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const SizedBox(
+                    height: 160,
+                    child: Center(child: CircularProgressIndicator(color: Colors.green)),
+                  );
+                }
+
+                final docs = [...?snapshot.data?.docs];
+                docs.sort((a, b) {
+                  final left = _toDateNullable(a.data()['createdAt']) ?? DateTime.fromMillisecondsSinceEpoch(0);
+                  final right = _toDateNullable(b.data()['createdAt']) ?? DateTime.fromMillisecondsSinceEpoch(0);
+                  return right.compareTo(left);
+                });
+
+                if (docs.isEmpty) {
+                  return const Text('No audit entries found for this attendance record.');
+                }
+
+                return ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: docs.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 10),
+                  itemBuilder: (context, index) {
+                    final data = docs[index].data();
+                    final details = data['details'] is Map<String, dynamic>
+                        ? data['details'] as Map<String, dynamic>
+                        : <String, dynamic>{};
+                    final actorName = (data['actorName'] ?? '').toString().trim();
+                    final reason = (data['reason'] ?? '').toString().trim();
+                    final method = (data['method'] ?? '').toString().trim();
+                    final actionLabel = _auditActionLabel((data['action'] ?? '').toString());
+
+                    return Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: const Color(0xFFE0E0E0)),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  actionLabel,
+                                  style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
+                                ),
+                              ),
+                              Text(
+                                _formatAuditTimestamp(data['createdAt']),
+                                style: const TextStyle(color: Colors.black54, fontSize: 12),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          Text('Child: $childName', style: const TextStyle(fontSize: 13)),
+                          Text('Actor: ${actorName.isEmpty ? '-' : actorName}', style: const TextStyle(fontSize: 13)),
+                          Text('Method: ${method.isEmpty ? '-' : method}', style: const TextStyle(fontSize: 13)),
+                          Text('Reason: ${reason.isEmpty ? '-' : reason}', style: const TextStyle(fontSize: 13)),
+                          const SizedBox(height: 6),
+                          Text(
+                            _formatAuditTimeRange(details),
+                            style: const TextStyle(color: Colors.black87, fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   /// 🔍 Apply filter based on selected dropdown value
   List<Map<String, dynamic>> _applyFilter(List<Map<String, dynamic>> records) {
     final now = DateTime.now();
+
+    if (_selectedFilter == "Corrected Only") {
+      return records.where((r) => r['isAdminCorrected'] == true).toList();
+    }
 
     if (_selectedFilter == "This Week") {
       final startOfWeek = now.subtract(Duration(days: now.weekday - 1));
@@ -251,6 +467,7 @@ class _StudentAttendanceDetailScreenState
             value: _selectedFilter,
             items: const [
               DropdownMenuItem(value: "All", child: Text("All")),
+              DropdownMenuItem(value: "Corrected Only", child: Text("Corrected Only")),
               DropdownMenuItem(value: "This Week", child: Text("This Week")),
               DropdownMenuItem(value: "This Month", child: Text("This Month")),
             ],
@@ -268,13 +485,47 @@ class _StudentAttendanceDetailScreenState
                 DataColumn(label: Text("Check In")),
                 DataColumn(label: Text("Check Out")),
                 DataColumn(label: Text("Status")),
+                DataColumn(label: Text("Source")),
+                DataColumn(label: Text("Updated By")),
+                DataColumn(label: Text("Reason")),
+                DataColumn(label: Text("Audit")),
               ],
               rows: filtered.map((r) {
+                final isAdminCorrected = r['isAdminCorrected'] == true;
                 return DataRow(cells: [
                   DataCell(Text(_formatDateOnly(r['date']))),
                   DataCell(Text(_formatTimeOnly(r['checkIn']))),
                   DataCell(Text(_formatTimeOnly(r['checkOut']))),
                   DataCell(Text(r['status'])),
+                  DataCell(
+                    Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (isAdminCorrected) ...[
+                          _adminCorrectedBadge(),
+                          const SizedBox(height: 4),
+                        ],
+                        Text((r['source'] ?? '-').toString()),
+                      ],
+                    ),
+                  ),
+                  DataCell(Text((r['updatedBy'] ?? '').toString().isEmpty
+                      ? '-'
+                      : r['updatedBy'].toString())),
+                  DataCell(Text((r['manualReason'] ?? '').toString().isEmpty
+                      ? '-'
+                      : r['manualReason'].toString())),
+                  DataCell(
+                    TextButton(
+                      onPressed: () => _openAuditDialog(
+                        attendanceId: (r['attendanceId'] ?? '').toString(),
+                        childName: widget.childName,
+                        dateLabel: _formatDateOnly(r['date']),
+                      ),
+                      child: const Text('View'),
+                    ),
+                  ),
                 ]);
               }).toList(),
             ),
@@ -367,18 +618,27 @@ class _StudentAttendanceDetailScreenState
                       (data['manual_out'] == true);
 
                     records.add({
+                      'attendanceId': docId,
+                      'isAdminCorrected': _manualReason(data).isNotEmpty || _sourceSummary(data).toLowerCase().contains('admin manual'),
                       'date': effectiveDate,
+                      'source': _sourceSummary(data),
+                      'updatedBy': _correctionActor(data),
+                      'manualReason': _manualReason(data),
                       'checkIn': data['check_in_time'] ??
+                        data['checkInAt'] ??
                           data['checkInTime'] ??
                           data['check_in'],
                       'checkOut': data['check_out_time'] ??
+                        data['checkOutAt'] ??
                           data['checkOutTime'] ??
                           data['check_out'],
                       'teacher': data['teacher'] ?? '-',
                       'pickedBy': data['parentName'] ?? data['pickedBy'] ?? '-',
-                      'status': presentFlag
-                          ? (manualFlag ? "Manual" : "On Time")
-                          : "Absent",
+                        'status': (data['check_out_time'] ?? data['checkOutTime'] ?? data['check_out']) != null
+                          ? "Checked Out"
+                          : (presentFlag
+                            ? (manualFlag ? "Manual" : "On Time")
+                            : "Absent"),
                     });
                   }
 

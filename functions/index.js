@@ -378,6 +378,502 @@ exports.notifyParentOnAttendanceChange = onDocumentWritten(
   },
 );
 
+exports.attendanceNfcCheckIn = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireStaff(req);
+
+    const childId = String(req.data && req.data.childId ? req.data.childId : "").trim();
+    const nfcUid = String(req.data && req.data.nfcUid ? req.data.nfcUid : "").trim().toUpperCase();
+    const actor = attendanceActor(req, req.data && (req.data.actorName || req.data.teacherName || req.data.adminName));
+
+    if (!childId) {
+      throw callableError("missing-child-id", "invalid-argument");
+    }
+
+    const db = admin.firestore();
+    const childRef = db.collection("children").doc(childId);
+    const childSnap = await childRef.get();
+    if (!childSnap.exists) {
+      throw callableError("child-not-found", "not-found");
+    }
+
+    const childData = childSnap.data() || {};
+    const childName = attendanceChildName(childData) || childId;
+    const parentName = attendanceParentName(childData, null);
+    const dayInfo = attendanceDayInfo();
+    const attendanceId = `${dayInfo.key}_${childId}`;
+    const attendanceRef = db.collection("attendance").doc(attendanceId);
+    const auditRef = db.collection("attendanceAudit").doc();
+
+    await db.runTransaction(async (tx) => {
+      const attendanceSnap = await tx.get(attendanceRef);
+      const existing = attendanceSnap.exists ? (attendanceSnap.data() || {}) : {};
+      const currentStatus = attendanceStatusValue(existing);
+
+      if (currentStatus === "CHECKED_IN") {
+        throw callableError("attendance-already-open", "already-exists");
+      }
+      if (currentStatus === "CHECKED_OUT") {
+        throw callableError("attendance-already-closed", "already-exists");
+      }
+
+      tx.set(attendanceRef, {
+        attendanceId,
+        childId,
+        childRef,
+        name: childName,
+        parentName,
+        nfc_uid: nfcUid || String(existing.nfc_uid || "").trim(),
+        date: admin.firestore.Timestamp.fromDate(dayInfo.startOfDayUtc),
+        dateKey: dayInfo.key,
+        status: "CHECKED_IN",
+        checkInAt: admin.firestore.FieldValue.serverTimestamp(),
+        checkInMethod: "NFC",
+        checkedInBy: {
+          uid: actor.uid,
+          role: actor.role,
+          displayName: actor.displayName,
+          email: actor.email,
+          phoneE164: actor.phoneE164,
+        },
+        checkedInByUid: actor.uid,
+        checkedInByRole: actor.role,
+        checkedInByName: actor.displayName,
+        createdAt: attendanceSnap.exists ? (existing.createdAt || admin.firestore.FieldValue.serverTimestamp()) : admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastEditedBy: actor.uid,
+        manualEditReason: existing.manualEditReason || "",
+        notes: existing.notes || "",
+        auditMetadata: {
+          lastAction: "CHECK_IN",
+          lastMethod: "NFC",
+          lastActorUid: actor.uid,
+          lastActorRole: actor.role,
+          lastActorName: actor.displayName,
+        },
+
+        check_in_time: admin.firestore.FieldValue.serverTimestamp(),
+        isPresent: true,
+        is_present: true,
+        checkin_method: "NFC",
+        manual_in: false,
+        manual_out: false,
+        manualCheckout: false,
+        checkout_approval: false,
+        reason: String(existing.reason || "Default"),
+        teacher: actor.displayName || String(existing.teacher || ""),
+      }, { merge: true });
+
+      tx.set(auditRef, attendanceAuditEntry({
+        action: "CHECK_IN",
+        attendanceId,
+        childId,
+        actor,
+        method: "NFC",
+        details: {
+          childName,
+          dateKey: dayInfo.key,
+          nfcUid,
+        },
+      }));
+    });
+
+    return {
+      ok: true,
+      attendanceId,
+      childId,
+      childName,
+      dateKey: dayInfo.key,
+      status: "CHECKED_IN",
+    };
+  } catch (err) {
+    logger.error("attendanceNfcCheckIn failed", err);
+    return { ok: false, reason: callableErrorReason(err) };
+  }
+});
+
+exports.attendanceCheckoutWithParentQr = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireStaff(req);
+
+    const rawToken = String(req.data && (req.data.qrToken || req.data.token) ? (req.data.qrToken || req.data.token) : "").trim();
+    const tokenValue = rawToken.replace(/^QR_/, "").trim();
+    const expectedChildId = String(req.data && req.data.expectedChildId ? req.data.expectedChildId : "").trim();
+    const actor = attendanceActor(req, req.data && (req.data.actorName || req.data.teacherName || req.data.adminName));
+
+    if (!tokenValue) {
+      throw callableError("missing-qr-token", "invalid-argument");
+    }
+
+    const db = admin.firestore();
+    const parentQuery = await db.collection("parents")
+      .where("dailyQrToken", "==", tokenValue)
+      .limit(1)
+      .get();
+
+    if (parentQuery.empty) {
+      throw callableError("pickup-token-not-found", "not-found");
+    }
+
+    const parentSnap = parentQuery.docs[0];
+    const parentData = parentSnap.data() || {};
+    const parentRef = parentSnap.ref;
+    const tokenRef = parentRef.collection("tokens").doc(tokenValue);
+    const auditRef = db.collection("attendanceAudit").doc();
+    const dayInfo = attendanceDayInfo();
+
+    const result = await db.runTransaction(async (tx) => {
+      const tokenSnap = await tx.get(tokenRef);
+      if (!tokenSnap.exists) {
+        throw callableError("pickup-token-not-found", "not-found");
+      }
+
+      const tokenData = tokenSnap.data() || {};
+      const childId = String(tokenData.childId || parentData.childId || "").trim();
+      if (!childId) {
+        throw callableError("pickup-token-missing-child", "failed-precondition");
+      }
+      if (expectedChildId && expectedChildId !== childId) {
+        throw callableError("pickup-token-child-mismatch", "permission-denied");
+      }
+
+      if (tokenData.used === true) {
+        throw callableError("pickup-token-already-used", "already-exists");
+      }
+
+      const expiredAt = attendanceTimestampToDate(tokenData.expiredAt);
+      if (expiredAt && expiredAt.getTime() < Date.now()) {
+        throw callableError("pickup-token-expired", "deadline-exceeded");
+      }
+
+      const attendanceId = `${dayInfo.key}_${childId}`;
+      const attendanceRef = db.collection("attendance").doc(attendanceId);
+      const attendanceSnap = await tx.get(attendanceRef);
+      if (!attendanceSnap.exists) {
+        throw callableError("attendance-not-found", "not-found");
+      }
+
+      const attendanceData = attendanceSnap.data() || {};
+      if (!attendanceHasCheckIn(attendanceData)) {
+        throw callableError("attendance-not-checked-in", "failed-precondition");
+      }
+      if (attendanceHasCheckOut(attendanceData)) {
+        throw callableError("attendance-already-closed", "already-exists");
+      }
+
+      const childName = String(tokenData.childName || attendanceData.name || childId).trim() || childId;
+      const parentName = String(parentData.parentName || attendanceData.parentName || "-").trim() || "-";
+      const representativeName = String(
+        tokenData.representativeName || parentData.representativeName || parentName,
+      ).trim() || parentName;
+      const representativeRole = String(tokenData.representativeRole || parentData.representativeRole || "").trim();
+      const parentPhone = String(parentData.phoneE164 || parentData.phone || "").trim();
+
+      tx.set(attendanceRef, {
+        attendanceId,
+        childId,
+        name: childName,
+        parentName,
+        date: attendanceData.date || admin.firestore.Timestamp.fromDate(dayInfo.startOfDayUtc),
+        dateKey: attendanceData.dateKey || dayInfo.key,
+        status: "CHECKED_OUT",
+        checkOutAt: admin.firestore.FieldValue.serverTimestamp(),
+        checkOutMethod: "PARENT_QR",
+        checkedOutBy: {
+          uid: actor.uid,
+          role: actor.role,
+          displayName: actor.displayName,
+          email: actor.email,
+          phoneE164: actor.phoneE164,
+        },
+        checkedOutByUid: actor.uid,
+        checkedOutByRole: actor.role,
+        checkedOutByName: actor.displayName,
+        pickupGuardianId: parentRef.id,
+        pickupGuardianNameSnapshot: representativeName,
+        pickupGuardianRoleSnapshot: representativeRole,
+        pickupVerifiedByTeacherId: actor.uid,
+        pickupVerifiedByTeacherName: actor.displayName,
+        pickupVerificationMethod: "PARENT_QR_TOKEN",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastEditedBy: actor.uid,
+        auditMetadata: {
+          lastAction: "CHECK_OUT",
+          lastMethod: "PARENT_QR",
+          lastActorUid: actor.uid,
+          lastActorRole: actor.role,
+          lastActorName: actor.displayName,
+        },
+
+        check_out_time: admin.firestore.FieldValue.serverTimestamp(),
+        checkout_method: "PARENT_QR",
+        checkout_approval: true,
+        isPresent: true,
+        is_present: true,
+        teacher: actor.displayName || String(attendanceData.teacher || ""),
+      }, { merge: true });
+
+      tx.set(tokenRef, {
+        used: true,
+        usedAt: admin.firestore.FieldValue.serverTimestamp(),
+        usedByUid: actor.uid,
+        usedByRole: actor.role,
+        usedByName: actor.displayName,
+      }, { merge: true });
+
+      tx.set(auditRef, attendanceAuditEntry({
+        action: "CHECK_OUT",
+        attendanceId,
+        childId,
+        actor,
+        method: "PARENT_QR",
+        details: {
+          childName,
+          parentId: parentRef.id,
+          parentName,
+          parentPhone,
+          representativeName,
+          representativeRole,
+          tokenValue,
+        },
+      }));
+
+      return {
+        attendanceId,
+        childId,
+        childName,
+        parentName,
+        parentPhone,
+        representativeName,
+        representativeRole,
+        status: "CHECKED_OUT",
+      };
+    });
+
+    return { ok: true, ...result };
+  } catch (err) {
+    logger.error("attendanceCheckoutWithParentQr failed", err);
+    return { ok: false, reason: callableErrorReason(err) };
+  }
+});
+
+exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+
+    const action = String(req.data && req.data.action ? req.data.action : "").trim().toUpperCase();
+    const childId = String(req.data && req.data.childId ? req.data.childId : "").trim();
+    const attendanceDate = String(req.data && req.data.attendanceDate ? req.data.attendanceDate : "").trim();
+    const reason = String(req.data && req.data.reason ? req.data.reason : "").trim();
+    const notes = String(req.data && req.data.notes ? req.data.notes : "").trim();
+    const actor = attendanceActor(req, req.data && (req.data.adminName || req.data.actorName));
+
+    if (!childId) throw callableError("missing-child-id", "invalid-argument");
+    if (!attendanceDate) throw callableError("missing-attendance-date", "invalid-argument");
+    if (!reason) throw callableError("missing-reason", "invalid-argument");
+
+    const allowedActions = new Set([
+      "MANUAL_CHECK_IN",
+      "MANUAL_CHECK_OUT",
+      "MARK_ABSENT",
+      "EDIT_RECORD",
+      "REOPEN_RECORD",
+    ]);
+    if (!allowedActions.has(action)) {
+      throw callableError("invalid-override-action", "invalid-argument");
+    }
+
+    const checkInAt = attendanceTimestampField(req.data && req.data.checkInAt, "check-in-at", action === "MANUAL_CHECK_IN");
+    const checkOutAt = attendanceTimestampField(req.data && req.data.checkOutAt, "check-out-at", false);
+    const dayInfo = attendanceDayInfoFromDateKey(attendanceDate);
+    const attendanceId = `${dayInfo.key}_${childId}`;
+    const db = admin.firestore();
+    const childRef = db.collection("children").doc(childId);
+    const childSnap = await childRef.get();
+    if (!childSnap.exists) {
+      throw callableError("child-not-found", "not-found");
+    }
+
+    const childData = childSnap.data() || {};
+    const childName = attendanceChildName(childData) || childId;
+    const parentName = attendanceParentName(childData, null);
+    const attendanceRef = db.collection("attendance").doc(attendanceId);
+    const auditRef = db.collection("attendanceAudit").doc();
+
+    const result = await db.runTransaction(async (tx) => {
+      const attendanceSnap = await tx.get(attendanceRef);
+      const existing = attendanceSnap.exists ? (attendanceSnap.data() || {}) : {};
+      const existingCheckIn = attendanceHasCheckIn(existing) ? (existing.checkInAt || existing.check_in_time || null) : null;
+      const existingCheckOut = attendanceHasCheckOut(existing) ? (existing.checkOutAt || existing.check_out_time || null) : null;
+      const hadCompletedRecord = Boolean(existingCheckOut);
+
+      let nextCheckIn = existingCheckIn;
+      let nextCheckOut = existingCheckOut;
+      let nextStatus = attendanceStatusValue(existing);
+      let nextCheckInMethod = existing.checkInMethod || existing.checkin_method || null;
+      let nextCheckOutMethod = existing.checkOutMethod || existing.checkout_method || null;
+
+      if (action === "MANUAL_CHECK_IN") {
+        if (existingCheckIn) {
+          throw callableError("attendance-already-open", "already-exists");
+        }
+        nextCheckIn = admin.firestore.Timestamp.fromDate(checkInAt);
+        nextCheckOut = null;
+        nextStatus = "CHECKED_IN";
+        nextCheckInMethod = "MANUAL";
+        nextCheckOutMethod = null;
+      } else if (action === "MANUAL_CHECK_OUT") {
+        if (!existingCheckIn) {
+          throw callableError("attendance-not-checked-in", "failed-precondition");
+        }
+        if (existingCheckOut) {
+          throw callableError("attendance-already-closed", "already-exists");
+        }
+        const resolvedOut = checkOutAt || new Date();
+        if (existingCheckIn && resolvedOut.getTime() < existingCheckIn.toDate().getTime()) {
+          throw callableError("checkout-before-checkin", "failed-precondition");
+        }
+        nextCheckOut = admin.firestore.Timestamp.fromDate(resolvedOut);
+        nextStatus = "CHECKED_OUT";
+        nextCheckOutMethod = "MANUAL";
+      } else if (action === "MARK_ABSENT") {
+        nextCheckIn = null;
+        nextCheckOut = null;
+        nextStatus = "NOT_CHECKED_IN";
+        nextCheckInMethod = null;
+        nextCheckOutMethod = null;
+      } else if (action === "REOPEN_RECORD") {
+        if (!existingCheckOut) {
+          throw callableError("attendance-not-closed", "failed-precondition");
+        }
+        nextCheckOut = null;
+        nextStatus = existingCheckIn ? "CHECKED_IN" : "NOT_CHECKED_IN";
+        nextCheckOutMethod = null;
+      } else if (action === "EDIT_RECORD") {
+        const editedCheckIn = attendanceTimestampField(req.data && req.data.checkInAt, "check-in-at", false);
+        const editedCheckOut = attendanceTimestampField(req.data && req.data.checkOutAt, "check-out-at", false);
+
+        if (!editedCheckIn && !editedCheckOut && !notes) {
+          throw callableError("missing-edit-fields", "invalid-argument");
+        }
+        if (editedCheckOut && !editedCheckIn) {
+          throw callableError("checkout-without-checkin", "failed-precondition");
+        }
+        if (editedCheckIn && editedCheckOut && editedCheckOut.getTime() < editedCheckIn.getTime()) {
+          throw callableError("checkout-before-checkin", "failed-precondition");
+        }
+
+        nextCheckIn = editedCheckIn ? admin.firestore.Timestamp.fromDate(editedCheckIn) : null;
+        nextCheckOut = editedCheckOut ? admin.firestore.Timestamp.fromDate(editedCheckOut) : null;
+        nextCheckInMethod = editedCheckIn ? "MANUAL" : null;
+        nextCheckOutMethod = editedCheckOut ? "MANUAL" : null;
+        nextStatus = editedCheckOut ? "CHECKED_OUT" : (editedCheckIn ? "CHECKED_IN" : "NOT_CHECKED_IN");
+      }
+
+      tx.set(attendanceRef, {
+        attendanceId,
+        childId,
+        childRef,
+        name: childName,
+        parentName,
+        date: existing.date || admin.firestore.Timestamp.fromDate(dayInfo.startOfDayUtc),
+        dateKey: dayInfo.key,
+        status: nextStatus,
+        checkInAt: nextCheckIn,
+        checkOutAt: nextCheckOut,
+        checkInMethod: nextCheckIn ? String(nextCheckInMethod || "MANUAL") : null,
+        checkOutMethod: nextCheckOut ? String(nextCheckOutMethod || "MANUAL") : null,
+        checkedInBy: nextCheckIn ? {
+          uid: actor.uid,
+          role: actor.role,
+          displayName: actor.displayName,
+          email: actor.email,
+          phoneE164: actor.phoneE164,
+        } : null,
+        checkedOutBy: nextCheckOut ? {
+          uid: actor.uid,
+          role: actor.role,
+          displayName: actor.displayName,
+          email: actor.email,
+          phoneE164: actor.phoneE164,
+        } : null,
+        checkedInByUid: nextCheckIn ? actor.uid : null,
+        checkedInByRole: nextCheckIn ? actor.role : null,
+        checkedInByName: nextCheckIn ? actor.displayName : null,
+        checkedOutByUid: nextCheckOut ? actor.uid : null,
+        checkedOutByRole: nextCheckOut ? actor.role : null,
+        checkedOutByName: nextCheckOut ? actor.displayName : null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: existing.createdAt || admin.firestore.FieldValue.serverTimestamp(),
+        lastEditedBy: actor.uid,
+        manualEditReason: reason,
+        notes,
+        auditMetadata: {
+          lastAction: action,
+          lastMethod: "MANUAL",
+          lastActorUid: actor.uid,
+          lastActorRole: actor.role,
+          lastActorName: actor.displayName,
+        },
+
+        check_in_time: nextCheckIn,
+        check_out_time: nextCheckOut,
+        isPresent: Boolean(nextCheckIn || nextCheckOut),
+        is_present: Boolean(nextCheckIn || nextCheckOut),
+        checkin_method: nextCheckIn ? String(nextCheckInMethod || "MANUAL") : "NONE",
+        checkout_method: nextCheckOut ? String(nextCheckOutMethod || "MANUAL") : null,
+        manual_in: Boolean(nextCheckIn),
+        manual_out: Boolean(nextCheckOut),
+        manualCheckout: Boolean(nextCheckOut),
+        checkout_approval: nextCheckOut ? true : Boolean(existing.checkout_approval || false),
+        reason,
+        teacher: actor.displayName || String(existing.teacher || ""),
+      }, { merge: true });
+
+      tx.set(auditRef, attendanceAuditEntry({
+        action,
+        attendanceId,
+        childId,
+        actor,
+        method: "MANUAL",
+        reason,
+        details: {
+          childName,
+          attendanceDate: dayInfo.key,
+          previousStatus: attendanceStatusValue(existing),
+          nextStatus,
+          previousCheckInAt: existingCheckIn,
+          previousCheckOutAt: existingCheckOut,
+          nextCheckInAt: nextCheckIn,
+          nextCheckOutAt: nextCheckOut,
+          notes,
+        },
+      }));
+
+      return {
+        attendanceId,
+        status: nextStatus,
+        hadCompletedRecord,
+      };
+    });
+
+    const billingRefresh = await refreshUnpaidInvoiceForAttendanceChange({
+      req,
+      childId,
+      attendanceDate: dayInfo.key,
+      action,
+      reason,
+      notes,
+      actor,
+    });
+
+    return { ok: true, ...result, billingRefresh };
+  } catch (err) {
+    logger.error("attendanceAdminOverride failed", err);
+    return { ok: false, reason: callableErrorReason(err) };
+  }
+});
+
 // 🔔 Firestore trigger — runs every time a new message is added
 exports.sendChatNotification = onDocumentCreated(
   "chats/{chatId}/messages/{messageId}",
@@ -518,6 +1014,161 @@ function callableErrorReason(err) {
   return "unknown-error";
 }
 
+function billingErrorDescriptor(reason, code = "failed-precondition", context = {}) {
+  const normalizedReason = String(reason || "unknown-error").trim() || "unknown-error";
+  const normalizedCode = String(code || "failed-precondition").trim() || "failed-precondition";
+  const health = context && typeof context.health === "object" ? context.health : null;
+
+  if (normalizedReason === "unauthenticated" || normalizedCode === "unauthenticated" || normalizedReason === "http-401") {
+    return {
+      reason: normalizedReason,
+      code: "unauthenticated",
+      category: "auth",
+      message: "Login expired. Please sign in again.",
+    };
+  }
+
+  if (normalizedReason === "admin-only" || normalizedReason === "permission-denied" || normalizedReason === "http-403") {
+    return {
+      reason: normalizedReason,
+      code: "permission-denied",
+      category: "permission",
+      message: "Admin access is required for this action.",
+    };
+  }
+
+  if (normalizedReason === "missing-version") {
+    return {
+      reason: normalizedReason,
+      code: "invalid-argument",
+      category: "validation",
+      message: "Version is required before saving the billing catalog.",
+    };
+  }
+
+  if (normalizedReason === "missing-catalogId") {
+    return {
+      reason: normalizedReason,
+      code: "invalid-argument",
+      category: "validation",
+      message: "Select a billing catalog before activating it.",
+    };
+  }
+
+  if (normalizedReason === "catalog-not-found") {
+    return {
+      reason: normalizedReason,
+      code: "not-found",
+      category: "not-found",
+      message: "The selected billing catalog no longer exists.",
+    };
+  }
+
+  if (normalizedReason === "invalid-catalog") {
+    const missingRequiredCodes = Array.isArray(health && health.missingRequiredCodes) ? health.missingRequiredCodes.filter(Boolean) : [];
+    return {
+      reason: normalizedReason,
+      code: "failed-precondition",
+      category: "billing-catalog",
+      message: missingRequiredCodes.length
+        ? `Billing catalog is incomplete. Missing required codes: ${missingRequiredCodes.join(", ")}.`
+        : "Billing catalog is incomplete or invalid.",
+    };
+  }
+
+  if (normalizedReason === "no-linked-children") {
+    return {
+      reason: normalizedReason,
+      code: "failed-precondition",
+      category: "billing-generation",
+      message: "No linked children were found for this parent.",
+    };
+  }
+
+  if (normalizedReason === "no-billable-items") {
+    return {
+      reason: normalizedReason,
+      code: "failed-precondition",
+      category: "billing-generation",
+      message: "No billable items were found for the selected billing period.",
+    };
+  }
+
+  if (normalizedReason === "payment-provider-disabled") {
+    return {
+      reason: normalizedReason,
+      code: "failed-precondition",
+      category: "payment-configuration",
+      message: "The configured payment provider is disabled. Dummy payment mode remains active.",
+    };
+  }
+
+  if (normalizedReason === "payment-provider-not-configured") {
+    return {
+      reason: normalizedReason,
+      code: "failed-precondition",
+      category: "payment-configuration",
+      message: "Payment provider settings are incomplete. Dummy payment mode remains active.",
+    };
+  }
+
+  if (normalizedReason === "payment-provider-not-implemented") {
+    return {
+      reason: normalizedReason,
+      code: "unimplemented",
+      category: "payment-configuration",
+      message: "This payment provider path is not implemented. Dummy payment mode remains active.",
+    };
+  }
+
+  if (normalizedReason === "invoice-not-found") {
+    return {
+      reason: normalizedReason,
+      code: "not-found",
+      category: "not-found",
+      message: "The requested invoice could not be found.",
+    };
+  }
+
+  if (normalizedCode === "internal") {
+    return {
+      reason: normalizedReason,
+      code: normalizedCode,
+      category: "internal",
+      message: "Unexpected billing backend error. Check the function logs for details.",
+    };
+  }
+
+  return {
+    reason: normalizedReason,
+    code: normalizedCode,
+    category: "operation",
+    message: normalizedReason,
+  };
+}
+
+function billingCallableFailure(reason, options = {}) {
+  const descriptor = billingErrorDescriptor(reason, options.code, options);
+  const payload = {
+    ok: false,
+    reason: descriptor.reason,
+    code: descriptor.code,
+    category: descriptor.category,
+    message: descriptor.message,
+  };
+  const extras = { ...options };
+  delete extras.code;
+  Object.assign(payload, extras);
+  return payload;
+}
+
+function billingCallableFailureFromError(err, options = {}) {
+  return billingCallableFailure(callableErrorReason(err), {
+    ...options,
+    code: String((err && err.code) || options.code || "internal"),
+  });
+}
+
 function requireAuth(req) {
   if (!req.auth) {
     throw callableError("unauthenticated", "unauthenticated");
@@ -531,6 +1182,526 @@ function requireAdmin(req) {
     throw callableError("admin-only", "permission-denied");
   }
 }
+
+function requireStaff(req) {
+  requireAuth(req);
+  const role = req && req.auth && req.auth.token ? String(req.auth.token.role || "").toLowerCase() : "";
+  if (role !== "admin" && role !== "teacher") {
+    throw callableError("staff-only", "permission-denied");
+  }
+  return role;
+}
+
+const ATTENDANCE_TIME_ZONE = "Asia/Kuala_Lumpur";
+const ATTENDANCE_UTC_OFFSET_HOURS = 8;
+
+function attendanceActor(req, fallbackDisplayName = "") {
+  const token = req && req.auth && req.auth.token ? req.auth.token : {};
+  const displayName = String(
+    fallbackDisplayName
+      || token.name
+      || token.email
+      || token.phone_number
+      || "",
+  ).trim();
+
+  return {
+    uid: String((req && req.auth && req.auth.uid) || ""),
+    role: String(token.role || "").trim().toLowerCase(),
+    email: String(token.email || "").trim(),
+    phoneE164: String(token.phone_number || "").trim(),
+    displayName,
+  };
+}
+
+function attendanceDayInfo(at = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: ATTENDANCE_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(at);
+
+  const values = {};
+  for (const part of parts) {
+    if (part.type === "year" || part.type === "month" || part.type === "day") {
+      values[part.type] = part.value;
+    }
+  }
+
+  const year = Number(values.year);
+  const month = Number(values.month);
+  const day = Number(values.day);
+  const key = `${values.year}-${values.month}-${values.day}`;
+  const startOfDayUtc = new Date(Date.UTC(year, month - 1, day, -ATTENDANCE_UTC_OFFSET_HOURS, 0, 0, 0));
+
+  return {
+    key,
+    year,
+    month,
+    day,
+    startOfDayUtc,
+  };
+}
+
+function attendanceDayInfoFromDateKey(dateKey) {
+  const normalized = String(dateKey || "").trim();
+  const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    throw callableError("invalid-attendance-date", "invalid-argument");
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  return {
+    key: normalized,
+    year,
+    month,
+    day,
+    startOfDayUtc: new Date(Date.UTC(year, month - 1, day, -ATTENDANCE_UTC_OFFSET_HOURS, 0, 0, 0)),
+  };
+}
+
+function attendanceTimestampField(raw, fieldName, required = false) {
+  const value = String(raw || "").trim();
+  if (!value) {
+    if (required) {
+      throw callableError(`missing-${fieldName}`, "invalid-argument");
+    }
+    return null;
+  }
+
+  const dt = new Date(value);
+  if (Number.isNaN(dt.getTime())) {
+    throw callableError(`invalid-${fieldName}`, "invalid-argument");
+  }
+  return dt;
+}
+
+function attendanceHasCheckIn(data) {
+  return Boolean(data && (data.checkInAt || data.check_in_time || data.checkInTime));
+}
+
+function attendanceHasCheckOut(data) {
+  return Boolean(data && (data.checkOutAt || data.check_out_time || data.checkOutTime || data.checkoutTime));
+}
+
+function attendanceStatusValue(data) {
+  const status = String(data && data.status ? data.status : "").trim().toUpperCase();
+  if (status) return status;
+  if (attendanceHasCheckOut(data)) return "CHECKED_OUT";
+  if (attendanceHasCheckIn(data)) return "CHECKED_IN";
+  return "NOT_CHECKED_IN";
+}
+
+function attendanceChildName(data) {
+  return String((data && (data.name || data.childName)) || "").trim();
+}
+
+function attendanceParentName(childData, parentData) {
+  return String(
+    (childData && (childData.parentName || childData.parent_name || childData.parentContact))
+      || (parentData && parentData.parentName)
+      || "-",
+  ).trim() || "-";
+}
+
+function attendanceAuditEntry({ action, attendanceId, childId, actor, method, reason, details }) {
+  return {
+    action: String(action || "unknown"),
+    attendanceId: String(attendanceId || ""),
+    childId: String(childId || ""),
+    actorUid: String(actor && actor.uid ? actor.uid : ""),
+    actorRole: String(actor && actor.role ? actor.role : ""),
+    actorEmail: String(actor && actor.email ? actor.email : ""),
+    actorPhoneE164: String(actor && actor.phoneE164 ? actor.phoneE164 : ""),
+    actorName: String(actor && actor.displayName ? actor.displayName : ""),
+    method: String(method || ""),
+    reason: String(reason || ""),
+    details: details && typeof details === "object" ? details : {},
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+function casualTransitVisitActor(req, fallbackDisplayName = "") {
+  return attendanceActor(req, fallbackDisplayName);
+}
+
+function casualTransitVisitStatus(data) {
+  const status = String(data && data.status ? data.status : "").trim().toUpperCase();
+  return status || "OPEN";
+}
+
+function casualTransitMoneySen(raw, fieldName, { required = false, min = 0 } = {}) {
+  const value = raw === undefined || raw === null ? "" : String(raw).trim();
+  if (!value) {
+    if (required) {
+      throw callableError(`missing-${fieldName}`, "invalid-argument");
+    }
+    return null;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw callableError(`invalid-${fieldName}`, "invalid-argument");
+  }
+
+  const rounded = Math.round(parsed);
+  if (rounded < min) {
+    throw callableError(`invalid-${fieldName}`, "invalid-argument");
+  }
+  return rounded;
+}
+
+function casualTransitPhone(raw) {
+  return String(raw || "").replace(/[^0-9+]/g, "").trim();
+}
+
+function casualTransitReceiptNo(visitRef) {
+  return `CT-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${visitRef.id.slice(0, 6).toUpperCase()}`;
+}
+
+function casualTransitAuditEntry({ action, visitId, actor, reason, details }) {
+  return {
+    action: String(action || "unknown"),
+    visitId: String(visitId || ""),
+    actorUid: String(actor && actor.uid ? actor.uid : ""),
+    actorRole: String(actor && actor.role ? actor.role : ""),
+    actorEmail: String(actor && actor.email ? actor.email : ""),
+    actorPhoneE164: String(actor && actor.phoneE164 ? actor.phoneE164 : ""),
+    actorName: String(actor && actor.displayName ? actor.displayName : ""),
+    reason: String(reason || ""),
+    details: details && typeof details === "object" ? details : {},
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+exports.casualTransitCreateVisit = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+
+    const childName = String(req.data && req.data.childName ? req.data.childName : "").trim();
+    const guardianName = String(req.data && req.data.guardianName ? req.data.guardianName : "").trim();
+    const guardianPhone = casualTransitPhone(req.data && req.data.guardianPhone);
+    const guardianRelationship = String(req.data && req.data.guardianRelationship ? req.data.guardianRelationship : "").trim();
+    const notes = String(req.data && req.data.notes ? req.data.notes : "").trim();
+    const actor = casualTransitVisitActor(req, req.data && (req.data.adminName || req.data.actorName));
+
+    if (!childName) throw callableError("missing-child-name", "invalid-argument");
+    if (!guardianName) throw callableError("missing-guardian-name", "invalid-argument");
+    if (!guardianPhone) throw callableError("missing-guardian-phone", "invalid-argument");
+
+    const db = admin.firestore();
+    const visitRef = db.collection("casualTransitVisits").doc();
+    const auditRef = db.collection("casualTransitAudit").doc();
+    const dayInfo = attendanceDayInfo();
+
+    await db.runTransaction(async (tx) => {
+      tx.set(visitRef, {
+        visitId: visitRef.id,
+        childName,
+        guardianName,
+        guardianPhone,
+        guardianRelationship,
+        notes,
+        visitDateKey: dayInfo.key,
+        visitDate: admin.firestore.Timestamp.fromDate(dayInfo.startOfDayUtc),
+        status: "OPEN",
+        paymentStatus: "PENDING",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        checkInAt: admin.firestore.FieldValue.serverTimestamp(),
+        checkInMethod: "ADMIN_MANUAL",
+        createdByUid: actor.uid,
+        createdByRole: actor.role,
+        createdByName: actor.displayName,
+        createdByEmail: actor.email,
+      }, { merge: true });
+
+      tx.set(auditRef, casualTransitAuditEntry({
+        action: "CREATE_VISIT",
+        visitId: visitRef.id,
+        actor,
+        details: {
+          childName,
+          guardianName,
+          guardianPhone,
+          guardianRelationship,
+          visitDateKey: dayInfo.key,
+          notes,
+        },
+      }));
+    });
+
+    return {
+      ok: true,
+      visitId: visitRef.id,
+      status: "OPEN",
+      paymentStatus: "PENDING",
+      visitDateKey: dayInfo.key,
+      childName,
+      guardianName,
+    };
+  } catch (err) {
+    logger.error("casualTransitCreateVisit failed", err);
+    return { ok: false, reason: callableErrorReason(err) };
+  }
+});
+
+exports.casualTransitCheckoutVisit = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+
+    const visitId = String(req.data && req.data.visitId ? req.data.visitId : "").trim();
+    const amountSen = casualTransitMoneySen(req.data && req.data.amountSen, "amount-sen", { required: true, min: 0 });
+    const paymentMethodRaw = String(req.data && req.data.paymentMethod ? req.data.paymentMethod : "Cash").trim();
+    const paymentMethod = paymentMethodRaw || "Cash";
+    const notes = String(req.data && req.data.notes ? req.data.notes : "").trim();
+    const actor = casualTransitVisitActor(req, req.data && (req.data.adminName || req.data.actorName));
+
+    if (!visitId) throw callableError("missing-visit-id", "invalid-argument");
+
+    const db = admin.firestore();
+    const visitRef = db.collection("casualTransitVisits").doc(visitId);
+    const auditRef = db.collection("casualTransitAudit").doc();
+
+    const result = await db.runTransaction(async (tx) => {
+      const visitSnap = await tx.get(visitRef);
+      if (!visitSnap.exists) {
+        throw callableError("visit-not-found", "not-found");
+      }
+
+      const visit = visitSnap.data() || {};
+      if (casualTransitVisitStatus(visit) !== "OPEN") {
+        throw callableError("visit-already-closed", "already-exists");
+      }
+
+      const receiptNo = String(visit.receiptNo || casualTransitReceiptNo(visitRef));
+      tx.set(visitRef, {
+        status: "CLOSED",
+        paymentStatus: "PAID",
+        paymentMethod,
+        amountSen,
+        receiptNo,
+        notes,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        checkOutAt: admin.firestore.FieldValue.serverTimestamp(),
+        checkedOutByUid: actor.uid,
+        checkedOutByRole: actor.role,
+        checkedOutByName: actor.displayName,
+        checkedOutByEmail: actor.email,
+      }, { merge: true });
+
+      tx.set(auditRef, casualTransitAuditEntry({
+        action: "CHECKOUT_VISIT",
+        visitId,
+        actor,
+        details: {
+          childName: String(visit.childName || ""),
+          guardianName: String(visit.guardianName || ""),
+          amountSen,
+          paymentMethod,
+          receiptNo,
+          notes,
+        },
+      }));
+
+      return {
+        visitId,
+        status: "CLOSED",
+        paymentStatus: "PAID",
+        amountSen,
+        paymentMethod,
+        receiptNo,
+        childName: String(visit.childName || ""),
+        guardianName: String(visit.guardianName || ""),
+      };
+    });
+
+    return { ok: true, ...result };
+  } catch (err) {
+    logger.error("casualTransitCheckoutVisit failed", err);
+    return { ok: false, reason: callableErrorReason(err) };
+  }
+});
+
+exports.casualTransitAdminOverride = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+
+    const action = String(req.data && req.data.action ? req.data.action : "").trim().toUpperCase();
+    const visitId = String(req.data && req.data.visitId ? req.data.visitId : "").trim();
+    const reason = String(req.data && req.data.reason ? req.data.reason : "").trim();
+    const notes = String(req.data && req.data.notes ? req.data.notes : "").trim();
+    const actor = casualTransitVisitActor(req, req.data && (req.data.adminName || req.data.actorName));
+
+    if (!visitId) throw callableError("missing-visit-id", "invalid-argument");
+    if (!reason) throw callableError("missing-reason", "invalid-argument");
+
+    const allowedActions = new Set(["EDIT_VISIT", "REOPEN_VISIT", "CANCEL_VISIT"]);
+    if (!allowedActions.has(action)) {
+      throw callableError("invalid-override-action", "invalid-argument");
+    }
+
+    const editedCheckInAt = attendanceTimestampField(req.data && req.data.checkInAt, "check-in-at", false);
+    const editedCheckOutAt = attendanceTimestampField(req.data && req.data.checkOutAt, "check-out-at", false);
+    const editedAmountSen = casualTransitMoneySen(req.data && req.data.amountSen, "amount-sen", { required: false, min: 0 });
+    const editedPaymentMethod = String(req.data && req.data.paymentMethod ? req.data.paymentMethod : "").trim();
+    const editedChildName = String(req.data && req.data.childName ? req.data.childName : "").trim();
+    const editedGuardianName = String(req.data && req.data.guardianName ? req.data.guardianName : "").trim();
+    const editedGuardianPhone = casualTransitPhone(req.data && req.data.guardianPhone);
+    const editedGuardianRelationship = String(req.data && req.data.guardianRelationship ? req.data.guardianRelationship : "").trim();
+
+    const db = admin.firestore();
+    const visitRef = db.collection("casualTransitVisits").doc(visitId);
+    const auditRef = db.collection("casualTransitAudit").doc();
+
+    const result = await db.runTransaction(async (tx) => {
+      const visitSnap = await tx.get(visitRef);
+      if (!visitSnap.exists) {
+        throw callableError("visit-not-found", "not-found");
+      }
+
+      const existing = visitSnap.data() || {};
+      const existingStatus = casualTransitVisitStatus(existing);
+      let nextStatus = existingStatus;
+      let nextPaymentStatus = String(existing.paymentStatus || "").trim().toUpperCase() || "PENDING";
+      let nextCheckOutAt = existing.checkOutAt || null;
+      let nextAmountSen = existing.amountSen == null ? null : Number(existing.amountSen);
+      let nextPaymentMethod = String(existing.paymentMethod || "").trim();
+      let nextReceiptNo = String(existing.receiptNo || "").trim();
+      let nextCanceledAt = existing.canceledAt || null;
+
+      const patch = {
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastEditedByUid: actor.uid,
+        lastEditedByRole: actor.role,
+        lastEditedByName: actor.displayName,
+        lastOverrideReason: reason,
+        notes,
+      };
+
+      if (action === "EDIT_VISIT") {
+        if (
+          !editedChildName &&
+          !editedGuardianName &&
+          !editedGuardianPhone &&
+          !editedGuardianRelationship &&
+          !editedCheckInAt &&
+          !editedCheckOutAt &&
+          editedAmountSen === null &&
+          !editedPaymentMethod &&
+          !notes
+        ) {
+          throw callableError("missing-edit-fields", "invalid-argument");
+        }
+
+        const resolvedCheckIn = editedCheckInAt || attendanceTimestampToDate(existing.checkInAt) || null;
+        const resolvedCheckOut = editedCheckOutAt || attendanceTimestampToDate(existing.checkOutAt) || null;
+        if (resolvedCheckOut && !resolvedCheckIn) {
+          throw callableError("checkout-without-checkin", "failed-precondition");
+        }
+        if (resolvedCheckIn && resolvedCheckOut && resolvedCheckOut.getTime() < resolvedCheckIn.getTime()) {
+          throw callableError("checkout-before-checkin", "failed-precondition");
+        }
+
+        if (editedChildName) patch.childName = editedChildName;
+        if (editedGuardianName) patch.guardianName = editedGuardianName;
+        if (editedGuardianPhone) patch.guardianPhone = editedGuardianPhone;
+        if (editedGuardianRelationship) patch.guardianRelationship = editedGuardianRelationship;
+        if (editedCheckInAt) patch.checkInAt = admin.firestore.Timestamp.fromDate(editedCheckInAt);
+        if (editedCheckOutAt) patch.checkOutAt = admin.firestore.Timestamp.fromDate(editedCheckOutAt);
+        if (editedAmountSen !== null) patch.amountSen = editedAmountSen;
+        if (editedPaymentMethod) patch.paymentMethod = editedPaymentMethod;
+
+        nextCheckOutAt = patch.checkOutAt || existing.checkOutAt || null;
+        nextAmountSen = Object.prototype.hasOwnProperty.call(patch, "amountSen") ? editedAmountSen : nextAmountSen;
+        nextPaymentMethod = Object.prototype.hasOwnProperty.call(patch, "paymentMethod") ? editedPaymentMethod : nextPaymentMethod;
+
+        if (existingStatus !== "CANCELED") {
+          nextStatus = nextCheckOutAt ? "CLOSED" : "OPEN";
+          nextPaymentStatus = nextCheckOutAt ? (nextAmountSen !== null && nextAmountSen > 0 ? "PAID" : nextPaymentStatus) : "PENDING";
+          if (!nextCheckOutAt) {
+            nextReceiptNo = "";
+            patch.receiptNo = admin.firestore.FieldValue.delete();
+          }
+        }
+      } else if (action === "REOPEN_VISIT") {
+        if (existingStatus !== "CLOSED") {
+          throw callableError("visit-not-closed", "failed-precondition");
+        }
+        nextStatus = "OPEN";
+        nextPaymentStatus = "PENDING";
+        nextCheckOutAt = null;
+        nextAmountSen = null;
+        nextPaymentMethod = "";
+        nextReceiptNo = "";
+        patch.checkOutAt = admin.firestore.FieldValue.delete();
+        patch.amountSen = admin.firestore.FieldValue.delete();
+        patch.paymentMethod = admin.firestore.FieldValue.delete();
+        patch.receiptNo = admin.firestore.FieldValue.delete();
+      } else if (action === "CANCEL_VISIT") {
+        if (existingStatus === "CANCELED") {
+          throw callableError("visit-already-canceled", "already-exists");
+        }
+        nextStatus = "CANCELED";
+        nextPaymentStatus = "VOID";
+        nextCanceledAt = admin.firestore.FieldValue.serverTimestamp();
+        patch.canceledAt = nextCanceledAt;
+        patch.canceledByUid = actor.uid;
+        patch.canceledByRole = actor.role;
+        patch.canceledByName = actor.displayName;
+        patch.cancellationReason = reason;
+      }
+
+      patch.status = nextStatus;
+      patch.paymentStatus = nextPaymentStatus;
+      tx.set(visitRef, patch, { merge: true });
+
+      tx.set(auditRef, casualTransitAuditEntry({
+        action,
+        visitId,
+        actor,
+        reason,
+        details: {
+          previousStatus: existingStatus,
+          nextStatus,
+          previousPaymentStatus: String(existing.paymentStatus || "").trim().toUpperCase() || "PENDING",
+          nextPaymentStatus,
+          previousCheckInAt: existing.checkInAt || null,
+          previousCheckOutAt: existing.checkOutAt || null,
+          nextCheckInAt: patch.checkInAt || existing.checkInAt || null,
+          nextCheckOutAt,
+          previousAmountSen: existing.amountSen == null ? null : Number(existing.amountSen),
+          nextAmountSen,
+          previousPaymentMethod: String(existing.paymentMethod || ""),
+          nextPaymentMethod,
+          previousReceiptNo: String(existing.receiptNo || ""),
+          nextReceiptNo,
+          previousCanceledAt: existing.canceledAt || null,
+          nextCanceledAt,
+          childName: String(patch.childName || existing.childName || ""),
+          guardianName: String(patch.guardianName || existing.guardianName || ""),
+          guardianPhone: String(patch.guardianPhone || existing.guardianPhone || ""),
+          guardianRelationship: String(patch.guardianRelationship || existing.guardianRelationship || ""),
+          notes,
+        },
+      }));
+
+      return {
+        visitId,
+        status: nextStatus,
+        paymentStatus: nextPaymentStatus,
+      };
+    });
+
+    return { ok: true, ...result };
+  } catch (err) {
+    logger.error("casualTransitAdminOverride failed", err);
+    return { ok: false, reason: callableErrorReason(err) };
+  }
+});
 
 function billingAuditActor(req) {
   const token = req && req.auth && req.auth.token ? req.auth.token : {};
@@ -876,26 +2047,26 @@ function billingCatalogHealthSnapshot(table) {
 }
 
 exports.billingGetHealth = onCall({ region: "asia-southeast1" }, async (req) => {
-  requireAuth(req);
   try {
+    requireAuth(req);
     const table = await loadActiveFeeCatalog();
+    const gatewayConfig = await loadPaymentGatewayConfig();
     return {
       ok: true,
-      health: billingCatalogHealthSnapshot(table),
+      health: {
+        ...billingCatalogHealthSnapshot(table),
+        paymentGateway: paymentGatewaySummary(gatewayConfig),
+      },
     };
   } catch (err) {
     logger.error("billing-get-health-failed", err);
-    return {
-      ok: false,
-      reason: callableErrorReason(err),
-      code: String((err && err.code) || "internal"),
-    };
+    return billingCallableFailureFromError(err);
   }
 });
 
 exports.billingAdminListCatalogs = onCall({ region: "asia-southeast1" }, async (req) => {
-  requireAdmin(req);
   try {
+    requireAdmin(req);
     const snap = await admin.firestore().collection("billingCatalog").get();
     const catalogs = snap.docs.map((doc) => {
       const normalized = normalizeCatalogDoc(doc.data() || {});
@@ -915,16 +2086,16 @@ exports.billingAdminListCatalogs = onCall({ region: "asia-southeast1" }, async (
     return { ok: true, catalogs };
   } catch (err) {
     logger.error("billing-admin-list-catalogs-failed", err);
-    return { ok: false, reason: callableErrorReason(err) };
+    return billingCallableFailureFromError(err);
   }
 });
 
 exports.billingAdminSaveCatalog = onCall({ region: "asia-southeast1" }, async (req) => {
-  requireAdmin(req);
   try {
+    requireAdmin(req);
     const data = req.data && typeof req.data === "object" ? req.data : {};
     const version = String(data.version || "").trim();
-    if (!version) return { ok: false, reason: "missing-version" };
+    if (!version) return billingCallableFailure("missing-version");
 
     const normalized = normalizeCatalogDoc({
       version,
@@ -934,11 +2105,7 @@ exports.billingAdminSaveCatalog = onCall({ region: "asia-southeast1" }, async (r
     });
     const health = billingCatalogHealthSnapshot(normalized);
     if (!health.isValid) {
-      return {
-        ok: false,
-        reason: "invalid-catalog",
-        health,
-      };
+      return billingCallableFailure("invalid-catalog", { health });
     }
 
     const payload = {
@@ -965,27 +2132,27 @@ exports.billingAdminSaveCatalog = onCall({ region: "asia-southeast1" }, async (r
     return { ok: true, catalogId: ref.id, health };
   } catch (err) {
     logger.error("billing-admin-save-catalog-failed", err);
-    return { ok: false, reason: callableErrorReason(err) };
+    return billingCallableFailureFromError(err);
   }
 });
 
 exports.billingAdminActivateCatalog = onCall({ region: "asia-southeast1" }, async (req) => {
-  requireAdmin(req);
   try {
+    requireAdmin(req);
     const data = req.data && typeof req.data === "object" ? req.data : {};
     const catalogId = String(data.catalogId || "").trim();
-    if (!catalogId) return { ok: false, reason: "missing-catalogId" };
+    if (!catalogId) return billingCallableFailure("missing-catalogId");
 
     const catRef = admin.firestore().collection("billingCatalog").doc(catalogId);
     const catSnap = await catRef.get();
-    if (!catSnap.exists) return { ok: false, reason: "catalog-not-found" };
+    if (!catSnap.exists) return billingCallableFailure("catalog-not-found");
 
     const current = normalizeCatalogDoc(catSnap.data() || {});
     const requestedDefaultTransitCode = sanitizeTransitCode(data.defaultTransitMonthlyCode);
     current.defaultTransitMonthlyCode = requestedDefaultTransitCode || current.defaultTransitMonthlyCode || "";
     const health = billingCatalogHealthSnapshot(current);
     if (!health.isValid) {
-      return { ok: false, reason: "invalid-catalog", health };
+      return billingCallableFailure("invalid-catalog", { health });
     }
 
     const snap = await admin.firestore().collection("billingCatalog").get();
@@ -1020,13 +2187,13 @@ exports.billingAdminActivateCatalog = onCall({ region: "asia-southeast1" }, asyn
     return { ok: true, catalogId, health };
   } catch (err) {
     logger.error("billing-admin-activate-catalog-failed", err);
-    return { ok: false, reason: callableErrorReason(err) };
+    return billingCallableFailureFromError(err);
   }
 });
 
 exports.billingAdminListAudit = onCall({ region: "asia-southeast1" }, async (req) => {
-  requireAdmin(req);
   try {
+    requireAdmin(req);
     const data = req.data && typeof req.data === "object" ? req.data : {};
     const requestedLimit = Number(data.limit || 25);
     const limit = Math.max(1, Math.min(50, Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : 25));
@@ -1058,7 +2225,7 @@ exports.billingAdminListAudit = onCall({ region: "asia-southeast1" }, async (req
     return { ok: true, entries };
   } catch (err) {
     logger.error("billing-admin-list-audit-failed", err);
-    return { ok: false, reason: callableErrorReason(err) };
+    return billingCallableFailureFromError(err);
   }
 });
 
@@ -1411,6 +2578,368 @@ async function createParentInvoiceForPeriod({ req, parentId, parentData, period,
   };
 }
 
+async function findInvoiceForChildPeriod({ childId, period }) {
+  const normalizedChildId = String(childId || "").trim();
+  const normalizedPeriod = String(period || "").trim();
+  if (!normalizedChildId || !normalizedPeriod) return null;
+
+  const snap = await admin.firestore().collectionGroup("invoices")
+    .where("period", "==", normalizedPeriod)
+    .get();
+
+  for (const doc of snap.docs) {
+    const data = doc.data() || {};
+    if (!invoiceChildIds(data).includes(normalizedChildId)) continue;
+    const parentRef = doc.ref.parent && doc.ref.parent.parent ? doc.ref.parent.parent : null;
+    const parentId = parentRef ? String(parentRef.id || "").trim() : "";
+    if (!parentId) continue;
+    return {
+      invoiceRef: doc.ref,
+      invoiceId: doc.id,
+      invoiceData: data,
+      parentId,
+    };
+  }
+
+  return null;
+}
+
+function replacePolicyNoteByPrefix(notes, prefix, nextNote) {
+  const normalizedPrefix = String(prefix || "").trim();
+  const filtered = [];
+  for (const note of notes || []) {
+    const text = String(note || "").trim();
+    if (!text) continue;
+    if (normalizedPrefix && text.startsWith(normalizedPrefix)) continue;
+    filtered.push(text);
+  }
+  if (nextNote) {
+    filtered.push(String(nextNote).trim());
+  }
+  return dedupePolicyNotes(filtered);
+}
+
+function attendanceAdjustmentReviewReason(deltaSen) {
+  const abs = Math.abs(moneySen(deltaSen));
+  const amountText = `RM ${(abs / 100).toFixed(2)}`;
+  if (deltaSen > 0) {
+    return `Attendance changed after payment. A debit adjustment of ${amountText} is pending manual review.`;
+  }
+  if (deltaSen < 0) {
+    return `Attendance changed after payment. A credit adjustment of ${amountText} is pending manual review.`;
+  }
+  return "Attendance changed after payment, but the latest recalculation no longer requires a financial adjustment.";
+}
+
+async function recordPaidInvoiceAdjustmentForAttendanceChange({ linkedInvoice, parentData, childId, period, attendanceDate, action, reason, notes, actor }) {
+  const calc = await buildFamilyInvoiceFromPdfPolicy({
+    parentId: linkedInvoice.parentId,
+    parentData,
+    period,
+    reqData: {},
+    fallbackChildId: childId,
+  });
+
+  if (!calc.ok && calc.reason !== "no-billable-items") {
+    return {
+      ok: false,
+      reason: `invoice-adjustment-${String(calc.reason || "failed")}`,
+      period,
+      parentId: linkedInvoice.parentId,
+      invoiceId: linkedInvoice.invoiceId,
+    };
+  }
+
+  const recalculatedTotalSen = calc.ok ? moneySen(calc.totalSen) : 0;
+  const previousTotalSen = moneySen(linkedInvoice.invoiceData && linkedInvoice.invoiceData.totalSen);
+  const deltaSen = recalculatedTotalSen - previousTotalSen;
+  const existingBillingMeta = linkedInvoice.invoiceData && linkedInvoice.invoiceData.billingMeta && typeof linkedInvoice.invoiceData.billingMeta === "object"
+    ? linkedInvoice.invoiceData.billingMeta
+    : {};
+  const notePrefix = "Attendance correction after payment:";
+  const reviewReason = attendanceAdjustmentReviewReason(deltaSen);
+  const nextPolicyNotes = replacePolicyNoteByPrefix(
+    Array.isArray(existingBillingMeta.policyNotes) ? existingBillingMeta.policyNotes : [],
+    notePrefix,
+    deltaSen === 0 ? `${notePrefix} no financial adjustment remains after the latest recalculation.` : `${notePrefix} ${reviewReason}`,
+  );
+
+  const adjustmentsSnap = await linkedInvoice.invoiceRef.collection("adjustments").get();
+  let adjustmentRef = null;
+  for (const doc of adjustmentsSnap.docs) {
+    const data = doc.data() || {};
+    if (String(data.source || "") !== "attendanceAdminOverride") continue;
+    if (String(data.childId || "") !== String(childId || "")) continue;
+    if (String(data.attendanceDate || "") !== String(attendanceDate || "")) continue;
+    if (String(data.status || "pending") !== "pending") continue;
+    adjustmentRef = doc.ref;
+    break;
+  }
+  if (!adjustmentRef) {
+    adjustmentRef = linkedInvoice.invoiceRef.collection("adjustments").doc();
+  }
+
+  if (deltaSen === 0) {
+    await linkedInvoice.invoiceRef.set({
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      billingMeta: {
+        ...existingBillingMeta,
+        policyNotes: nextPolicyNotes,
+        managementReviewRecommended: Boolean(existingBillingMeta.managementReviewRecommended),
+        reviewReason: String(existingBillingMeta.reviewReason || ""),
+        attendanceAdjustment: {
+          required: false,
+          status: "not-needed",
+          deltaSen: 0,
+          amountSen: 0,
+          direction: "none",
+          childId: String(childId || ""),
+          attendanceDate: String(attendanceDate || ""),
+          source: "attendanceAdminOverride",
+          action: String(action || "").trim().toUpperCase(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      },
+    }, { merge: true });
+
+    return {
+      ok: true,
+      period,
+      parentId: linkedInvoice.parentId,
+      invoiceId: linkedInvoice.invoiceId,
+      paidInvoice: true,
+      adjustmentRecorded: false,
+      adjustmentRequired: false,
+      previousTotalSen,
+      recalculatedTotalSen,
+      deltaSen: 0,
+    };
+  }
+
+  await adjustmentRef.set({
+    source: "attendanceAdminOverride",
+    status: "pending",
+    type: deltaSen > 0 ? "debit" : "credit",
+    deltaSen,
+    amountSen: Math.abs(deltaSen),
+    previousTotalSen,
+    recalculatedTotalSen,
+    period,
+    parentId: linkedInvoice.parentId,
+    invoiceId: linkedInvoice.invoiceId,
+    childId: String(childId || ""),
+    attendanceDate: String(attendanceDate || ""),
+    action: String(action || "").trim().toUpperCase(),
+    reason: String(reason || "").trim(),
+    notes: String(notes || "").trim(),
+    actorUid: String(actor && actor.uid ? actor.uid : ""),
+    actorRole: String(actor && actor.role ? actor.role : ""),
+    actorName: String(actor && actor.displayName ? actor.displayName : ""),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  await linkedInvoice.invoiceRef.set({
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    billingMeta: {
+      ...existingBillingMeta,
+      policyNotes: nextPolicyNotes,
+      managementReviewRecommended: true,
+      reviewReason,
+      attendanceAdjustment: {
+        required: true,
+        status: "pending",
+        adjustmentId: adjustmentRef.id,
+        deltaSen,
+        amountSen: Math.abs(deltaSen),
+        direction: deltaSen > 0 ? "debit" : "credit",
+        childId: String(childId || ""),
+        attendanceDate: String(attendanceDate || ""),
+        source: "attendanceAdminOverride",
+        action: String(action || "").trim().toUpperCase(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    },
+  }, { merge: true });
+
+  return {
+    ok: true,
+    period,
+    parentId: linkedInvoice.parentId,
+    invoiceId: linkedInvoice.invoiceId,
+    paidInvoice: true,
+    adjustmentRecorded: true,
+    adjustmentRequired: true,
+    adjustmentId: adjustmentRef.id,
+    previousTotalSen,
+    recalculatedTotalSen,
+    deltaSen,
+    direction: deltaSen > 0 ? "debit" : "credit",
+  };
+}
+
+async function refreshUnpaidInvoiceForAttendanceChange({ req, childId, attendanceDate, action, reason, notes, actor }) {
+  const normalizedDate = String(attendanceDate || "").trim();
+  const match = normalizedDate.match(/^(\d{4}-\d{2})-\d{2}$/);
+  if (!match) {
+    return { ok: false, reason: "invalid-attendance-period" };
+  }
+
+  const period = match[1];
+  const linkedInvoice = await findInvoiceForChildPeriod({ childId, period });
+  if (!linkedInvoice) {
+    return { ok: false, reason: "invoice-not-found-for-period", period };
+  }
+
+  const status = String(linkedInvoice.invoiceData && linkedInvoice.invoiceData.status ? linkedInvoice.invoiceData.status : "unpaid").toLowerCase();
+  if (status === "paid") {
+    const parentSnap = await admin.firestore().collection("parents").doc(linkedInvoice.parentId).get();
+    if (!parentSnap.exists) {
+      return {
+        ok: false,
+        reason: "parent-not-found-for-invoice",
+        period,
+        parentId: linkedInvoice.parentId,
+        invoiceId: linkedInvoice.invoiceId,
+      };
+    }
+
+    return recordPaidInvoiceAdjustmentForAttendanceChange({
+      linkedInvoice,
+      parentData: parentSnap.data() || {},
+      childId,
+      period,
+      attendanceDate: normalizedDate,
+      action,
+      reason,
+      notes,
+      actor,
+    });
+  }
+
+  const parentSnap = await admin.firestore().collection("parents").doc(linkedInvoice.parentId).get();
+  if (!parentSnap.exists) {
+    return {
+      ok: false,
+      reason: "parent-not-found-for-invoice",
+      period,
+      parentId: linkedInvoice.parentId,
+      invoiceId: linkedInvoice.invoiceId,
+    };
+  }
+
+  const parentData = parentSnap.data() || {};
+  const calc = await buildFamilyInvoiceFromPdfPolicy({
+    parentId: linkedInvoice.parentId,
+    parentData,
+    period,
+    reqData: {},
+    fallbackChildId: childId,
+  });
+
+  const refreshMetaBase = {
+    source: "attendanceAdminOverride",
+    action: String(action || "").trim().toUpperCase(),
+    attendanceDate: normalizedDate,
+    childId: String(childId || "").trim(),
+    actorUid: String(actor && actor.uid ? actor.uid : ""),
+    actorRole: String(actor && actor.role ? actor.role : ""),
+    actorName: String(actor && actor.displayName ? actor.displayName : ""),
+    reason: String(reason || "").trim(),
+    notes: String(notes || "").trim(),
+    previousTotalSen: moneySen(linkedInvoice.invoiceData && linkedInvoice.invoiceData.totalSen),
+    refreshedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  if (!calc.ok) {
+    if (calc.reason !== "no-billable-items") {
+      return {
+        ok: false,
+        reason: `invoice-refresh-${String(calc.reason || "failed")}`,
+        period,
+        parentId: linkedInvoice.parentId,
+        invoiceId: linkedInvoice.invoiceId,
+      };
+    }
+
+    await linkedInvoice.invoiceRef.set({
+      childId: null,
+      childName: null,
+      childIds: [],
+      childCoverageKey: childCoverageKey(period, []),
+      childNames: [],
+      items: [],
+      subTotalSen: 0,
+      totalSen: 0,
+      pricingVersion: String(linkedInvoice.invoiceData && linkedInvoice.invoiceData.pricingVersion ? linkedInvoice.invoiceData.pricingVersion : ""),
+      dueDate: linkedInvoice.invoiceData && linkedInvoice.invoiceData.dueDate ? linkedInvoice.invoiceData.dueDate : null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      billingMeta: {
+        ...(linkedInvoice.invoiceData && linkedInvoice.invoiceData.billingMeta && typeof linkedInvoice.invoiceData.billingMeta === "object"
+          ? linkedInvoice.invoiceData.billingMeta
+          : {}),
+        childCount: 0,
+        children: [],
+        policyNotes: dedupePolicyNotes([
+          "Tiada caj aktif selepas pembetulan kehadiran. Sila semak sebelum menuntut bayaran.",
+        ]),
+        managementReviewRecommended: false,
+        managementReviewChildIds: [],
+        attendanceRefresh: {
+          ...refreshMetaBase,
+          noBillableItems: true,
+          totalSen: 0,
+        },
+      },
+    }, { merge: true });
+
+    return {
+      ok: true,
+      refreshed: true,
+      noBillableItems: true,
+      period,
+      parentId: linkedInvoice.parentId,
+      invoiceId: linkedInvoice.invoiceId,
+      previousTotalSen: refreshMetaBase.previousTotalSen,
+      totalSen: 0,
+    };
+  }
+
+  await linkedInvoice.invoiceRef.set({
+    payerType: calc.payerType,
+    childId: calc.childIds.length === 1 ? calc.childIds[0] : null,
+    childName: calc.childNameSummary || null,
+    childIds: calc.childIds,
+    childCoverageKey: childCoverageKey(period, calc.childIds),
+    childNames: calc.childNames,
+    items: calc.items,
+    subTotalSen: calc.subTotalSen,
+    totalSen: calc.totalSen,
+    pricingVersion: calc.pricingVersion,
+    dueDate: calc.dueDate,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    billingMeta: {
+      ...(calc.billingMeta || {}),
+      attendanceRefresh: {
+        ...refreshMetaBase,
+        noBillableItems: false,
+        totalSen: moneySen(calc.totalSen),
+      },
+    },
+  }, { merge: true });
+
+  return {
+    ok: true,
+    refreshed: true,
+    noBillableItems: false,
+    period,
+    parentId: linkedInvoice.parentId,
+    invoiceId: linkedInvoice.invoiceId,
+    previousTotalSen: refreshMetaBase.previousTotalSen,
+    totalSen: moneySen(calc.totalSen),
+  };
+}
+
 function pickDefaultTransitCode({ table, configuredCode }) {
   const rows = table && table.table ? table.table : (table || {});
   if (configuredCode && rows[configuredCode]) return configuredCode;
@@ -1435,6 +2964,7 @@ async function loadPaymentGatewayConfig() {
     mode: "dummy",
     enabled: true,
     isSandbox: true,
+    allowRealProvider: false,
     collectionId: "",
     checkoutBaseUrl: "",
     callbackUrl: "",
@@ -1449,16 +2979,20 @@ async function loadPaymentGatewayConfig() {
     const raw = snap.data() || {};
     const provider = String(raw.provider || raw.activeProvider || fallback.provider).trim().toLowerCase() || fallback.provider;
     const mode = String(raw.mode || (provider === "dummy" ? "dummy" : "redirect")).trim().toLowerCase() || fallback.mode;
+    const allowRealProvider = raw.allowRealProvider === true;
+    const effectiveProvider = provider === "dummy" || allowRealProvider ? provider : fallback.provider;
+    const effectiveMode = effectiveProvider === "dummy" ? "dummy" : mode;
     return {
-      provider,
-      mode,
+      provider: effectiveProvider,
+      mode: effectiveMode,
       enabled: raw.enabled !== false,
       isSandbox: raw.isSandbox !== false,
-      collectionId: String(raw.collectionId || raw.billplzCollectionId || "").trim(),
-      checkoutBaseUrl: String(raw.checkoutBaseUrl || "").trim(),
-      callbackUrl: String(raw.callbackUrl || "").trim(),
-      returnUrl: String(raw.returnUrl || "").trim(),
-      cancelUrl: String(raw.cancelUrl || "").trim(),
+      allowRealProvider,
+      collectionId: effectiveProvider === "dummy" ? "" : String(raw.collectionId || raw.billplzCollectionId || "").trim(),
+      checkoutBaseUrl: effectiveProvider === "dummy" ? "" : String(raw.checkoutBaseUrl || "").trim(),
+      callbackUrl: effectiveProvider === "dummy" ? "" : String(raw.callbackUrl || "").trim(),
+      returnUrl: effectiveProvider === "dummy" ? "" : String(raw.returnUrl || "").trim(),
+      cancelUrl: effectiveProvider === "dummy" ? "" : String(raw.cancelUrl || "").trim(),
       metadata: raw.metadata && typeof raw.metadata === "object" ? raw.metadata : {},
     };
   } catch (err) {
@@ -1474,6 +3008,7 @@ function paymentGatewaySummary(config) {
     mode: String(src.mode || "dummy"),
     enabled: src.enabled !== false,
     isSandbox: src.isSandbox !== false,
+    allowRealProvider: src.allowRealProvider === true,
   };
 }
 
@@ -2915,80 +4450,84 @@ exports.billingCreateDemoInvoiceForCurrentMonth = onCall({ region: "asia-southea
 });
 
 exports.billingAdminGenerateInvoicesForPeriod = onCall({ region: "asia-southeast1" }, async (req) => {
-  requireAdmin(req);
+  try {
+    requireAdmin(req);
 
-  const requestedPeriod = (req.data && req.data.period) ? String(req.data.period).trim() : monthKey(new Date());
-  const period = /^\d{4}-\d{2}$/.test(requestedPeriod) ? requestedPeriod : monthKey(new Date());
-  const parentIds = Array.isArray(req.data && req.data.parentIds)
-    ? req.data.parentIds.map((v) => String(v || "").trim()).filter(Boolean)
-    : [];
+    const requestedPeriod = (req.data && req.data.period) ? String(req.data.period).trim() : monthKey(new Date());
+    const period = /^\d{4}-\d{2}$/.test(requestedPeriod) ? requestedPeriod : monthKey(new Date());
+    const parentIds = Array.isArray(req.data && req.data.parentIds)
+      ? req.data.parentIds.map((v) => String(v || "").trim()).filter(Boolean)
+      : [];
 
-  const requestedParents = parentIds.length
-    ? await Promise.all(parentIds.map(async (parentId) => {
-      const snap = await admin.firestore().collection("parents").doc(parentId).get();
-      return snap.exists ? snap : null;
-    }))
-    : (await admin.firestore().collection("parents").get()).docs;
+    const requestedParents = parentIds.length
+      ? await Promise.all(parentIds.map(async (parentId) => {
+        const snap = await admin.firestore().collection("parents").doc(parentId).get();
+        return snap.exists ? snap : null;
+      }))
+      : (await admin.firestore().collection("parents").get()).docs;
 
-  const summary = {
-    ok: true,
-    period,
-    createdCount: 0,
-    existingCount: 0,
-    skippedNoChildrenCount: 0,
-    skippedNoItemsCount: 0,
-    errorCount: 0,
-    results: [],
-  };
+    const summary = {
+      ok: true,
+      period,
+      createdCount: 0,
+      existingCount: 0,
+      skippedNoChildrenCount: 0,
+      skippedNoItemsCount: 0,
+      errorCount: 0,
+      results: [],
+    };
 
-  for (const snap of requestedParents) {
-    if (!snap || !snap.exists) {
-      continue;
-    }
-
-    const parentId = snap.id;
-    const parentData = snap.data() || {};
-
-    try {
-      const created = await createParentInvoiceForPeriod({
-        req,
-        parentId,
-        parentData,
-        period,
-        reqData: req.data || {},
-        createdByKind: "admin-batch",
-      });
-
-      if (created.already) {
-        summary.existingCount += 1;
-      } else if (created.ok) {
-        summary.createdCount += 1;
-      } else if (created.reason === "no-linked-children") {
-        summary.skippedNoChildrenCount += 1;
-      } else if (created.reason === "no-billable-items") {
-        summary.skippedNoItemsCount += 1;
-      } else {
-        summary.errorCount += 1;
+    for (const snap of requestedParents) {
+      if (!snap || !snap.exists) {
+        continue;
       }
 
-      summary.results.push({
-        parentId,
-        parentName: String(parentData.parentName || parentData.name || ""),
-        ...created,
-      });
-    } catch (err) {
-      summary.errorCount += 1;
-      summary.results.push({
-        parentId,
-        parentName: String(parentData.parentName || parentData.name || ""),
-        ok: false,
-        reason: callableErrorReason(err),
-      });
-      logger.error("billing-admin-generate-invoice-failed", { parentId, period, error: String(err && err.message ? err.message : err) });
-    }
-  }
+      const parentId = snap.id;
+      const parentData = snap.data() || {};
 
-  return summary;
+      try {
+        const created = await createParentInvoiceForPeriod({
+          req,
+          parentId,
+          parentData,
+          period,
+          reqData: req.data || {},
+          createdByKind: "admin-batch",
+        });
+
+        if (created.already) {
+          summary.existingCount += 1;
+        } else if (created.ok) {
+          summary.createdCount += 1;
+        } else if (created.reason === "no-linked-children") {
+          summary.skippedNoChildrenCount += 1;
+        } else if (created.reason === "no-billable-items") {
+          summary.skippedNoItemsCount += 1;
+        } else {
+          summary.errorCount += 1;
+        }
+
+        summary.results.push({
+          parentId,
+          parentName: String(parentData.parentName || parentData.name || ""),
+          ...created,
+        });
+      } catch (err) {
+        summary.errorCount += 1;
+        summary.results.push({
+          parentId,
+          parentName: String(parentData.parentName || parentData.name || ""),
+          ...billingCallableFailureFromError(err),
+        });
+        logger.error("billing-admin-generate-invoice-failed", { parentId, period, error: String(err && err.message ? err.message : err) });
+      }
+    }
+
+    return summary;
+  } catch (err) {
+    logger.error("billing-admin-generate-invoices-for-period-failed", err);
+    return billingCallableFailureFromError(err);
+  }
 });
 
 async function billingCreateCheckoutSessionImpl(req) {

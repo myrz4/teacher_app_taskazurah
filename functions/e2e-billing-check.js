@@ -91,7 +91,7 @@ async function updateParent(parentId, patch) {
   await db.collection("parents").doc(parentId).set(patch, { merge: true });
 }
 
-async function createChild({ childId, name, careType, feePlan, registrationType, staffChild, billingDueDay, birthDate, registeredAt, transportFromTadika, uniformFeeSen, uniformChargePeriod }) {
+async function createChild({ childId, name, careType, feePlan, registrationType, staffChild, billingDueDay, birthDate, registeredAt, transportFromTadika, uniformFeeSen, uniformChargePeriod, registrationFeeAppliedPeriod, uniformFeeAppliedPeriod }) {
   await db.collection("children").doc(childId).set({
     name,
     careType,
@@ -104,6 +104,8 @@ async function createChild({ childId, name, careType, feePlan, registrationType,
     transportFromTadika: Boolean(transportFromTadika),
     uniformFeeSen: Number(uniformFeeSen || 0),
     uniformChargePeriod: uniformChargePeriod || "",
+    registrationFeeAppliedPeriod: registrationFeeAppliedPeriod || "",
+    uniformFeeAppliedPeriod: uniformFeeAppliedPeriod || "",
   }, { merge: true });
 }
 
@@ -134,6 +136,13 @@ async function clearPayments(parentId) {
 
 async function listPayments(parentId) {
   const snap = await db.collection("parents").doc(parentId).collection("payments").get();
+  return snap.docs.map((doc) => ({ id: doc.id, data: doc.data() || {} }));
+}
+
+async function listInvoiceAdjustments(parentId, invoiceId) {
+  const snap = await db.collection("parents").doc(parentId).collection("invoices").doc(invoiceId)
+    .collection("adjustments")
+    .get();
   return snap.docs.map((doc) => ({ id: doc.id, data: doc.data() || {} }));
 }
 
@@ -211,6 +220,34 @@ async function seedAttendanceRows(childId, rows) {
   await Promise.all(writes);
 }
 
+async function seedCanonicalAttendanceRecord(childId, row) {
+  const base = new Date();
+  const y = base.getFullYear();
+  const m = base.getMonth();
+  const day = Number(row.day || 1);
+  const dateKey = `${y}-${String(m + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  const attendanceId = `${dateKey}_${childId}`;
+  const dateOnly = new Date(y, m, day, 0, 0, 0);
+  const checkIn = new Date(y, m, day, Number(row.checkInHour), Number(row.checkInMinute || 0), 0);
+  const checkOut = new Date(y, m, day, Number(row.checkOutHour), Number(row.checkOutMinute || 0), 0);
+
+  await db.collection("attendance").doc(attendanceId).set({
+    attendanceId,
+    childId,
+    date: admin.firestore.Timestamp.fromDate(dateOnly),
+    dateKey,
+    status: "CHECKED_OUT",
+    checkInAt: admin.firestore.Timestamp.fromDate(checkIn),
+    checkOutAt: admin.firestore.Timestamp.fromDate(checkOut),
+    check_in_time: admin.firestore.Timestamp.fromDate(checkIn),
+    check_out_time: admin.firestore.Timestamp.fromDate(checkOut),
+    isPresent: true,
+    is_present: true,
+  }, { merge: true });
+
+  return { attendanceId, dateKey };
+}
+
 async function run() {
   const phone = "+601112223334";
   const uid = "e2e-parent-1";
@@ -269,6 +306,7 @@ async function run() {
     birthDate: "2023-01-15",
     registeredAt: admin.firestore.Timestamp.fromDate(lastMonth),
     transportFromTadika: true,
+    registrationFeeAppliedPeriod: monthKey(lastMonth),
   });
   await seedAttendanceOvertime(child2);
 
@@ -297,6 +335,168 @@ async function run() {
   assertTrue(due2 && due2.getDate() === 7, "Case2: due day expected 7");
   console.log("PASS Case2 transit + overtime + discount + due day 7");
 
+  // Case 2aa: Attendance override should refresh an unpaid invoice for the affected month
+  const parentRefresh = "e2e-parent-att-refresh";
+  const childRefresh = "e2e-child-att-refresh";
+  await createParent({ parentId: parentRefresh, phoneE164: phone });
+  await updateParent(parentRefresh, {
+    childIds: [childRefresh],
+    childNames: ["E2E Child Attendance Refresh"],
+  });
+  await clearInvoicesByPeriod(parentRefresh, currentPeriod);
+
+  await createChild({
+    childId: childRefresh,
+    name: "E2E Child Attendance Refresh",
+    careType: "transit_2h_month",
+    registrationType: "transit",
+    staffChild: false,
+    billingDueDay: 7,
+    birthDate: "2023-04-18",
+    registeredAt: admin.firestore.Timestamp.fromDate(lastMonth),
+    transportFromTadika: false,
+    registrationFeeAppliedPeriod: monthKey(lastMonth),
+  });
+
+  const seededAttendance = await seedCanonicalAttendanceRecord(childRefresh, {
+    day: 15,
+    checkInHour: 8,
+    checkOutHour: 21,
+  });
+
+  const refreshCreateRes = await fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
+    uid,
+    phone,
+    data: { parentId: parentRefresh, childId: childRefresh },
+  }));
+  assertTrue(refreshCreateRes && refreshCreateRes.ok, "Case2aa: invoice creation failed");
+
+  const beforeRefresh = await fetchInvoiceByPeriod({ parentId: parentRefresh, period: currentPeriod });
+  assertTrue(beforeRefresh, "Case2aa: invoice missing before refresh");
+  const beforeRefreshItems = Array.isArray(beforeRefresh.data.items) ? beforeRefresh.data.items : [];
+  assertTrue(beforeRefreshItems.some((item) => item.code === "overtime_after_530"), "Case2aa: expected overtime_after_530 before refresh");
+  assertTrue(beforeRefreshItems.some((item) => item.code === "overtime_8pm_12am"), "Case2aa: expected overtime_8pm_12am before refresh");
+  const beforeRefreshTotal = Number(beforeRefresh.data.totalSen || 0);
+
+  const editedCheckIn = new Date(new Date().getFullYear(), new Date().getMonth(), 15, 8, 0, 0);
+  const editedCheckOut = new Date(new Date().getFullYear(), new Date().getMonth(), 15, 17, 0, 0);
+  const refreshOverrideRes = await fns.attendanceAdminOverride.run(mkAdminReq({
+    uid: "e2e-admin-refresh",
+    phone,
+    data: {
+      action: "EDIT_RECORD",
+      childId: childRefresh,
+      attendanceDate: seededAttendance.dateKey,
+      reason: "Shortened recorded pickup time",
+      notes: "Billing should remove overtime",
+      adminName: "E2E Admin",
+      checkInAt: editedCheckIn.toISOString(),
+      checkOutAt: editedCheckOut.toISOString(),
+    },
+  }));
+  assertTrue(refreshOverrideRes && refreshOverrideRes.ok, `Case2aa: attendance override failed: ${JSON.stringify(refreshOverrideRes)}`);
+  assertTrue(refreshOverrideRes.billingRefresh && refreshOverrideRes.billingRefresh.ok, `Case2aa: billing refresh failed: ${JSON.stringify(refreshOverrideRes.billingRefresh)}`);
+
+  const afterRefresh = await fetchInvoiceByPeriod({ parentId: parentRefresh, period: currentPeriod });
+  assertTrue(afterRefresh, "Case2aa: invoice missing after refresh");
+  const afterRefreshItems = Array.isArray(afterRefresh.data.items) ? afterRefresh.data.items : [];
+  assertTrue(!afterRefreshItems.some((item) => item.code === "overtime_after_530"), "Case2aa: overtime_after_530 should be removed after refresh");
+  assertTrue(!afterRefreshItems.some((item) => item.code === "overtime_8pm_12am"), "Case2aa: overtime_8pm_12am should be removed after refresh");
+  const afterRefreshTotal = Number(afterRefresh.data.totalSen || 0);
+  assertTrue(afterRefreshTotal < beforeRefreshTotal, "Case2aa: refreshed invoice total should decrease");
+  const attendanceRefreshMeta = afterRefresh.data.billingMeta && afterRefresh.data.billingMeta.attendanceRefresh
+    ? afterRefresh.data.billingMeta.attendanceRefresh
+    : null;
+  assertTrue(attendanceRefreshMeta && attendanceRefreshMeta.action === "EDIT_RECORD", "Case2aa: attendance refresh metadata missing");
+  console.log("PASS Case2aa unpaid invoice refresh after attendance override");
+
+  // Case 2ab: Paid invoice should keep totals intact and record a pending attendance adjustment
+  const parentPaidAdjust = "e2e-parent-paid-adjust";
+  const childPaidAdjust = "e2e-child-paid-adjust";
+  await createParent({ parentId: parentPaidAdjust, phoneE164: phone });
+  await updateParent(parentPaidAdjust, {
+    childIds: [childPaidAdjust],
+    childNames: ["E2E Child Paid Adjust"],
+  });
+  await clearInvoicesByPeriod(parentPaidAdjust, currentPeriod);
+
+  await createChild({
+    childId: childPaidAdjust,
+    name: "E2E Child Paid Adjust",
+    careType: "transit_2h_month",
+    registrationType: "transit",
+    staffChild: false,
+    billingDueDay: 7,
+    birthDate: "2023-05-11",
+    registeredAt: admin.firestore.Timestamp.fromDate(lastMonth),
+    transportFromTadika: false,
+    registrationFeeAppliedPeriod: monthKey(lastMonth),
+  });
+
+  const paidAttendance = await seedCanonicalAttendanceRecord(childPaidAdjust, {
+    day: 16,
+    checkInHour: 8,
+    checkOutHour: 21,
+  });
+
+  const paidAdjustCreate = await fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
+    uid,
+    phone,
+    data: { parentId: parentPaidAdjust, childId: childPaidAdjust },
+  }));
+  assertTrue(paidAdjustCreate && paidAdjustCreate.ok, "Case2ab: paid-adjust invoice creation failed");
+
+  const beforePaidAdjust = await fetchInvoiceByPeriod({ parentId: parentPaidAdjust, period: currentPeriod });
+  assertTrue(beforePaidAdjust, "Case2ab: invoice missing before paid adjustment");
+  const paidAdjustTotalBefore = Number(beforePaidAdjust.data.totalSen || 0);
+  await db.collection("parents").doc(parentPaidAdjust).collection("invoices").doc(beforePaidAdjust.id).set({
+    status: "paid",
+    paidAt: nowTs(),
+    paidMethod: "Cash",
+    paidBank: "",
+    paidAmountSen: paidAdjustTotalBefore,
+    paidReceiptNo: "E2E-PAID-ADJUST",
+    paidProvider: "cash",
+  }, { merge: true });
+
+  const paidAdjustOverride = await fns.attendanceAdminOverride.run(mkAdminReq({
+    uid: "e2e-admin-paid-adjust",
+    phone,
+    data: {
+      action: "EDIT_RECORD",
+      childId: childPaidAdjust,
+      attendanceDate: paidAttendance.dateKey,
+      reason: "Pickup time corrected after payment",
+      notes: "Should create a pending credit adjustment",
+      adminName: "E2E Admin",
+      checkInAt: new Date(new Date().getFullYear(), new Date().getMonth(), 16, 8, 0, 0).toISOString(),
+      checkOutAt: new Date(new Date().getFullYear(), new Date().getMonth(), 16, 17, 0, 0).toISOString(),
+    },
+  }));
+  assertTrue(paidAdjustOverride && paidAdjustOverride.ok, `Case2ab: attendance override failed: ${JSON.stringify(paidAdjustOverride)}`);
+  assertTrue(paidAdjustOverride.billingRefresh && paidAdjustOverride.billingRefresh.ok, `Case2ab: paid invoice adjustment recording failed: ${JSON.stringify(paidAdjustOverride.billingRefresh)}`);
+  assertTrue(paidAdjustOverride.billingRefresh.paidInvoice === true, "Case2ab: expected paid invoice adjustment path");
+  assertTrue(paidAdjustOverride.billingRefresh.adjustmentRequired === true, "Case2ab: expected adjustment to be required");
+
+  const afterPaidAdjust = await fetchInvoiceByPeriod({ parentId: parentPaidAdjust, period: currentPeriod });
+  assertTrue(afterPaidAdjust, "Case2ab: invoice missing after paid adjustment");
+  assertTrue(String(afterPaidAdjust.data.status || "") === "paid", "Case2ab: invoice status should remain paid");
+  assertTrue(Number(afterPaidAdjust.data.totalSen || 0) === paidAdjustTotalBefore, "Case2ab: paid invoice total should not be rewritten");
+  const paidAdjustMeta = afterPaidAdjust.data.billingMeta && afterPaidAdjust.data.billingMeta.attendanceAdjustment
+    ? afterPaidAdjust.data.billingMeta.attendanceAdjustment
+    : null;
+  assertTrue(paidAdjustMeta && paidAdjustMeta.required === true, "Case2ab: attendanceAdjustment metadata missing");
+  assertTrue(String(paidAdjustMeta.direction || "") === "credit", "Case2ab: expected a credit adjustment direction");
+  assertTrue(Boolean(afterPaidAdjust.data.billingMeta && afterPaidAdjust.data.billingMeta.managementReviewRecommended), "Case2ab: paid adjustment should surface as management review");
+  assertTrue(String(afterPaidAdjust.data.billingMeta && afterPaidAdjust.data.billingMeta.reviewReason || "").includes("Attendance changed after payment"), "Case2ab: custom review reason missing");
+
+  const paidAdjustments = await listInvoiceAdjustments(parentPaidAdjust, afterPaidAdjust.id);
+  assertTrue(paidAdjustments.length === 1, "Case2ab: expected one pending attendance adjustment record");
+  assertTrue(String(paidAdjustments[0].data.status || "") === "pending", "Case2ab: adjustment should stay pending");
+  assertTrue(String(paidAdjustments[0].data.type || "") === "credit", "Case2ab: adjustment type should be credit");
+  assertTrue(Number(paidAdjustments[0].data.deltaSen || 0) < 0, "Case2ab: adjustment delta should be negative for a credit");
+  console.log("PASS Case2ab paid invoice records pending attendance adjustment");
+
   // Case 2a: Attendance-based transit variants and configurable uniform charge
   const parentUsage = "e2e-parent-usage";
   const childDay = "e2e-child-day";
@@ -321,6 +521,7 @@ async function run() {
     birthDate: "2023-06-10",
     registeredAt: admin.firestore.Timestamp.fromDate(registeredBefore),
     transportFromTadika: false,
+    registrationFeeAppliedPeriod: monthKey(registeredBefore),
   });
   await createChild({
     childId: childWeek,
@@ -332,6 +533,7 @@ async function run() {
     birthDate: "2022-11-05",
     registeredAt: admin.firestore.Timestamp.fromDate(registeredBefore),
     transportFromTadika: false,
+    registrationFeeAppliedPeriod: monthKey(registeredBefore),
   });
   await createChild({
     childId: childHour,
@@ -343,6 +545,7 @@ async function run() {
     birthDate: "2023-02-01",
     registeredAt: admin.firestore.Timestamp.fromDate(registeredBefore),
     transportFromTadika: false,
+    registrationFeeAppliedPeriod: monthKey(registeredBefore),
   });
   await createChild({
     childId: childUniform,
@@ -356,6 +559,7 @@ async function run() {
     transportFromTadika: false,
     uniformFeeSen: 4500,
     uniformChargePeriod: currentPeriod,
+    registrationFeeAppliedPeriod: monthKey(registeredBefore),
   });
   await createChild({
     childId: childReview,
@@ -367,6 +571,7 @@ async function run() {
     birthDate: "2023-03-12",
     registeredAt: admin.firestore.Timestamp.fromDate(registeredBefore),
     transportFromTadika: false,
+    registrationFeeAppliedPeriod: monthKey(registeredBefore),
   });
   await createChild({
     childId: childTransitAuto2h,
@@ -378,6 +583,7 @@ async function run() {
     birthDate: "2023-08-10",
     registeredAt: admin.firestore.Timestamp.fromDate(registeredBefore),
     transportFromTadika: false,
+    registrationFeeAppliedPeriod: monthKey(registeredBefore),
   });
   await createChild({
     childId: childTransitAutoHalfday,
@@ -389,6 +595,7 @@ async function run() {
     birthDate: "2023-09-10",
     registeredAt: admin.firestore.Timestamp.fromDate(registeredBefore),
     transportFromTadika: false,
+    registrationFeeAppliedPeriod: monthKey(registeredBefore),
   });
   await updateParent(parentUsage, {
     childIds: [childDay, childWeek, childHour, childUniform, childReview, childTransitAuto2h, childTransitAutoHalfday],
@@ -487,6 +694,7 @@ async function run() {
     birthDate: "2023-04-12",
     registeredAt: admin.firestore.Timestamp.fromDate(registeredEarlier),
     transportFromTadika: false,
+    registrationFeeAppliedPeriod: monthKey(registeredEarlier),
   });
   await createChild({
     childId: childFamily2,
@@ -498,6 +706,7 @@ async function run() {
     birthDate: "2022-07-01",
     registeredAt: admin.firestore.Timestamp.fromDate(registeredEarlier),
     transportFromTadika: true,
+    registrationFeeAppliedPeriod: monthKey(registeredEarlier),
   });
   await updateParent(parentFamily, {
     childIds: [childFamily1, childFamily2],
@@ -589,6 +798,7 @@ async function run() {
     birthDate: underThreeMonthsBirthDate,
     registeredAt: admin.firestore.Timestamp.fromDate(registeredLongAgo),
     transportFromTadika: false,
+    registrationFeeAppliedPeriod: monthKey(registeredLongAgo),
   });
 
   const ageReviewRes = await fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
@@ -731,7 +941,7 @@ async function run() {
   assertTrue(Boolean(checkoutSync.paymentId), "Case3d: paymentId missing after sync");
   console.log("PASS Case3d generic checkout adapter preserves demo flow on the dummy provider");
 
-  // Case 3e: Billplz provider path should fail cleanly when not configured
+  // Case 3e: Real-provider config stays locked to dummy unless explicitly allowed
   await db.collection("billingConfig").doc("paymentGateway").set({
     provider: "billplz",
     mode: "redirect",
@@ -755,10 +965,11 @@ async function run() {
     phone,
     data: { parentId: parent2, invoiceId: billplzInvoice.invoiceId },
   }));
-  assertTrue(billplzCreate && billplzCreate.ok === false, "Case3e: billplz create should fail when provider secret is missing");
-  assertTrue(String(billplzCreate.reason || "") === "payment-provider-not-configured", "Case3e: expected payment-provider-not-configured");
+  assertTrue(billplzCreate && billplzCreate.ok, "Case3e: checkout creation should stay available under dummy lock");
+  assertTrue(String(billplzCreate.provider || "") === "dummy", "Case3e: provider should be forced back to dummy");
+  assertTrue(String(billplzCreate.mode || "") === "dummy", "Case3e: mode should be forced back to dummy");
   await db.collection("billingConfig").doc("paymentGateway").delete();
-  console.log("PASS Case3e billplz path fails cleanly when not configured");
+  console.log("PASS Case3e real-provider config is locked back to dummy without opt-in");
 
   // Case 3f: Billplz callback finalizes exactly once and is idempotent
   await clearPayments(parent2);
@@ -871,6 +1082,7 @@ async function run() {
     birthDate: "2022-01-01",
     registeredAt: admin.firestore.Timestamp.fromDate(new Date(2025, 11, 20, 10, 0, 0)),
     transportFromTadika: false,
+    registrationFeeAppliedPeriod: "2025-12",
   });
 
   await withMockDate(janDate, async () => {

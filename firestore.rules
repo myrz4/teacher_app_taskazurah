@@ -11,15 +11,19 @@ service cloud.firestore {
       return signedIn() ? request.auth.token.role : null;
     }
 
+    function normalizedRole() {
+      return role() is string ? role().lower() : null;
+    }
+
     function isAdmin() {
-      return role() == 'admin';
+      return normalizedRole() == 'admin';
     }
 
     // Teacher should be recognized by custom claim only.
     // IMPORTANT: Do NOT rely on derived-email patterns for authorization, because anyone could
     // create an email/password account like t_<digits>@taskazurah.local and escalate privileges.
     function isTeacher() {
-      return role() == 'teacher';
+      return normalizedRole() == 'teacher';
     }
 
     function isTeacherForTeacherDoc() {
@@ -36,7 +40,7 @@ service cloud.firestore {
     // This is used for features like "parents can view teacher directory".
     function isParent() {
       // Some deployments set an explicit role=parent claim.
-      return signedIn() && (role() == null || role() == 'parent');
+      return signedIn() && (normalizedRole() == null || normalizedRole() == 'parent');
     }
 
     // Parent derived email support: p_<digits>@taskazurah.local
@@ -159,6 +163,30 @@ service cloud.firestore {
         );
     }
 
+    function isParentForAttendanceChildId(childId) {
+      return childId != null
+        && exists(/databases/$(database)/documents/children/$(childId))
+        && (
+          (
+            signedIn()
+            && request.auth.token.phone_number is string
+            && get(/databases/$(database)/documents/children/$(childId)).data.parentPhonesE164 != null
+            && get(/databases/$(database)/documents/children/$(childId)).data.parentPhonesE164.hasAny([request.auth.token.phone_number])
+          )
+          || (
+            signedIn()
+            && request.auth.token.phone_number is string
+            && get(/databases/$(database)/documents/children/$(childId)).data.parentPhoneTails != null
+            && listHasTailSuffix(get(/databases/$(database)/documents/children/$(childId)).data.parentPhoneTails)
+          )
+          || matchesPhoneFields(
+            get(/databases/$(database)/documents/children/$(childId)).data.parentContact,
+            '',
+            ''
+          )
+        );
+    }
+
     // Default deny
     match /{document=**} {
       allow read, write: if false;
@@ -213,8 +241,21 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    match /attendanceAudit/{docId} {
+      allow read: if isAdmin() || isTeacher() || isParentForAttendanceChildId(resource.data.childId);
+      allow create, update, delete: if isAdmin();
+    }
+
     // Salary: admin-only by default
     match /salary/{docId} {
+      allow read, create, update, delete: if isAdmin();
+    }
+
+    match /casualTransitVisits/{docId} {
+      allow read, create, update, delete: if isAdmin();
+    }
+
+    match /casualTransitAudit/{docId} {
       allow read, create, update, delete: if isAdmin();
     }
 

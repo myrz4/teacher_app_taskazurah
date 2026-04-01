@@ -7,10 +7,13 @@
   },
   "scripts": {
     "lint": "echo Skipping lint step...",
+    "deploy:billing-functions": "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tools/deploy-billing-functions.ps1",
     "billplz:deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tools/deploy-billing-functions.ps1",
     "serve": "firebase emulators:start --only functions",
     "shell": "firebase functions:shell",
     "start": "npm run shell",
+    "e2e:attendance": "npx --yes firebase-tools emulators:exec --project taskazurah --only firestore \"node e2e-attendance-check.js\"",
+    "e2e:casual-transit": "npx --yes firebase-tools emulators:exec --project taskazurah --only firestore \"node e2e-casual-transit-check.js\"",
     "e2e:billing": "npx firebase-tools emulators:exec --project taskazurah --only firestore \"node e2e-billing-check.js\"",
     "deploy": "firebase deploy --only functions",
     "logs": "firebase functions:log"

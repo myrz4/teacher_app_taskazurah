@@ -1,0 +1,184 @@
+/* eslint-disable no-console */
+const admin = require("firebase-admin");
+const fns = require("./index");
+
+const db = admin.firestore();
+
+function assertTrue(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function teacherReq(data) {
+  return {
+    auth: {
+      uid: "e2e-teacher-1",
+      token: {
+        role: "teacher",
+        email: "teacher-e2e@example.com",
+        phone_number: "+601122233344",
+      },
+    },
+    data: data || {},
+  };
+}
+
+function adminReq(data) {
+  return {
+    auth: {
+      uid: "e2e-admin-1",
+      token: {
+        role: "admin",
+        email: "admin-e2e@example.com",
+        phone_number: "+601199988877",
+      },
+    },
+    data: data || {},
+  };
+}
+
+async function run() {
+  const suffix = Date.now().toString(36).toUpperCase();
+  const parentId = `e2e-att-parent-${suffix}`;
+  const childId = `e2e-att-child-${suffix}`;
+  const token = `PICKUP${suffix}`;
+
+  await db.collection("parents").doc(parentId).set({
+    parentName: "E2E Parent",
+    phone: "01122233344",
+    phoneTail: "1122233344",
+    phoneE164: "+601122233344",
+    dailyQrToken: token,
+    representativeName: "E2E Guardian",
+    representativeRole: "Mother",
+  }, { merge: true });
+
+  await db.collection("children").doc(childId).set({
+    name: "E2E Child",
+    parentName: "E2E Parent",
+    parentContact: "01122233344",
+    nfc_uid: "A1B2C3D4",
+  }, { merge: true });
+
+  await db.collection("parents").doc(parentId).collection("tokens").doc(token).set({
+    parentId,
+    childId,
+    childName: "E2E Child",
+    used: false,
+    expiredAt: admin.firestore.Timestamp.fromDate(new Date(Date.now() + (15 * 60 * 1000))),
+    representativeName: "E2E Guardian",
+    representativeRole: "Mother",
+  }, { merge: true });
+
+  const checkIn = await fns.attendanceNfcCheckIn.run(teacherReq({
+    childId,
+    nfcUid: "A1B2C3D4",
+    teacherName: "E2E Teacher",
+  }));
+  assertTrue(checkIn && checkIn.ok, `check-in failed: ${JSON.stringify(checkIn)}`);
+
+  const attendanceId = `${checkIn.dateKey}_${childId}`;
+  let snap = await db.collection("attendance").doc(attendanceId).get();
+  assertTrue(snap.exists, "attendance document missing after check-in");
+  let attendance = snap.data() || {};
+  assertTrue(String(attendance.status || "") === "CHECKED_IN", "attendance status should be CHECKED_IN");
+  assertTrue(Boolean(attendance.check_in_time), "legacy check_in_time missing after check-in");
+  assertTrue(Boolean(attendance.checkInAt), "checkInAt missing after check-in");
+  assertTrue(!attendance.check_out_time, "check_out_time should be empty after check-in");
+
+  const duplicateCheckIn = await fns.attendanceNfcCheckIn.run(teacherReq({
+    childId,
+    nfcUid: "A1B2C3D4",
+    teacherName: "E2E Teacher",
+  }));
+  assertTrue(!duplicateCheckIn.ok && duplicateCheckIn.reason === "attendance-already-open", "duplicate check-in should be rejected");
+
+  const checkOut = await fns.attendanceCheckoutWithParentQr.run(teacherReq({
+    qrToken: `QR_${token}`,
+    teacherName: "E2E Teacher",
+  }));
+  assertTrue(checkOut && checkOut.ok, `checkout failed: ${JSON.stringify(checkOut)}`);
+
+  snap = await db.collection("attendance").doc(attendanceId).get();
+  attendance = snap.data() || {};
+  assertTrue(String(attendance.status || "") === "CHECKED_OUT", "attendance status should be CHECKED_OUT");
+  assertTrue(Boolean(attendance.check_out_time), "legacy check_out_time missing after checkout");
+  assertTrue(Boolean(attendance.checkOutAt), "checkOutAt missing after checkout");
+  assertTrue(String(attendance.checkout_method || "") === "PARENT_QR", "legacy checkout_method should be PARENT_QR");
+  assertTrue(String(attendance.checkOutMethod || "") === "PARENT_QR", "checkOutMethod should be PARENT_QR");
+  assertTrue(String(attendance.pickupGuardianNameSnapshot || "") === "E2E Guardian", "pickup guardian snapshot missing");
+
+  const tokenSnap = await db.collection("parents").doc(parentId).collection("tokens").doc(token).get();
+  assertTrue(tokenSnap.exists && tokenSnap.data().used === true, "pickup token should be marked used");
+
+  const duplicateCheckOut = await fns.attendanceCheckoutWithParentQr.run(teacherReq({
+    qrToken: token,
+    teacherName: "E2E Teacher",
+  }));
+  assertTrue(!duplicateCheckOut.ok && duplicateCheckOut.reason === "pickup-token-already-used", "duplicate checkout should be rejected");
+
+  const reopen = await fns.attendanceAdminOverride.run(adminReq({
+    action: "REOPEN_RECORD",
+    childId,
+    attendanceDate: checkIn.dateKey,
+    reason: "Correcting QR checkout",
+    notes: "Reopened for admin correction",
+    adminName: "E2E Admin",
+  }));
+  assertTrue(reopen && reopen.ok, `reopen failed: ${JSON.stringify(reopen)}`);
+
+  snap = await db.collection("attendance").doc(attendanceId).get();
+  attendance = snap.data() || {};
+  assertTrue(String(attendance.status || "") === "CHECKED_IN", "attendance status should return to CHECKED_IN after reopen");
+  assertTrue(!attendance.check_out_time, "check_out_time should be cleared after reopen");
+  assertTrue(!attendance.checkOutAt, "checkOutAt should be cleared after reopen");
+
+  const editedCheckInAt = new Date("2026-03-20T00:15:00.000Z");
+  const editedCheckOutAt = new Date("2026-03-20T09:45:00.000Z");
+  const editRecord = await fns.attendanceAdminOverride.run(adminReq({
+    action: "EDIT_RECORD",
+    childId,
+    attendanceDate: checkIn.dateKey,
+    reason: "Backfilling corrected times",
+    notes: "Adjusted after guardian confirmation",
+    adminName: "E2E Admin",
+    checkInAt: editedCheckInAt.toISOString(),
+    checkOutAt: editedCheckOutAt.toISOString(),
+  }));
+  assertTrue(editRecord && editRecord.ok, `edit record failed: ${JSON.stringify(editRecord)}`);
+
+  snap = await db.collection("attendance").doc(attendanceId).get();
+  attendance = snap.data() || {};
+  assertTrue(String(attendance.status || "") === "CHECKED_OUT", "attendance status should be CHECKED_OUT after edit");
+  assertTrue(attendance.checkInAt && attendance.checkInAt.toDate().toISOString() === editedCheckInAt.toISOString(), "edited checkInAt mismatch");
+  assertTrue(attendance.checkOutAt && attendance.checkOutAt.toDate().toISOString() === editedCheckOutAt.toISOString(), "edited checkOutAt mismatch");
+  assertTrue(String(attendance.manualEditReason || "") === "Backfilling corrected times", "manual edit reason missing after edit");
+
+  const markAbsent = await fns.attendanceAdminOverride.run(adminReq({
+    action: "MARK_ABSENT",
+    childId,
+    attendanceDate: checkIn.dateKey,
+    reason: "Removing record after audit review",
+    notes: "Attendance entry was invalid",
+    adminName: "E2E Admin",
+  }));
+  assertTrue(markAbsent && markAbsent.ok, `mark absent failed: ${JSON.stringify(markAbsent)}`);
+
+  snap = await db.collection("attendance").doc(attendanceId).get();
+  attendance = snap.data() || {};
+  assertTrue(String(attendance.status || "") === "NOT_CHECKED_IN", "attendance status should be NOT_CHECKED_IN after mark absent");
+  assertTrue(!attendance.check_in_time, "check_in_time should be cleared after mark absent");
+  assertTrue(!attendance.check_out_time, "check_out_time should be cleared after mark absent");
+  assertTrue(attendance.isPresent === false, "isPresent should be false after mark absent");
+
+  const auditSnap = await db.collection("attendanceAudit")
+    .where("attendanceId", "==", attendanceId)
+    .get();
+  assertTrue(auditSnap.size >= 5, "attendance audit entries missing admin override history");
+
+  console.log("PASS attendance E2E: NFC check-in + QR checkout + admin override audit");
+}
+
+run().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});

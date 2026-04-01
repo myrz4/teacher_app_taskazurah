@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:qr_code_scanner/qr_code_scanner.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:intl/intl.dart';
 
 class QRScannerScreen extends StatefulWidget {
@@ -44,39 +45,38 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
     }
   }
 
-  /// 🧠 Update / create attendance doc for this child:
-  Future<void> _updateCheckoutApproval({
-    required String childId,
-    required String childName,
-    required String parentName,
-    required String teacher,
-    required bool approved,
+  Future<Map<String, dynamic>> _checkoutWithParentQr({
+    required String qrToken,
   }) async {
-    if (childId.isEmpty) return;
+    final callable = FirebaseFunctions.instanceFor(region: 'asia-southeast1')
+        .httpsCallable('attendanceCheckoutWithParentQr');
+    final response = await callable.call<Map<String, dynamic>>({
+      'qrToken': qrToken,
+      'teacherName': teacherName,
+    });
+    return Map<String, dynamic>.from(response.data ?? const <String, dynamic>{});
+  }
 
-    final String todayDateId = DateFormat('yyyy-MM-dd').format(DateTime.now());
-    final String attendanceDocId = '${todayDateId}_$childId';
-
-    final DocumentReference attendRef =
-        _firestore.collection('attendance').doc(attendanceDocId);
-
-    final docSnap = await attendRef.get();
-
-    if (docSnap.exists) {
-      await attendRef.update({
-        'checkout_approval': approved,
-      });
-    } else {
-      await attendRef.set({
-        'childId': childId,
-        'childRef': '/children/$childId',
-        'name': childName,
-        'parentName': parentName,
-        'teacher': teacher,
-        'date': Timestamp.now(),
-        'isPresent': true,
-        'checkout_approval': approved,
-      }, SetOptions(merge: true));
+  String _reasonToMessage(String reason) {
+    switch (reason) {
+      case 'pickup-token-not-found':
+        return 'QR tidak sah atau tiada dalam rekod.';
+      case 'pickup-token-expired':
+        return 'QR ini telah tamat tempoh.';
+      case 'pickup-token-already-used':
+        return 'QR ini sudah digunakan.';
+      case 'attendance-not-found':
+        return 'Rekod kehadiran tiada untuk hari ini.';
+      case 'attendance-not-checked-in':
+        return 'Kanak-kanak belum check-in.';
+      case 'attendance-already-closed':
+        return 'Attendance sudah ditutup.';
+      case 'pickup-token-child-mismatch':
+        return 'QR ini tidak sepadan dengan kanak-kanak yang dipilih.';
+      case 'staff-only':
+        return 'Hanya guru atau admin boleh sahkan pickup.';
+      default:
+        return 'Pengesahan QR gagal.';
     }
   }
 
@@ -98,99 +98,18 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
 
       try {
         final tokenValue = qrValue.replaceFirst("QR_", "").trim();
+        final result = await _checkoutWithParentQr(qrToken: tokenValue);
+        final bool verified = result['ok'] == true;
+        final String parentName = (result['parentName'] ?? '-').toString();
+        final String phone = (result['parentPhone'] ?? '-').toString();
+        final String childName = (result['childName'] ?? '-').toString();
+        final String representativeName = (result['representativeName'] ?? '-').toString();
+        final String representativeRole = (result['representativeRole'] ?? '-').toString();
 
-        // 1️⃣ Cari parent yang sedang guna token ni
-        final parentQuery = await _firestore
-            .collection('parents')
-            .where('dailyQrToken', isEqualTo: tokenValue)
-            .limit(1)
-            .get();
-
-        if (parentQuery.docs.isEmpty) {
+        if (!verified) {
           Fluttertoast.showToast(
-            msg: "QR tidak sah atau tiada dalam rekod.",
+            msg: _reasonToMessage((result['reason'] ?? '').toString()),
             backgroundColor: Colors.red,
-          );
-          setState(() => scanned = false);
-          return;
-        }
-
-        final parentDoc = parentQuery.docs.first;
-        final parentData = parentDoc.data();
-        final parentRef = parentDoc.reference;
-
-        final parentName = parentData['parentName'] ?? '-';
-        final phone = parentData['phone'] ?? '-';
-        final parentChildName = parentData['childName'] ?? '-';
-        final representativeFromParent = parentData['representativeName'] ?? '-';
-
-        // 2️⃣ Dapatkan dokumen token sebenar
-        final tokenRef = parentRef.collection('tokens').doc(tokenValue);
-        final tokenSnap = await tokenRef.get();
-
-        if (!tokenSnap.exists) {
-          Fluttertoast.showToast(
-            msg: "Token tidak wujud atau sudah dipadam.",
-            backgroundColor: Colors.red,
-          );
-          setState(() => scanned = false);
-          return;
-        }
-
-        final tokenData = tokenSnap.data()!;
-        final bool used = tokenData['used'] ?? false;
-        final Timestamp? expiredAtTs = tokenData['expiredAt'];
-        final DateTime? expiredAt = expiredAtTs?.toDate();
-
-        final bool expired =
-            expiredAt != null && DateTime.now().isAfter(expiredAt);
-
-        // Ambil child ID dari token (NFC UID)
-        final String childId = tokenData['childId'] ?? '';
-
-        String childName = (tokenData['childName'] ?? parentChildName ?? '-').toString();
-        if ((childName.trim().isEmpty || childName.trim() == '-') && childId.trim().isNotEmpty) {
-          try {
-            final childSnap = await _firestore.collection('children').doc(childId.trim()).get();
-            final childData = childSnap.data();
-            if (childData != null && (childData['name'] ?? '').toString().trim().isNotEmpty) {
-              childName = (childData['name'] ?? childName).toString();
-            }
-          } catch (_) {
-            // ignore lookup errors
-          }
-        }
-
-        // Per-token representative details (for unregistered relatives)
-        final representativeName = (tokenData['representativeName'] ?? representativeFromParent ?? '-').toString();
-        final representativeRole = (tokenData['representativeRole'] ?? '-').toString();
-
-        // 3️⃣ Tentukan hasil verification
-        final bool verified = !used && !expired;
-
-        // 4️⃣ Kalau QR valid, tandakan sebagai digunakan
-        if (verified) {
-          await tokenRef.update({
-            'used': true,
-            'usedAt': FieldValue.serverTimestamp(),
-          });
-
-          // 🔄 Update attendance.checkout_approval = true
-          await _updateCheckoutApproval(
-            childId: childId,
-            childName: childName,
-            parentName: parentName,
-            teacher: teacherName,
-            approved: true,
-          );
-        } else {
-          // ❌ Invalid / expired → update attendance.checkout_approval = false
-          await _updateCheckoutApproval(
-            childId: childId,
-            childName: childName,
-            parentName: parentName,
-            teacher: teacherName,
-            approved: false,
           );
         }
 
@@ -207,7 +126,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
                 teacher: teacherName,
                 representativeName: representativeName,
                 representativeRole: representativeRole,
-                expiryDate: expiredAt,
+                expiryDate: null,
                 teacherUsername: widget.teacherUsername,
               ),
             ),
