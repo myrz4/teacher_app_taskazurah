@@ -243,7 +243,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
 
     final total = _childrenDocs.length;
     final childAliasToId = <String, String>{};
-    final presentIds = <String>{};
+    final attendedIds = <String>{};
 
     void registerChildAlias(dynamic rawAlias, String canonicalId) {
       final alias = rawAlias?.toString().trim() ?? '';
@@ -287,17 +287,17 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
       final hasCheckIn = _attendanceHasCheckIn(data);
       final hasCheckOut = _attendanceHasCheckOut(data);
 
-      if (hasCheckIn && !hasCheckOut) {
-        presentIds.add(childId);
+      if (hasCheckIn || hasCheckOut) {
+        attendedIds.add(childId);
       }
     }
 
     if (!mounted) return;
 
-    final absentCount = total - presentIds.length;
+    final absentCount = total - attendedIds.length;
 
     setState(() {
-      todayAttendanceCount = presentIds.length;
+      todayAttendanceCount = attendedIds.length;
       totalStudentCount = total;
       absentStudentCount = absentCount < 0 ? 0 : absentCount;
       _isLoading = false;
