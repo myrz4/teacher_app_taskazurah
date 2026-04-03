@@ -546,14 +546,30 @@ exports.attendanceCheckoutWithParentQr = onCall({ region: "asia-southeast1" }, a
         throw callableError("pickup-token-expired", "deadline-exceeded");
       }
 
-      const attendanceId = `${dayInfo.key}_${childId}`;
-      const attendanceRef = db.collection("attendance").doc(attendanceId);
-      const attendanceSnap = await tx.get(attendanceRef);
-      if (!attendanceSnap.exists) {
+      const resolvedAttendance = await attendanceResolveParentQrCheckoutTarget({
+        tx,
+        db,
+        dayInfo,
+        tokenData,
+        parentData,
+        fallbackChildId: childId,
+      });
+      if (!resolvedAttendance.attendanceSnap || !resolvedAttendance.attendanceSnap.exists) {
         throw callableError("attendance-not-found", "not-found");
       }
 
+      const attendanceRef = resolvedAttendance.attendanceRef;
+      const attendanceSnap = resolvedAttendance.attendanceSnap;
       const attendanceData = attendanceSnap.data() || {};
+      const resolvedChildSnap = resolvedAttendance.childSnap;
+      const resolvedChildData = resolvedChildSnap && resolvedChildSnap.exists ? (resolvedChildSnap.data() || {}) : {};
+      const resolvedChildId = String(
+        attendanceData.childId
+          || resolvedAttendance.resolvedChildId
+          || childId,
+      ).trim() || childId;
+      const attendanceId = attendanceRef.id;
+
       if (!attendanceHasCheckIn(attendanceData)) {
         throw callableError("attendance-not-checked-in", "failed-precondition");
       }
@@ -561,7 +577,13 @@ exports.attendanceCheckoutWithParentQr = onCall({ region: "asia-southeast1" }, a
         throw callableError("attendance-already-closed", "already-exists");
       }
 
-      const childName = String(tokenData.childName || attendanceData.name || childId).trim() || childId;
+      const childName = String(
+        tokenData.childName
+          || attendanceData.name
+          || attendanceData.childName
+          || resolvedChildData.name
+          || resolvedChildId,
+      ).trim() || resolvedChildId;
       const parentName = String(parentData.parentName || attendanceData.parentName || "-").trim() || "-";
       const representativeName = String(
         tokenData.representativeName || parentData.representativeName || parentName,
@@ -569,9 +591,9 @@ exports.attendanceCheckoutWithParentQr = onCall({ region: "asia-southeast1" }, a
       const representativeRole = String(tokenData.representativeRole || parentData.representativeRole || "").trim();
       const parentPhone = String(parentData.phoneE164 || parentData.phone || "").trim();
 
-      tx.set(attendanceRef, {
+      const attendancePatch = {
         attendanceId,
-        childId,
+        childId: resolvedChildId,
         name: childName,
         parentName,
         date: attendanceData.date || admin.firestore.Timestamp.fromDate(dayInfo.startOfDayUtc),
@@ -611,7 +633,12 @@ exports.attendanceCheckoutWithParentQr = onCall({ region: "asia-southeast1" }, a
         isPresent: true,
         is_present: true,
         teacher: actor.displayName || String(attendanceData.teacher || ""),
-      }, { merge: true });
+      };
+      if (resolvedAttendance.childRef) {
+        attendancePatch.childRef = resolvedAttendance.childRef;
+      }
+
+      tx.set(attendanceRef, attendancePatch, { merge: true });
 
       tx.set(tokenRef, {
         used: true,
@@ -624,7 +651,7 @@ exports.attendanceCheckoutWithParentQr = onCall({ region: "asia-southeast1" }, a
       tx.set(auditRef, attendanceAuditEntry({
         action: "CHECK_OUT",
         attendanceId,
-        childId,
+        childId: resolvedChildId,
         actor,
         method: "PARENT_QR",
         details: {
@@ -640,20 +667,119 @@ exports.attendanceCheckoutWithParentQr = onCall({ region: "asia-southeast1" }, a
 
       return {
         attendanceId,
-        childId,
+        childId: resolvedChildId,
         childName,
         parentName,
         parentPhone,
         representativeName,
         representativeRole,
         status: "CHECKED_OUT",
+        previousStatus: attendanceStatusValue(attendanceData),
+        matchScore: resolvedAttendance.matchScore,
       };
     });
 
-    return { ok: true, ...result };
+    logger.info("attendanceCheckoutWithParentQr success", {
+      tokenValue,
+      parentId: parentRef.id,
+      attendanceId: result.attendanceId,
+      childId: result.childId,
+      previousStatus: result.previousStatus,
+      matchScore: result.matchScore,
+      actorUid: actor.uid,
+      actorRole: actor.role,
+    });
+
+    return {
+      ok: true,
+      attendanceId: result.attendanceId,
+      childId: result.childId,
+      childName: result.childName,
+      parentName: result.parentName,
+      parentPhone: result.parentPhone,
+      representativeName: result.representativeName,
+      representativeRole: result.representativeRole,
+      status: result.status,
+    };
   } catch (err) {
     logger.error("attendanceCheckoutWithParentQr failed", err);
     return { ok: false, reason: callableErrorReason(err) };
+  }
+});
+
+exports.attendanceParentPickupEligibility = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAuth(req);
+
+    const parentId = String(req.data && req.data.parentId ? req.data.parentId : "").trim();
+    const desiredChildId = String(req.data && req.data.childId ? req.data.childId : "").trim();
+    const desiredChildRef = String(req.data && req.data.childRef ? req.data.childRef : "").trim();
+
+    if (!parentId || (!desiredChildId && !desiredChildRef)) {
+      return { ok: false, reason: "missing-args", message: "Unable to verify pickup eligibility right now." };
+    }
+
+    const { parentData } = await assertParentOwnerByPhone({ parentId, authToken: req.auth.token });
+    const requestedChildDocId = attendanceChildDocIdFromRef(desiredChildRef) || desiredChildId;
+    const linkedChildDocIds = attendanceParentLinkedChildDocIds(parentData);
+
+    if (requestedChildDocId && linkedChildDocIds.length && !linkedChildDocIds.includes(requestedChildDocId)) {
+      throw callableError("child-not-linked", "permission-denied");
+    }
+
+    const db = admin.firestore();
+    const dayInfo = attendanceDayInfo();
+    const resolvedAttendance = await attendanceResolvePickupEligibilityTarget({
+      db,
+      dayInfo,
+      desiredChildId,
+      desiredChildRef,
+    });
+
+    if (!resolvedAttendance.attendanceSnap || !resolvedAttendance.attendanceSnap.exists) {
+      return {
+        ok: true,
+        allowed: false,
+        reason: "attendance-not-found",
+        message: "Pickup QR will be available after your child checks in today.",
+      };
+    }
+
+    const attendanceData = resolvedAttendance.attendanceSnap.data() || {};
+    if (!attendanceHasCheckIn(attendanceData)) {
+      return {
+        ok: true,
+        allowed: false,
+        reason: "attendance-not-checked-in",
+        message: "Pickup QR will be available after your child checks in today.",
+      };
+    }
+
+    if (attendanceHasCheckOut(attendanceData)) {
+      return {
+        ok: true,
+        allowed: false,
+        reason: "attendance-already-closed",
+        message: "Pickup QR is no longer available because your child has already checked out today.",
+      };
+    }
+
+    return {
+      ok: true,
+      allowed: true,
+      reason: "eligible",
+      message: "",
+      attendanceId: resolvedAttendance.attendanceSnap.id,
+      resolvedChildId: resolvedAttendance.resolvedChildId,
+      matchScore: resolvedAttendance.matchScore,
+    };
+  } catch (err) {
+    logger.error("attendanceParentPickupEligibility failed", err);
+    return {
+      ok: false,
+      reason: callableErrorReason(err),
+      message: "Unable to verify pickup eligibility right now.",
+    };
   }
 });
 
@@ -1305,6 +1431,386 @@ function attendanceParentName(childData, parentData) {
       || (parentData && parentData.parentName)
       || "-",
   ).trim() || "-";
+}
+
+function attendanceChildDocIdFromRef(rawRef) {
+  if (!rawRef) return "";
+
+  let path = "";
+  if (typeof rawRef === "string") {
+    path = rawRef.trim();
+  } else if (typeof rawRef.path === "string") {
+    path = rawRef.path.trim();
+  }
+
+  if (!path) return "";
+
+  path = path.startsWith("/") ? path.slice(1) : path;
+  const documentsMarker = "/documents/";
+  const documentsIndex = path.indexOf(documentsMarker);
+  if (documentsIndex >= 0) {
+    path = path.slice(documentsIndex + documentsMarker.length);
+  }
+  if (path.startsWith("documents/")) {
+    path = path.slice("documents/".length);
+  }
+
+  const childMarker = "children/";
+  const childIndex = path.indexOf(childMarker);
+  if (childIndex < 0) return "";
+
+  const childPath = path.slice(childIndex + childMarker.length);
+  return String(childPath.split("/")[0] || "").trim();
+}
+
+function attendanceDocumentMatchesDay(data, dayInfo, docId = "") {
+  const normalizedDocId = String(docId || "").trim();
+  if (normalizedDocId && normalizedDocId.startsWith(`${dayInfo.key}_`)) {
+    return true;
+  }
+
+  const normalizedDateKey = String(data && data.dateKey ? data.dateKey : "").trim();
+  if (normalizedDateKey && normalizedDateKey === dayInfo.key) {
+    return true;
+  }
+
+  const rawDate = data && data.date ? data.date : null;
+  if (typeof rawDate === "string" && rawDate.trim() === dayInfo.key) {
+    return true;
+  }
+
+  const attendanceDate = attendanceTimestampToDate(rawDate);
+  if (!attendanceDate) {
+    return false;
+  }
+
+  const startMs = dayInfo.startOfDayUtc.getTime();
+  const endMs = startMs + (24 * 60 * 60 * 1000);
+  const attendanceMs = attendanceDate.getTime();
+  return attendanceMs >= startMs && attendanceMs < endMs;
+}
+
+async function attendanceResolveParentQrCheckoutTarget({ tx, db, dayInfo, tokenData, parentData, fallbackChildId }) {
+  const candidateChildKeys = [];
+  const candidateChildDocIds = [];
+
+  const addUnique = (target, raw) => {
+    const value = String(raw || "").trim();
+    if (!value || target.includes(value)) return;
+    target.push(value);
+  };
+
+  addUnique(candidateChildDocIds, attendanceChildDocIdFromRef(tokenData && tokenData.childRef));
+  addUnique(candidateChildDocIds, attendanceChildDocIdFromRef(parentData && parentData.childRef));
+  addUnique(candidateChildDocIds, fallbackChildId);
+  addUnique(candidateChildDocIds, tokenData && tokenData.childId);
+  addUnique(candidateChildDocIds, parentData && parentData.childId);
+
+  addUnique(candidateChildKeys, fallbackChildId);
+  addUnique(candidateChildKeys, tokenData && tokenData.childId);
+  addUnique(candidateChildKeys, parentData && parentData.childId);
+
+  let childNumericId = null;
+
+  let childSnap = null;
+  for (const childDocId of candidateChildDocIds) {
+    const nextChildSnap = await tx.get(db.collection("children").doc(childDocId));
+    if (nextChildSnap.exists) {
+      childSnap = nextChildSnap;
+      break;
+    }
+  }
+
+  let childRef = null;
+  if (childSnap && childSnap.exists) {
+    childRef = childSnap.ref;
+    const childData = childSnap.data() || {};
+    childNumericId = Number.isFinite(Number(childData.child_id)) ? Number(childData.child_id) : null;
+    addUnique(candidateChildKeys, childSnap.id);
+    addUnique(candidateChildKeys, childData.childId);
+    addUnique(candidateChildKeys, childData.nfc_uid);
+    addUnique(candidateChildKeys, childData.child_id);
+  } else if (candidateChildDocIds.length) {
+    childRef = db.collection("children").doc(candidateChildDocIds[0]);
+  }
+
+  const scoreAttendanceCandidate = (doc, data) => {
+    if (!doc || !data) return -1;
+
+    let score = 0;
+    if (attendanceDocumentMatchesDay(data, dayInfo, doc.id)) score += 10;
+
+    const docChildId = String(data.childId || "").trim();
+    const docChildDocId = attendanceChildDocIdFromRef(data.childRef);
+    const docNumericChildId = Number.isFinite(Number(data.child_id)) ? Number(data.child_id) : null;
+
+    if (docChildId && candidateChildKeys.includes(docChildId)) score += 6;
+    if (docChildDocId && candidateChildDocIds.includes(docChildDocId)) score += 6;
+    if (docNumericChildId !== null && childNumericId !== null && docNumericChildId === childNumericId) score += 5;
+    if (attendanceHasCheckIn(data)) score += 8;
+    if (!attendanceHasCheckOut(data)) score += 4;
+    if (attendanceStatusValue(data) === "CHECKED_IN") score += 3;
+    if (attendanceStatusValue(data) === "CHECKED_OUT") score -= 3;
+
+    return score;
+  };
+
+  const candidateDocs = [];
+  const addCandidateDoc = (doc) => {
+    if (doc && doc.exists) {
+      candidateDocs.push(doc);
+    }
+  };
+
+  for (const childKey of candidateChildKeys) {
+    const attendanceRef = db.collection("attendance").doc(`${dayInfo.key}_${childKey}`);
+    const attendanceSnap = await tx.get(attendanceRef);
+    addCandidateDoc(attendanceSnap);
+  }
+
+  if (childRef) {
+    const attendanceQuery = db.collection("attendance")
+      .where("childRef", "==", childRef)
+      .limit(20);
+    const attendanceQuerySnap = await tx.get(attendanceQuery);
+
+    candidateDocs.push(...attendanceQuerySnap.docs);
+  }
+
+  const uniqueCandidateChildKeys = candidateChildKeys.slice(0, 10);
+  if (uniqueCandidateChildKeys.length) {
+    const attendanceByChildIdQuery = db.collection("attendance")
+      .where("childId", "in", uniqueCandidateChildKeys)
+      .limit(20);
+    const attendanceByChildIdSnap = await tx.get(attendanceByChildIdQuery);
+    candidateDocs.push(...attendanceByChildIdSnap.docs);
+  }
+
+  if (childNumericId !== null) {
+    const attendanceByNumericIdQuery = db.collection("attendance")
+      .where("child_id", "==", childNumericId)
+      .limit(20);
+    const attendanceByNumericIdSnap = await tx.get(attendanceByNumericIdQuery);
+    candidateDocs.push(...attendanceByNumericIdSnap.docs);
+  }
+
+  let bestMatch = null;
+  let bestScore = -1;
+  let bestHasCheckIn = false;
+  let bestHasCheckOut = true;
+  const seenDocIds = new Set();
+  for (const doc of candidateDocs) {
+    if (!doc || seenDocIds.has(doc.id)) {
+      continue;
+    }
+    seenDocIds.add(doc.id);
+
+    const data = doc.data() || {};
+    if (!attendanceDocumentMatchesDay(data, dayInfo, doc.id)) {
+      continue;
+    }
+
+    const score = scoreAttendanceCandidate(doc, data);
+    const hasCheckIn = attendanceHasCheckIn(data);
+    const hasCheckOut = attendanceHasCheckOut(data);
+    const shouldReplace = score > bestScore
+      || (score === bestScore && hasCheckIn && !bestHasCheckIn)
+      || (score === bestScore && hasCheckIn === bestHasCheckIn && !hasCheckOut && bestHasCheckOut);
+    if (shouldReplace) {
+      bestMatch = doc;
+      bestScore = score;
+      bestHasCheckIn = hasCheckIn;
+      bestHasCheckOut = hasCheckOut;
+    }
+  }
+
+  if (bestMatch) {
+    const matchedData = bestMatch.data() || {};
+    return {
+      attendanceRef: bestMatch.ref,
+      attendanceSnap: bestMatch,
+      childRef,
+      childSnap,
+      resolvedChildId: String(matchedData.childId || candidateChildKeys[0] || fallbackChildId || "").trim(),
+      matchScore: bestScore,
+    };
+  }
+
+  return {
+    attendanceRef: null,
+    attendanceSnap: null,
+    childRef,
+    childSnap,
+    resolvedChildId: String(candidateChildKeys[0] || fallbackChildId || "").trim(),
+  };
+}
+
+function attendanceAddUnique(target, raw) {
+  const value = String(raw || "").trim();
+  if (!value || target.includes(value)) return;
+  target.push(value);
+}
+
+function attendanceParentLinkedChildDocIds(parentData) {
+  const childDocIds = [];
+  const parent = parentData && typeof parentData === "object" ? parentData : {};
+
+  const refLists = [];
+  if (Array.isArray(parent.childRefs)) refLists.push(...parent.childRefs);
+  if (Array.isArray(parent.childrenRefs)) refLists.push(...parent.childrenRefs);
+
+  for (const rawRef of refLists) {
+    attendanceAddUnique(childDocIds, attendanceChildDocIdFromRef(rawRef));
+  }
+
+  if (Array.isArray(parent.childIds)) {
+    for (const rawChildId of parent.childIds) {
+      attendanceAddUnique(childDocIds, rawChildId);
+    }
+  }
+
+  attendanceAddUnique(childDocIds, attendanceChildDocIdFromRef(parent.childRef));
+  attendanceAddUnique(childDocIds, parent.childId);
+  return childDocIds;
+}
+
+async function attendanceResolvePickupEligibilityTarget({ db, dayInfo, desiredChildId, desiredChildRef }) {
+  const candidateChildKeys = [];
+  const candidateChildDocIds = [];
+
+  attendanceAddUnique(candidateChildDocIds, attendanceChildDocIdFromRef(desiredChildRef));
+  attendanceAddUnique(candidateChildDocIds, desiredChildId);
+  attendanceAddUnique(candidateChildKeys, desiredChildId);
+
+  let childNumericId = null;
+  let childSnap = null;
+  for (const childDocId of candidateChildDocIds) {
+    const nextChildSnap = await db.collection("children").doc(childDocId).get();
+    if (nextChildSnap.exists) {
+      childSnap = nextChildSnap;
+      break;
+    }
+  }
+
+  let childRef = null;
+  if (childSnap && childSnap.exists) {
+    childRef = childSnap.ref;
+    const childData = childSnap.data() || {};
+    childNumericId = Number.isFinite(Number(childData.child_id)) ? Number(childData.child_id) : null;
+    attendanceAddUnique(candidateChildKeys, childSnap.id);
+    attendanceAddUnique(candidateChildKeys, childData.childId);
+    attendanceAddUnique(candidateChildKeys, childData.nfc_uid);
+    attendanceAddUnique(candidateChildKeys, childData.child_id);
+  } else if (candidateChildDocIds.length) {
+    childRef = db.collection("children").doc(candidateChildDocIds[0]);
+  }
+
+  const scoreAttendanceCandidate = (doc, data) => {
+    if (!doc || !data) return -1;
+
+    let score = 0;
+    if (attendanceDocumentMatchesDay(data, dayInfo, doc.id)) score += 10;
+
+    const docChildId = String(data.childId || "").trim();
+    const docChildDocId = attendanceChildDocIdFromRef(data.childRef);
+    const docNumericChildId = Number.isFinite(Number(data.child_id)) ? Number(data.child_id) : null;
+
+    if (docChildId && candidateChildKeys.includes(docChildId)) score += 6;
+    if (docChildDocId && candidateChildDocIds.includes(docChildDocId)) score += 6;
+    if (docNumericChildId !== null && childNumericId !== null && docNumericChildId === childNumericId) score += 5;
+    if (attendanceHasCheckIn(data)) score += 8;
+    if (!attendanceHasCheckOut(data)) score += 4;
+    if (attendanceStatusValue(data) === "CHECKED_IN") score += 3;
+    if (attendanceStatusValue(data) === "CHECKED_OUT") score -= 3;
+
+    return score;
+  };
+
+  const candidateDocs = [];
+  const addCandidateDoc = (doc) => {
+    if (doc && doc.exists) {
+      candidateDocs.push(doc);
+    }
+  };
+
+  for (const childKey of candidateChildKeys) {
+    const attendanceRef = db.collection("attendance").doc(`${dayInfo.key}_${childKey}`);
+    const attendanceSnap = await attendanceRef.get();
+    addCandidateDoc(attendanceSnap);
+  }
+
+  if (childRef) {
+    const attendanceQuerySnap = await db.collection("attendance")
+      .where("childRef", "==", childRef)
+      .limit(20)
+      .get();
+    candidateDocs.push(...attendanceQuerySnap.docs);
+  }
+
+  const uniqueCandidateChildKeys = candidateChildKeys.slice(0, 10);
+  if (uniqueCandidateChildKeys.length) {
+    const attendanceByChildIdSnap = await db.collection("attendance")
+      .where("childId", "in", uniqueCandidateChildKeys)
+      .limit(20)
+      .get();
+    candidateDocs.push(...attendanceByChildIdSnap.docs);
+  }
+
+  if (childNumericId !== null) {
+    const attendanceByNumericIdSnap = await db.collection("attendance")
+      .where("child_id", "==", childNumericId)
+      .limit(20)
+      .get();
+    candidateDocs.push(...attendanceByNumericIdSnap.docs);
+  }
+
+  let bestMatch = null;
+  let bestScore = -1;
+  let bestHasCheckIn = false;
+  let bestHasCheckOut = true;
+  const seenDocIds = new Set();
+  for (const doc of candidateDocs) {
+    if (!doc || seenDocIds.has(doc.id)) {
+      continue;
+    }
+    seenDocIds.add(doc.id);
+
+    const data = doc.data() || {};
+    if (!attendanceDocumentMatchesDay(data, dayInfo, doc.id)) {
+      continue;
+    }
+
+    const score = scoreAttendanceCandidate(doc, data);
+    const hasCheckIn = attendanceHasCheckIn(data);
+    const hasCheckOut = attendanceHasCheckOut(data);
+    const shouldReplace = score > bestScore
+      || (score === bestScore && hasCheckIn && !bestHasCheckIn)
+      || (score === bestScore && hasCheckIn === bestHasCheckIn && !hasCheckOut && bestHasCheckOut);
+    if (shouldReplace) {
+      bestMatch = doc;
+      bestScore = score;
+      bestHasCheckIn = hasCheckIn;
+      bestHasCheckOut = hasCheckOut;
+    }
+  }
+
+  if (bestMatch) {
+    const matchedData = bestMatch.data() || {};
+    return {
+      attendanceSnap: bestMatch,
+      childRef,
+      childSnap,
+      resolvedChildId: String(matchedData.childId || candidateChildKeys[0] || desiredChildId || "").trim(),
+      matchScore: bestScore,
+    };
+  }
+
+  return {
+    attendanceSnap: null,
+    childRef,
+    childSnap,
+    resolvedChildId: String(candidateChildKeys[0] || desiredChildId || "").trim(),
+  };
 }
 
 function attendanceAuditEntry({ action, attendanceId, childId, actor, method, reason, details }) {

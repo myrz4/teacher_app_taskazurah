@@ -67,6 +67,99 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     return "${DateFormat('yyyy-MM-dd').format(DateTime.now())}_";
   }
 
+  DateTime? _toDate(dynamic value) {
+    if (value == null) return null;
+    if (value is Timestamp) return value.toDate();
+    if (value is DateTime) return value;
+    if (value is String) return DateTime.tryParse(value);
+    return null;
+  }
+
+  String _extractChildIdFromRef(dynamic rawRef) {
+    final value = rawRef?.toString().trim() ?? '';
+    if (value.isEmpty) return '';
+
+    final normalized = value.startsWith('/') ? value.substring(1) : value;
+    final marker = 'children/';
+    final markerIndex = normalized.indexOf(marker);
+    if (markerIndex < 0) return '';
+
+    final childPath = normalized.substring(markerIndex + marker.length);
+    final slashIndex = childPath.indexOf('/');
+    return (slashIndex >= 0 ? childPath.substring(0, slashIndex) : childPath).trim();
+  }
+
+  bool _isAttendanceDocForToday({
+    required String docId,
+    required String todayPrefix,
+    required Map<String, dynamic> data,
+    required int todayY,
+    required int todayM,
+    required int todayD,
+  }) {
+    if (docId.startsWith(todayPrefix)) {
+      return true;
+    }
+
+    final dateKey = (data['dateKey'] ?? '').toString().trim();
+    if (dateKey == todayPrefix.substring(0, todayPrefix.length - 1)) {
+      return true;
+    }
+
+    final date = _toDate(data['date']);
+    if (date == null) {
+      return false;
+    }
+
+    return date.year == todayY && date.month == todayM && date.day == todayD;
+  }
+
+  bool _attendanceHasCheckIn(Map<String, dynamic> data) {
+    final status = (data['status'] ?? '').toString().trim().toUpperCase();
+    return data['check_in_time'] != null ||
+        data['checkInAt'] != null ||
+        data['checkInTime'] != null ||
+        data['check_in'] != null ||
+        status == 'CHECKED_IN';
+  }
+
+  bool _attendanceHasCheckOut(Map<String, dynamic> data) {
+    final status = (data['status'] ?? '').toString().trim().toUpperCase();
+    return data['check_out_time'] != null ||
+        data['checkOutAt'] != null ||
+        data['checkOutTime'] != null ||
+        data['check_out'] != null ||
+        data['checkoutTime'] != null ||
+        status == 'CHECKED_OUT';
+  }
+
+  String _resolveCanonicalChildId({
+    required String docId,
+    required String todayPrefix,
+    required Map<String, dynamic> data,
+    required Map<String, String> childAliasToId,
+  }) {
+    final candidates = <String>[
+      _extractChildIdFromRef(data['childRef'] ?? data['child_ref']),
+      (data['childId'] ?? '').toString().trim(),
+      (data['child_id'] ?? '').toString().trim(),
+    ];
+
+    if (docId.startsWith(todayPrefix)) {
+      candidates.add(docId.substring(todayPrefix.length).trim());
+    }
+
+    for (final candidate in candidates) {
+      if (candidate.isEmpty) continue;
+      final canonicalId = childAliasToId[candidate];
+      if (canonicalId != null && canonicalId.isNotEmpty) {
+        return canonicalId;
+      }
+    }
+
+    return '';
+  }
+
   @override
   void dispose() {
     _childrenSub?.cancel();
@@ -149,46 +242,64 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     final todayPrefix = _todayDocPrefix();
 
     final total = _childrenDocs.length;
+    final childAliasToId = <String, String>{};
     final presentIds = <String>{};
 
-    DateTime? toDate(dynamic v) {
-      if (v == null) return null;
-      if (v is Timestamp) return v.toDate();
-      if (v is DateTime) return v;
-      if (v is String) return DateTime.tryParse(v);
-      return null;
+    void registerChildAlias(dynamic rawAlias, String canonicalId) {
+      final alias = rawAlias?.toString().trim() ?? '';
+      if (alias.isEmpty) return;
+      childAliasToId.putIfAbsent(alias, () => canonicalId);
+    }
+
+    for (final childDoc in _childrenDocs) {
+      final data = childDoc.data() as Map<String, dynamic>;
+      final canonicalId = childDoc.id.trim();
+      if (canonicalId.isEmpty) continue;
+
+      registerChildAlias(canonicalId, canonicalId);
+      registerChildAlias(data['childId'], canonicalId);
+      registerChildAlias(data['child_id'], canonicalId);
+      registerChildAlias(data['nfc_uid'], canonicalId);
+      registerChildAlias(_extractChildIdFromRef(data['childRef'] ?? data['child_ref']), canonicalId);
     }
 
     for (final doc in _attendanceDocs) {
       final data = doc.data() as Map<String, dynamic>;
 
-      // Prefer docId prefix for matching "today" (avoids timezone issues with Timestamp->DateTime)
-      final bool isTodayById = doc.id.startsWith(todayPrefix);
+      final isToday = _isAttendanceDocForToday(
+        docId: doc.id,
+        todayPrefix: todayPrefix,
+        data: data,
+        todayY: todayY,
+        todayM: todayM,
+        todayD: todayD,
+      );
+      if (!isToday) continue;
 
-      if (!isTodayById) {
-        final date = toDate(data['date']);
-        if (date == null) continue;
-        if (date.year != todayY || date.month != todayM || date.day != todayD) continue;
-      }
-
-      final dynamic rawChildId = data['childId'] ?? data['child_id'];
-      final String childId = (rawChildId ?? '').toString().trim();
+      final childId = _resolveCanonicalChildId(
+        docId: doc.id,
+        todayPrefix: todayPrefix,
+        data: data,
+        childAliasToId: childAliasToId,
+      );
       if (childId.isEmpty) continue;
 
-      final isPresent = data['isPresent'] == true;
-      final hasCheckIn = data['check_in_time'] != null;
+      final hasCheckIn = _attendanceHasCheckIn(data);
+      final hasCheckOut = _attendanceHasCheckOut(data);
 
-      if (isPresent || hasCheckIn) {
+      if (hasCheckIn && !hasCheckOut) {
         presentIds.add(childId);
       }
     }
 
     if (!mounted) return;
 
+    final absentCount = total - presentIds.length;
+
     setState(() {
       todayAttendanceCount = presentIds.length;
       totalStudentCount = total;
-      absentStudentCount = total - presentIds.length;
+      absentStudentCount = absentCount < 0 ? 0 : absentCount;
       _isLoading = false;
     });
   }

@@ -175,7 +175,76 @@ async function run() {
     .get();
   assertTrue(auditSnap.size >= 5, "attendance audit entries missing admin override history");
 
-  console.log("PASS attendance E2E: NFC check-in + QR checkout + admin override audit");
+  const esp32ParentId = `e2e-att-parent-esp32-${suffix}`;
+  const esp32ChildId = `e2e-att-child-esp32-${suffix}`;
+  const esp32Token = `PICKUPESP32${suffix}`;
+  const esp32NfcUid = `ESP32${suffix}`;
+  const esp32ChildRef = db.collection("children").doc(esp32ChildId);
+  const esp32AttendanceId = `${checkIn.dateKey}_${esp32NfcUid}`;
+
+  await db.collection("parents").doc(esp32ParentId).set({
+    parentName: "E2E ESP32 Parent",
+    phone: "01122233345",
+    phoneTail: "1122233345",
+    phoneE164: "+601122233345",
+    dailyQrToken: esp32Token,
+    childId: esp32ChildId,
+    childName: "E2E ESP32 Child",
+    childRef: esp32ChildRef,
+    representativeName: "E2E ESP32 Guardian",
+    representativeRole: "Father",
+  }, { merge: true });
+
+  await db.collection("children").doc(esp32ChildId).set({
+    child_id: 900001,
+    name: "E2E ESP32 Child",
+    parentName: "E2E ESP32 Parent",
+    parentContact: "01122233345",
+    nfc_uid: esp32NfcUid,
+  }, { merge: true });
+
+  await db.collection("parents").doc(esp32ParentId).collection("tokens").doc(esp32Token).set({
+    parentId: esp32ParentId,
+    childId: esp32ChildId,
+    childName: "E2E ESP32 Child",
+    childRef: esp32ChildRef,
+    used: false,
+    expiredAt: admin.firestore.Timestamp.fromDate(new Date(Date.now() + (15 * 60 * 1000))),
+    representativeName: "E2E ESP32 Guardian",
+    representativeRole: "Father",
+  }, { merge: true });
+
+  await db.collection("attendance").doc(esp32AttendanceId).set({
+    attendanceId: esp32AttendanceId,
+    childId: esp32NfcUid,
+    childRef: esp32ChildRef,
+    name: "E2E ESP32 Child",
+    parentName: "E2E ESP32 Parent",
+    dateKey: checkIn.dateKey,
+    status: "CHECKED_IN",
+    checkInAt: admin.firestore.Timestamp.fromDate(new Date()),
+    check_in_time: admin.firestore.Timestamp.fromDate(new Date()),
+    isPresent: true,
+    is_present: true,
+    checkin_method: "NFC",
+  }, { merge: true });
+
+  const esp32CheckOut = await fns.attendanceCheckoutWithParentQr.run(teacherReq({
+    qrToken: `QR_${esp32Token}`,
+    teacherName: "E2E Teacher",
+  }));
+  assertTrue(esp32CheckOut && esp32CheckOut.ok, `ESP32-style checkout failed: ${JSON.stringify(esp32CheckOut)}`);
+
+  const esp32AttendanceSnap = await db.collection("attendance").doc(esp32AttendanceId).get();
+  const esp32Attendance = esp32AttendanceSnap.data() || {};
+  assertTrue(esp32AttendanceSnap.exists, "ESP32-style attendance document missing after checkout");
+  assertTrue(String(esp32Attendance.status || "") === "CHECKED_OUT", "ESP32-style attendance status should be CHECKED_OUT");
+  assertTrue(Boolean(esp32Attendance.check_out_time), "ESP32-style legacy check_out_time missing after checkout");
+  assertTrue(Boolean(esp32Attendance.checkOutAt), "ESP32-style checkOutAt missing after checkout");
+  assertTrue(String(esp32Attendance.childId || "") === esp32NfcUid, "ESP32-style checkout should preserve NFC-based childId");
+  assertTrue(String(esp32Attendance.name || "") === "E2E ESP32 Child", "ESP32-style checkout should preserve child name");
+
+  console.log("PASS attendance E2E: NFC check-in + QR checkout + ESP32 QR checkout + admin override audit");
 }
 
 run().catch((err) => {

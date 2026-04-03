@@ -221,10 +221,10 @@ service cloud.firestore {
 
     // Parent pickup QR tokens (subcollection)
     match /parents/{docId}/tokens/{tokenId} {
-      // Parents generate tokens for themselves; teachers read+mark used when scanning.
+      // Parents generate tokens for themselves; token consumption is server-side only.
       allow read: if isAdmin() || isTeacher() || isParentOwnerOfParentId(docId);
       allow create: if isAdmin() || isParentOwnerOfParentId(docId);
-      allow update: if isAdmin() || isTeacher() || isParentOwnerOfParentId(docId);
+      allow update: if isAdmin();
       allow delete: if isAdmin();
     }
 
