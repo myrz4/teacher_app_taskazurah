@@ -8,12 +8,14 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 class StudentAttendanceDetailScreen extends StatefulWidget {
   final String childId;
   final int? childNumericId;
+  final String? childNfcUid;
   final String childName;
 
   const StudentAttendanceDetailScreen({
     super.key,
     required this.childId,
     this.childNumericId,
+    this.childNfcUid,
     required this.childName,
   });
 
@@ -33,18 +35,49 @@ class _StudentAttendanceDetailScreenState
     return id.trim();
   }
 
-  List<String> _childIdCandidates(String childId) {
-    final normalized = _normalizeId(childId);
-    if (normalized.isEmpty || normalized == '-') return const [];
+  void _addAliasCandidate(Set<String> target, String rawValue) {
+    final normalized = _normalizeId(rawValue);
+    if (normalized.isEmpty || normalized == '-') return;
 
-    final candidates = <String>{
+    target.addAll({
       normalized,
       normalized.replaceAll(' ', ''),
       normalized.toUpperCase(),
       normalized.toLowerCase(),
-    };
+    });
+  }
+
+  List<String> _childIdCandidates(String childId, [String? childNfcUid]) {
+    final candidates = <String>{};
+    _addAliasCandidate(candidates, childId);
+    _addAliasCandidate(candidates, childNfcUid ?? '');
     candidates.removeWhere((e) => e.trim().isEmpty || e.trim() == '-');
     return candidates.toList(growable: false);
+  }
+
+  List<String> _childRefPathCandidates(String childId) {
+    final normalized = _normalizeId(childId);
+    if (normalized.isEmpty || normalized == '-') return const [];
+
+    return <String>[
+      'children/$normalized',
+      '/children/$normalized',
+    ];
+  }
+
+  String _extractChildIdFromRef(dynamic rawRef) {
+    final value = rawRef?.toString().trim() ?? '';
+    if (value.isEmpty) return '';
+
+    final normalized = value.startsWith('/') ? value.substring(1) : value;
+    final marker = 'children/';
+    final markerIndex = normalized.indexOf(marker);
+    if (markerIndex < 0) return '';
+
+    final childPath = normalized.substring(markerIndex + marker.length);
+    final slashIndex = childPath.indexOf('/');
+    return (slashIndex >= 0 ? childPath.substring(0, slashIndex) : childPath)
+        .trim();
   }
 
   DateTime? _tryParseDocIdDate(String docId) {
@@ -61,22 +94,95 @@ class _StudentAttendanceDetailScreenState
     }
   }
 
+  String _dayKeyForRecord(String docId, Map<String, dynamic> data, DateTime? effectiveDate) {
+    final dateKey = (data['dateKey'] ?? '').toString().trim();
+    if (RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(dateKey)) {
+      return dateKey;
+    }
+
+    final docDate = _tryParseDocIdDate(docId);
+    if (docDate != null) {
+      return DateFormat('yyyy-MM-dd').format(docDate);
+    }
+
+    if (effectiveDate != null) {
+      return DateFormat('yyyy-MM-dd').format(effectiveDate);
+    }
+
+    return docId;
+  }
+
+  int _attendanceSortEpoch(String docId, Map<String, dynamic> data, DateTime? effectiveDate) {
+    final candidates = <DateTime?>[
+      _toDateNullable(data['updatedAt']),
+      _toDateNullable(data['checkOutAt']),
+      _toDateNullable(data['check_out_time']),
+      _toDateNullable(data['checkOutTime']),
+      _toDateNullable(data['checkoutTime']),
+      _toDateNullable(data['checkInAt']),
+      _toDateNullable(data['check_in_time']),
+      _toDateNullable(data['checkInTime']),
+      _toDateNullable(data['createdAt']),
+      effectiveDate,
+      _tryParseDocIdDate(docId),
+    ];
+
+    var best = 0;
+    for (final candidate in candidates) {
+      final epoch = candidate?.millisecondsSinceEpoch ?? 0;
+      if (epoch > best) {
+        best = epoch;
+      }
+    }
+    return best;
+  }
+
+  bool _shouldPreferRecord(Map<String, dynamic> nextRecord, Map<String, dynamic>? currentRecord) {
+    if (currentRecord == null) {
+      return true;
+    }
+
+    final nextEpoch = (nextRecord['_sortEpoch'] as int?) ?? 0;
+    final currentEpoch = (currentRecord['_sortEpoch'] as int?) ?? 0;
+    if (nextEpoch != currentEpoch) {
+      return nextEpoch > currentEpoch;
+    }
+
+    final nextCorrected = nextRecord['isAdminCorrected'] == true;
+    final currentCorrected = currentRecord['isAdminCorrected'] == true;
+    if (nextCorrected != currentCorrected) {
+      return nextCorrected;
+    }
+
+    final nextStatus = (nextRecord['status'] ?? '').toString();
+    final currentStatus = (currentRecord['status'] ?? '').toString();
+    final nextHasCheckOut = nextStatus == 'Checked Out';
+    final currentHasCheckOut = currentStatus == 'Checked Out';
+    if (nextHasCheckOut != currentHasCheckOut) {
+      return nextHasCheckOut;
+    }
+
+    final nextHasCheckIn = nextStatus == 'On Time' || nextStatus == 'Manual';
+    final currentHasCheckIn = currentStatus == 'On Time' || currentStatus == 'Manual';
+    if (nextHasCheckIn != currentHasCheckIn) {
+      return nextHasCheckIn;
+    }
+
+    return (nextRecord['attendanceId'] ?? '').toString().compareTo(
+          (currentRecord['attendanceId'] ?? '').toString(),
+        ) >
+        0;
+  }
+
   Future<List<DocumentSnapshot<Map<String, dynamic>>>> _fetchTodayDocs({
     required String childId,
     required int? childNumericId,
+    String? childNfcUid,
   }) async {
     final normalized = _normalizeId(childId);
     final prefix = DateFormat('yyyy-MM-dd').format(DateTime.now());
 
-    final candidates = <String>{};
-    if (normalized.isNotEmpty) {
-      candidates.addAll({
-        normalized,
-        normalized.replaceAll(' ', ''),
-        normalized.toUpperCase(),
-        normalized.toLowerCase(),
-      });
-    }
+    final candidates = <String>{..._childIdCandidates(childId, childNfcUid)};
     if (childNumericId != null) {
       candidates.add(childNumericId.toString());
     }
@@ -95,6 +201,7 @@ class _StudentAttendanceDetailScreenState
       datePrefix: '${prefix}_',
       childId: normalized,
       childNumericId: childNumericId,
+      childNfcUid: childNfcUid,
     );
 
     final merged = <DocumentSnapshot<Map<String, dynamic>>>[];
@@ -120,20 +227,17 @@ class _StudentAttendanceDetailScreenState
     required String datePrefix,
     required String childId,
     required int? childNumericId,
+    String? childNfcUid,
   }) async {
     try {
-      final candidates = <String>{};
-      if (childId.isNotEmpty) {
-        candidates.addAll({
-          childId,
-          childId.replaceAll(' ', ''),
-          childId.toUpperCase(),
-          childId.toLowerCase(),
-        });
-      }
+      final normalizedChildId = _normalizeId(childId);
+      final candidates = <String>{..._childIdCandidates(normalizedChildId, childNfcUid)};
       if (childNumericId != null) {
         candidates.add(childNumericId.toString());
       }
+      final childRefPaths = _childRefPathCandidates(normalizedChildId)
+          .map((path) => path.startsWith('/') ? path : '/$path')
+          .toSet();
       if (candidates.isEmpty) return const [];
 
       final qs = await _firestore
@@ -155,8 +259,19 @@ class _StudentAttendanceDetailScreenState
             : '';
 
         final docChildId = (data['childId'] ?? data['child_id'] ?? '').toString().trim();
+        final docNfcUid = (data['nfc_uid'] ?? data['nfcUid'] ?? '').toString().trim();
+        final refChildId = _extractChildIdFromRef(data['childRef'] ?? data['child_ref']);
+        final rawChildRef = (data['childRef'] ?? data['child_ref'] ?? '').toString().trim();
+        final normalizedRawChildRef = rawChildRef.isEmpty
+          ? ''
+          : (rawChildRef.startsWith('/') ? rawChildRef : '/$rawChildRef');
 
-        final isMatch = candidates.contains(suffix) || candidates.contains(docChildId);
+        final isMatch =
+          candidates.contains(suffix) ||
+          candidates.contains(docChildId) ||
+          candidates.contains(docNfcUid) ||
+          (refChildId.isNotEmpty && _normalizeId(refChildId) == normalizedChildId) ||
+          childRefPaths.contains(normalizedRawChildRef);
         if (isMatch) {
           matched.add(doc);
         }
@@ -180,6 +295,95 @@ class _StudentAttendanceDetailScreenState
       debugPrint('⚠ Failed to fetch history by child_id=$childNumericId: $e');
       return const [];
     }
+  }
+
+  Future<List<QueryDocumentSnapshot<Map<String, dynamic>>>> _runAttendanceQuery({
+    required String field,
+    required Object value,
+  }) async {
+    try {
+      final snap = await _firestore
+          .collection('attendance')
+          .where(field, isEqualTo: value)
+          .get();
+      return snap.docs;
+    } catch (e) {
+      debugPrint('⚠ Failed to fetch history by $field=$value: $e');
+      return const [];
+    }
+  }
+
+  Future<List<QueryDocumentSnapshot<Map<String, dynamic>>>> _fetchHistoryByAliases({
+    required String childId,
+    required int? childNumericId,
+    String? childNfcUid,
+  }) async {
+    final normalizedChildId = _normalizeId(childId);
+    final normalizedNfcUid = _normalizeId(childNfcUid ?? '');
+    final futures = <Future<List<QueryDocumentSnapshot<Map<String, dynamic>>>>>[];
+
+    if (childNumericId != null) {
+      futures.add(_fetchHistoryByNumericId(childNumericId));
+    }
+    if (normalizedNfcUid.isNotEmpty && normalizedNfcUid != '-') {
+      futures.add(_runAttendanceQuery(field: 'nfc_uid', value: normalizedNfcUid));
+    }
+    if (normalizedChildId.isNotEmpty && normalizedChildId != '-') {
+      final childRefDoc = _firestore.doc('children/$normalizedChildId');
+      futures.add(_runAttendanceQuery(field: 'childRef', value: childRefDoc));
+      for (final childRefPath in _childRefPathCandidates(normalizedChildId)) {
+        futures.add(_runAttendanceQuery(field: 'childRef', value: childRefPath));
+        futures.add(_runAttendanceQuery(field: 'child_ref', value: childRefPath));
+      }
+    }
+
+    if (futures.isEmpty) return const [];
+
+    final results = await Future.wait(futures);
+    final merged = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+    final seen = <String>{};
+
+    for (final docs in results) {
+      for (final doc in docs) {
+        if (seen.add(doc.id)) {
+          merged.add(doc);
+        }
+      }
+    }
+
+    return merged;
+  }
+
+  bool _attendanceHasCheckIn(Map<String, dynamic> data) {
+    final status = (data['status'] ?? '').toString().trim().toUpperCase();
+    return data['check_in_time'] != null ||
+        data['checkInAt'] != null ||
+        data['checkInTime'] != null ||
+        data['check_in'] != null ||
+        data['isPresent'] == true ||
+        data['is_present'] == true ||
+        status == 'CHECKED_IN' ||
+        status == 'CHECKED_OUT';
+  }
+
+  bool _attendanceHasCheckOut(Map<String, dynamic> data) {
+    final status = (data['status'] ?? '').toString().trim().toUpperCase();
+    return data['check_out_time'] != null ||
+        data['checkOutAt'] != null ||
+        data['checkOutTime'] != null ||
+        data['check_out'] != null ||
+        data['checkoutTime'] != null ||
+        status == 'CHECKED_OUT';
+  }
+
+  String _attendanceStatusLabel(Map<String, dynamic> data, {required bool manualFlag}) {
+    if (_attendanceHasCheckOut(data)) {
+      return 'Checked Out';
+    }
+    if (_attendanceHasCheckIn(data)) {
+      return manualFlag ? 'Manual' : 'On Time';
+    }
+    return 'Absent';
   }
 
   DateTime? _toDateNullable(dynamic val) {
@@ -537,7 +741,7 @@ class _StudentAttendanceDetailScreenState
 
   @override
   Widget build(BuildContext context) {
-    final childIdCandidates = _childIdCandidates(widget.childId);
+    final childIdCandidates = _childIdCandidates(widget.childId, widget.childNfcUid);
 
     return Scaffold(
       backgroundColor: Colors.grey[50],
@@ -579,21 +783,24 @@ class _StudentAttendanceDetailScreenState
           }
 
           return FutureBuilder<List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
-            future: (widget.childNumericId == null)
-                ? Future.value(const [])
-                : _fetchHistoryByNumericId(widget.childNumericId!),
-            builder: (context, todaySnap) {
+            future: _fetchHistoryByAliases(
+              childId: widget.childId,
+              childNumericId: widget.childNumericId,
+              childNfcUid: widget.childNfcUid,
+            ),
+            builder: (context, historySnap) {
                 final streamDocs = snapshot.data?.docs ??
                   const <QueryDocumentSnapshot<Map<String, dynamic>>>[];
-              final numericDocs = todaySnap.data ?? const <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+              final aliasDocs = historySnap.data ?? const <QueryDocumentSnapshot<Map<String, dynamic>>>[];
 
               return FutureBuilder<List<DocumentSnapshot<Map<String, dynamic>>>>(
                 future: _fetchTodayDocs(
                   childId: widget.childId,
                   childNumericId: widget.childNumericId,
+                  childNfcUid: widget.childNfcUid,
                 ),
                 builder: (context, todayDocSnap) {
-                  final records = <Map<String, dynamic>>[];
+                  final recordsByDay = <String, Map<String, dynamic>>{};
                   final seenDocIds = <String>{};
 
                   void addDoc(String docId, Map<String, dynamic> data) {
@@ -609,16 +816,16 @@ class _StudentAttendanceDetailScreenState
                     // docId date so UI is stable across device timezones.
                     final effectiveDate = docIdDate ?? dateFromField;
 
-                    final presentFlag =
-                        (data['isPresent'] == true) || (data['is_present'] == true);
                     final manualFlag =
                       (data['manualCheckout'] == true) ||
                       (data['manual_checkout'] == true) ||
                       (data['manual_in'] == true) ||
                       (data['manual_out'] == true);
 
-                    records.add({
-                      'attendanceId': docId,
+                    final record = {
+                      'attendanceId': (data['attendanceId'] ?? '').toString().trim().isEmpty
+                          ? docId
+                          : (data['attendanceId'] ?? '').toString().trim(),
                       'isAdminCorrected': _manualReason(data).isNotEmpty || _sourceSummary(data).toLowerCase().contains('admin manual'),
                       'date': effectiveDate,
                       'source': _sourceSummary(data),
@@ -634,18 +841,21 @@ class _StudentAttendanceDetailScreenState
                           data['check_out'],
                       'teacher': data['teacher'] ?? '-',
                       'pickedBy': data['parentName'] ?? data['pickedBy'] ?? '-',
-                        'status': (data['check_out_time'] ?? data['checkOutTime'] ?? data['check_out']) != null
-                          ? "Checked Out"
-                          : (presentFlag
-                            ? (manualFlag ? "Manual" : "On Time")
-                            : "Absent"),
-                    });
+                      'status': _attendanceStatusLabel(data, manualFlag: manualFlag),
+                      '_sortEpoch': _attendanceSortEpoch(docId, data, effectiveDate),
+                    };
+
+                    final dayKey = _dayKeyForRecord(docId, data, effectiveDate);
+                    final current = recordsByDay[dayKey];
+                    if (_shouldPreferRecord(record, current)) {
+                      recordsByDay[dayKey] = record;
+                    }
                   }
 
                   for (final doc in streamDocs) {
                     addDoc(doc.id, doc.data());
                   }
-                  for (final doc in numericDocs) {
+                  for (final doc in aliasDocs) {
                     addDoc(doc.id, doc.data());
                   }
 
@@ -655,6 +865,8 @@ class _StudentAttendanceDetailScreenState
                     final data = doc.data();
                     if (data != null) addDoc(doc.id, data);
                   }
+
+                  final records = recordsByDay.values.toList(growable: false);
 
                   if (records.isEmpty) {
                     return Center(

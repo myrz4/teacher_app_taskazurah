@@ -10,7 +10,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'student_attendance_detail_screen.dart';
 
 class AttendanceListScreen extends StatefulWidget {
-  const AttendanceListScreen({Key? key}) : super(key: key);
+  const AttendanceListScreen({super.key});
 
   @override
   State<AttendanceListScreen> createState() => _AttendanceListScreenState();
@@ -175,6 +175,9 @@ class _AttendanceListScreenState extends State<AttendanceListScreen> {
                                                   (childNumericId ?? '')
                                                       .toString(),
                                                 ),
+                                      childNfcUid: (child['nfc_uid'] ?? '')
+                                          .toString()
+                                          .trim(),
                                       childName: childName,
                                     ),
                                   ),

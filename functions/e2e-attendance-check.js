@@ -244,6 +244,28 @@ async function run() {
   assertTrue(String(esp32Attendance.childId || "") === esp32NfcUid, "ESP32-style checkout should preserve NFC-based childId");
   assertTrue(String(esp32Attendance.name || "") === "E2E ESP32 Child", "ESP32-style checkout should preserve child name");
 
+  const esp32MarkAbsent = await fns.attendanceAdminOverride.run(adminReq({
+    action: "MARK_ABSENT",
+    childId: esp32ChildId,
+    attendanceDate: checkIn.dateKey,
+    reason: "Removing duplicate legacy NFC entry",
+    notes: "Should patch the existing NFC-keyed doc instead of creating a second record",
+    adminName: "E2E Admin",
+  }));
+  assertTrue(esp32MarkAbsent && esp32MarkAbsent.ok, `ESP32-style mark absent failed: ${JSON.stringify(esp32MarkAbsent)}`);
+
+  const esp32AttendanceAfterAbsentSnap = await db.collection("attendance").doc(esp32AttendanceId).get();
+  const esp32AttendanceAfterAbsent = esp32AttendanceAfterAbsentSnap.data() || {};
+  assertTrue(esp32AttendanceAfterAbsentSnap.exists, "ESP32-style attendance document missing after mark absent");
+  assertTrue(String(esp32AttendanceAfterAbsent.status || "") === "NOT_CHECKED_IN", "ESP32-style attendance should become NOT_CHECKED_IN after mark absent");
+  assertTrue(!esp32AttendanceAfterAbsent.check_in_time, "ESP32-style legacy check_in_time should be cleared after mark absent");
+  assertTrue(!esp32AttendanceAfterAbsent.checkOutAt, "ESP32-style checkOutAt should be cleared after mark absent");
+  assertTrue(String(esp32AttendanceAfterAbsent.childId || "") === esp32ChildId, "ESP32-style admin override should canonicalize childId");
+  assertTrue(String(esp32AttendanceAfterAbsent.attendanceId || "") === esp32AttendanceId, "ESP32-style admin override should preserve the original doc id as attendanceId");
+
+  const duplicateCanonicalAttendanceSnap = await db.collection("attendance").doc(`${checkIn.dateKey}_${esp32ChildId}`).get();
+  assertTrue(!duplicateCanonicalAttendanceSnap.exists, "Admin override should not create a duplicate canonical attendance document for ESP32-style records");
+
   console.log("PASS attendance E2E: NFC check-in + QR checkout + ESP32 QR checkout + admin override audit");
 }
 

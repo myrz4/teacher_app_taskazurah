@@ -56,7 +56,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
 
   // 🔁 LIVE attendance listeners
   StreamSubscription<QuerySnapshot>? _childrenSub;
-  StreamSubscription<QuerySnapshot>? _attendanceSub;
+  final List<StreamSubscription<QuerySnapshot>> _attendanceSubs = [];
+  final Map<String, Map<String, QueryDocumentSnapshot>> _attendanceDocsBySource = {};
   Timer? _midnightTimer;
 
   List<QueryDocumentSnapshot> _childrenDocs = [];
@@ -67,6 +68,15 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     return "${DateFormat('yyyy-MM-dd').format(DateTime.now())}_";
   }
 
+  String _todayDateKey() {
+    return DateFormat('yyyy-MM-dd').format(DateTime.now());
+  }
+
+  Timestamp _todayStartOfDayTimestamp() {
+    final now = DateTime.now();
+    return Timestamp.fromDate(DateTime(now.year, now.month, now.day));
+  }
+
   DateTime? _toDate(dynamic value) {
     if (value == null) return null;
     if (value is Timestamp) return value.toDate();
@@ -75,7 +85,89 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     return null;
   }
 
+  DateTime? _tryParseDocIdDate(String docId) {
+    final match = RegExp(r'^(\d{4}-\d{2}-\d{2})').firstMatch(docId);
+    if (match == null) return null;
+    return DateTime.tryParse(match.group(1)!);
+  }
+
+  String _manualReason(Map<String, dynamic> data) {
+    return (data['manualEditReason'] ?? data['manual_edit_reason'] ?? '')
+        .toString()
+        .trim();
+  }
+
+  bool _isAdminCorrected(Map<String, dynamic> data) {
+    return _manualReason(data).isNotEmpty;
+  }
+
+  int _attendanceSortEpoch(String docId, Map<String, dynamic> data) {
+    final candidates = <DateTime?>[
+      _toDate(data['updatedAt']),
+      _toDate(data['checkOutAt']),
+      _toDate(data['check_out_time']),
+      _toDate(data['checkOutTime']),
+      _toDate(data['checkoutTime']),
+      _toDate(data['checkInAt']),
+      _toDate(data['check_in_time']),
+      _toDate(data['checkInTime']),
+      _toDate(data['createdAt']),
+      _toDate(data['date']),
+      _tryParseDocIdDate(docId),
+    ];
+
+    var best = 0;
+    for (final candidate in candidates) {
+      final epoch = candidate?.millisecondsSinceEpoch ?? 0;
+      if (epoch > best) {
+        best = epoch;
+      }
+    }
+    return best;
+  }
+
+  bool _shouldPreferAttendanceDoc({
+    required String nextDocId,
+    required Map<String, dynamic> nextData,
+    String? currentDocId,
+    Map<String, dynamic>? currentData,
+  }) {
+    if (currentDocId == null || currentData == null) {
+      return true;
+    }
+
+    final nextEpoch = _attendanceSortEpoch(nextDocId, nextData);
+    final currentEpoch = _attendanceSortEpoch(currentDocId, currentData);
+    if (nextEpoch != currentEpoch) {
+      return nextEpoch > currentEpoch;
+    }
+
+    final nextCorrected = _isAdminCorrected(nextData);
+    final currentCorrected = _isAdminCorrected(currentData);
+    if (nextCorrected != currentCorrected) {
+      return nextCorrected;
+    }
+
+    final nextHasCheckOut = _attendanceHasCheckOut(nextData);
+    final currentHasCheckOut = _attendanceHasCheckOut(currentData);
+    if (nextHasCheckOut != currentHasCheckOut) {
+      return nextHasCheckOut;
+    }
+
+    final nextHasCheckIn = _attendanceHasCheckIn(nextData);
+    final currentHasCheckIn = _attendanceHasCheckIn(currentData);
+    if (nextHasCheckIn != currentHasCheckIn) {
+      return nextHasCheckIn;
+    }
+
+    return nextDocId.compareTo(currentDocId) > 0;
+  }
+
   String _extractChildIdFromRef(dynamic rawRef) {
+    if (rawRef is DocumentReference) {
+      return rawRef.id.trim();
+    }
+
     final value = rawRef?.toString().trim() ?? '';
     if (value.isEmpty) return '';
 
@@ -120,7 +212,10 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
         data['checkInAt'] != null ||
         data['checkInTime'] != null ||
         data['check_in'] != null ||
-        status == 'CHECKED_IN';
+      data['isPresent'] == true ||
+      data['is_present'] == true ||
+      status == 'CHECKED_IN' ||
+      status == 'CHECKED_OUT';
   }
 
   bool _attendanceHasCheckOut(Map<String, dynamic> data) {
@@ -142,6 +237,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     final candidates = <String>[
       _extractChildIdFromRef(data['childRef'] ?? data['child_ref']),
       (data['childId'] ?? '').toString().trim(),
+      (data['nfc_uid'] ?? data['nfcUid'] ?? '').toString().trim(),
       (data['child_id'] ?? '').toString().trim(),
     ];
 
@@ -160,10 +256,79 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     return '';
   }
 
+  void _replaceAttendanceDocsForSource(String source, List<QueryDocumentSnapshot> docs) {
+    final sourceDocs = <String, QueryDocumentSnapshot>{};
+    for (final doc in docs) {
+      sourceDocs[doc.id] = doc;
+    }
+
+    _attendanceDocsBySource[source] = sourceDocs;
+
+    final merged = <String, QueryDocumentSnapshot>{};
+    for (final docsForSource in _attendanceDocsBySource.values) {
+      docsForSource.forEach((docId, doc) {
+        merged.putIfAbsent(docId, () => doc);
+      });
+    }
+
+    _attendanceDocs = merged.values.toList(growable: false);
+    _recalculateTodayAttendance();
+  }
+
+  void _cancelAttendanceListeners() {
+    for (final sub in _attendanceSubs) {
+      sub.cancel();
+    }
+    _attendanceSubs.clear();
+    _attendanceDocsBySource.clear();
+    _attendanceDocs = [];
+  }
+
+  void _subscribeTodayAttendanceStreams() {
+    _cancelAttendanceListeners();
+
+    final prefix = _todayDocPrefix();
+    final dateKey = _todayDateKey();
+    final startOfDay = _todayStartOfDayTimestamp();
+
+    void listen(String source, Query query) {
+      _attendanceSubs.add(
+        query.snapshots().listen(
+          (snap) => _replaceAttendanceDocsForSource(source, snap.docs),
+          onError: (error) {
+            debugPrint('⚠ Failed today attendance listener ($source): $error');
+            _replaceAttendanceDocsForSource(source, []);
+          },
+        ),
+      );
+    }
+
+    listen(
+      'docPrefix',
+      _firestore
+          .collection('attendance')
+          .orderBy(FieldPath.documentId)
+          .startAt([prefix])
+          .endAt(["$prefix\uf8ff"]),
+    );
+    listen(
+      'dateKey',
+      _firestore.collection('attendance').where('dateKey', isEqualTo: dateKey),
+    );
+    listen(
+      'dateTimestamp',
+      _firestore.collection('attendance').where('date', isEqualTo: startOfDay),
+    );
+    listen(
+      'dateString',
+      _firestore.collection('attendance').where('date', isEqualTo: dateKey),
+    );
+  }
+
   @override
   void dispose() {
     _childrenSub?.cancel();
-    _attendanceSub?.cancel();
+    _cancelAttendanceListeners();
     _midnightTimer?.cancel();
     super.dispose();
   }
@@ -192,19 +357,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     _midnightTimer = Timer(delay, () {
       if (!mounted) return;
 
-      // Re-subscribe attendance listener to the new day's prefix
-      _attendanceSub?.cancel();
-      final prefix = _todayDocPrefix();
-      _attendanceSub = _firestore
-          .collection('attendance')
-          .orderBy(FieldPath.documentId)
-          .startAt([prefix])
-          .endAt(["$prefix\uf8ff"])
-          .snapshots()
-          .listen((snap) {
-        _attendanceDocs = snap.docs;
-        _recalculateTodayAttendance();
-      });
+      // Re-subscribe to the new day's attendance sources.
+      _subscribeTodayAttendanceStreams();
 
       // Re-arm for the next day
       _scheduleMidnightRolloverRefresh();
@@ -218,18 +372,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
       _recalculateTodayAttendance();
     });
 
-    // 📋 Listen to today's attendance docs only (reliable across timezone + faster)
-    final prefix = _todayDocPrefix();
-    _attendanceSub = _firestore
-        .collection('attendance')
-        .orderBy(FieldPath.documentId)
-        .startAt([prefix])
-        .endAt(["$prefix\uf8ff"])
-        .snapshots()
-        .listen((snap) {
-      _attendanceDocs = snap.docs;
-      _recalculateTodayAttendance();
-    });
+    // 📋 Subscribe to the same day sources JavaFX uses so legacy docs are not missed.
+    _subscribeTodayAttendanceStreams();
   }
 
   void _recalculateTodayAttendance() {
@@ -241,9 +385,9 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     final todayD = now.day;
     final todayPrefix = _todayDocPrefix();
 
-    final total = _childrenDocs.length;
+    final canonicalChildIds = <String>{};
     final childAliasToId = <String, String>{};
-    final attendedIds = <String>{};
+    final effectiveDocsByChild = <String, QueryDocumentSnapshot>{};
 
     void registerChildAlias(dynamic rawAlias, String canonicalId) {
       final alias = rawAlias?.toString().trim() ?? '';
@@ -253,15 +397,23 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
 
     for (final childDoc in _childrenDocs) {
       final data = childDoc.data() as Map<String, dynamic>;
-      final canonicalId = childDoc.id.trim();
+      final migratedToChildId = (data['migratedToChildId'] ?? '').toString().trim();
+      final canonicalId = (migratedToChildId.isNotEmpty ? migratedToChildId : childDoc.id).trim();
       if (canonicalId.isEmpty) continue;
 
+      canonicalChildIds.add(canonicalId);
+
       registerChildAlias(canonicalId, canonicalId);
+      registerChildAlias(childDoc.id, canonicalId);
       registerChildAlias(data['childId'], canonicalId);
       registerChildAlias(data['child_id'], canonicalId);
       registerChildAlias(data['nfc_uid'], canonicalId);
+      registerChildAlias(data['nfcUid'], canonicalId);
+      registerChildAlias(data['migratedToChildId'], canonicalId);
       registerChildAlias(_extractChildIdFromRef(data['childRef'] ?? data['child_ref']), canonicalId);
     }
+
+    final total = canonicalChildIds.length;
 
     for (final doc in _attendanceDocs) {
       final data = doc.data() as Map<String, dynamic>;
@@ -284,11 +436,22 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
       );
       if (childId.isEmpty) continue;
 
-      final hasCheckIn = _attendanceHasCheckIn(data);
-      final hasCheckOut = _attendanceHasCheckOut(data);
+      final current = effectiveDocsByChild[childId];
+      if (_shouldPreferAttendanceDoc(
+        nextDocId: doc.id,
+        nextData: data,
+        currentDocId: current?.id,
+        currentData: current == null ? null : (current.data() as Map<String, dynamic>),
+      )) {
+        effectiveDocsByChild[childId] = doc;
+      }
+    }
 
-      if (hasCheckIn || hasCheckOut) {
-        attendedIds.add(childId);
+    final attendedIds = <String>{};
+    for (final entry in effectiveDocsByChild.entries) {
+      final data = entry.value.data() as Map<String, dynamic>;
+      if (_attendanceHasCheckIn(data) || _attendanceHasCheckOut(data)) {
+        attendedIds.add(entry.key);
       }
     }
 
