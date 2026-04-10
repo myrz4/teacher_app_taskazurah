@@ -15,6 +15,7 @@ const { defineSecret } = require("firebase-functions/params");
 const crypto = require("crypto");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
+const feeEngine = require("./fee-engine");
 
 const BILLPLZ_API_KEY_SECRET = defineSecret("BILLPLZ_API_KEY");
 const BILLPLZ_X_SIGNATURE_KEY_SECRET = defineSecret("BILLPLZ_X_SIGNATURE_KEY");
@@ -115,18 +116,262 @@ function buildPaidInvoiceSyncPatch(sourceInvoice, sourcePath) {
   return patch;
 }
 
+function invoiceCoverageLookupRef(coverageKey) {
+  const normalizedCoverageKey = String(coverageKey || "").trim();
+  return normalizedCoverageKey
+    ? admin.firestore().collection("billingInvoiceCoverage").doc(normalizedCoverageKey)
+    : null;
+}
+
+function childPeriodLookupKey(period, childId) {
+  const normalizedPeriod = String(period || "").trim();
+  const normalizedChildId = String(childId || "").trim();
+  if (!normalizedPeriod || !normalizedChildId) return "";
+  return `${normalizedPeriod}::${normalizedChildId}`;
+}
+
+function childPeriodLookupRef(period, childId) {
+  const lookupKey = childPeriodLookupKey(period, childId);
+  return lookupKey
+    ? admin.firestore().collection("billingChildPeriodLookup").doc(lookupKey)
+    : null;
+}
+
+function paymentSessionLookupRef(kind, value) {
+  const normalizedKind = String(kind || "").trim();
+  const normalizedValue = String(value || "").trim();
+  if (!normalizedKind || !normalizedValue) return null;
+  const hash = crypto.createHash("sha1").update(normalizedValue).digest("hex");
+  return admin.firestore().collection("billingSessionLookup").doc(`${normalizedKind}:${hash}`);
+}
+
+function coveragePeriod(coverageKey) {
+  const normalizedCoverageKey = String(coverageKey || "").trim();
+  const separatorIndex = normalizedCoverageKey.indexOf("::");
+  return separatorIndex >= 0 ? normalizedCoverageKey.slice(0, separatorIndex) : normalizedCoverageKey;
+}
+
+function coverageChildIds(coverageKey) {
+  const normalizedCoverageKey = String(coverageKey || "").trim();
+  const separatorIndex = normalizedCoverageKey.indexOf("::");
+  if (separatorIndex < 0) return [];
+  return uniqueSortedIds(normalizedCoverageKey.slice(separatorIndex + 2).split("|"));
+}
+
+function docRefFromPath(path) {
+  const normalizedPath = String(path || "").trim();
+  return normalizedPath ? admin.firestore().doc(normalizedPath) : null;
+}
+
+async function loadInvoicesFromLookupPaths(invoicePaths, isValidInvoice) {
+  const normalizedPaths = uniqueSortedIds(invoicePaths);
+  if (!normalizedPaths.length) {
+    return { matches: [], validPaths: [] };
+  }
+
+  const reads = await Promise.all(normalizedPaths.map(async (invoicePath) => {
+    try {
+      const invoiceRef = docRefFromPath(invoicePath);
+      if (!invoiceRef) return null;
+      const snap = await invoiceRef.get();
+      return { invoicePath, snap };
+    } catch (err) {
+      logger.error("billing-lookup-invoice-read-failed", {
+        invoicePath,
+        error: String(err && err.message ? err.message : err),
+      });
+      return null;
+    }
+  }));
+
+  const matches = [];
+  const validPaths = [];
+  for (const entry of reads) {
+    if (!entry || !entry.snap || !entry.snap.exists) continue;
+    const data = entry.snap.data() || {};
+    if (!isValidInvoice(data)) continue;
+    validPaths.push(entry.snap.ref.path);
+    matches.push({ ref: entry.snap.ref, data });
+  }
+
+  return { matches, validPaths: uniqueSortedIds(validPaths) };
+}
+
+async function loadCoverageLookupInvoices(coverageKey) {
+  const lookupRef = invoiceCoverageLookupRef(coverageKey);
+  if (!lookupRef) return [];
+
+  const lookupSnap = await lookupRef.get();
+  if (!lookupSnap.exists) return [];
+
+  const lookupData = lookupSnap.data() || {};
+  const storedPaths = uniqueSortedIds(lookupData.invoicePaths || []);
+  const { matches, validPaths } = await loadInvoicesFromLookupPaths(
+    storedPaths,
+    (invoiceData) => invoiceChildCoverageKey(invoiceData) === coverageKey,
+  );
+
+  if (storedPaths.join("|") !== validPaths.join("|")) {
+    await lookupRef.set({
+      period: coveragePeriod(coverageKey),
+      childIds: coverageChildIds(coverageKey),
+      childCoverageKey: coverageKey,
+      invoicePaths: validPaths,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
+
+  return matches;
+}
+
+async function loadChildPeriodLookupInvoices(period, childId) {
+  const lookupRef = childPeriodLookupRef(period, childId);
+  if (!lookupRef) return [];
+
+  const lookupSnap = await lookupRef.get();
+  if (!lookupSnap.exists) return [];
+
+  const lookupData = lookupSnap.data() || {};
+  const storedPaths = uniqueSortedIds(lookupData.invoicePaths || []);
+  const normalizedPeriod = String(period || "").trim();
+  const normalizedChildId = String(childId || "").trim();
+  const { matches, validPaths } = await loadInvoicesFromLookupPaths(
+    storedPaths,
+    (invoiceData) => String(invoiceData.period || "").trim() === normalizedPeriod && invoiceChildIds(invoiceData).includes(normalizedChildId),
+  );
+
+  if (storedPaths.join("|") !== validPaths.join("|")) {
+    await lookupRef.set({
+      period: normalizedPeriod,
+      childId: normalizedChildId,
+      invoicePaths: validPaths,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
+
+  return matches;
+}
+
+async function upsertInvoiceLookupDocs({ invoiceRef, invoiceData }) {
+  if (!invoiceRef || !invoiceData) return;
+
+  const period = String(invoiceData.period || "").trim();
+  const childIds = invoiceChildIds(invoiceData);
+  const coverageKey = invoiceChildCoverageKey(invoiceData);
+  const batch = admin.firestore().batch();
+  let writes = 0;
+
+  if (coverageKey) {
+    const coverageRef = invoiceCoverageLookupRef(coverageKey);
+    if (coverageRef) {
+      batch.set(coverageRef, {
+        period,
+        childIds,
+        childCoverageKey: coverageKey,
+        invoicePaths: admin.firestore.FieldValue.arrayUnion(invoiceRef.path),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      writes += 1;
+    }
+  }
+
+  for (const childId of childIds) {
+    const lookupRef = childPeriodLookupRef(period, childId);
+    if (!lookupRef) continue;
+    batch.set(lookupRef, {
+      period,
+      childId,
+      invoicePaths: admin.firestore.FieldValue.arrayUnion(invoiceRef.path),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    writes += 1;
+  }
+
+  if (writes > 0) {
+    await batch.commit();
+  }
+}
+
+async function upsertSessionLookupDocs({ sessionRef, sessionData }) {
+  if (!sessionRef || !sessionData) return;
+
+  const providerSessionId = String(sessionData.providerSessionId || "").trim();
+  const providerReference = String(sessionData.providerReference || "").trim();
+  const invoiceRef = sessionRef.parent && sessionRef.parent.parent ? sessionRef.parent.parent : null;
+  const batch = admin.firestore().batch();
+  let writes = 0;
+
+  const basePayload = {
+    sessionPath: sessionRef.path,
+    invoicePath: invoiceRef ? invoiceRef.path : "",
+    provider: String(sessionData.provider || "").trim(),
+    status: String(sessionData.status || "").trim(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  if (providerSessionId) {
+    const lookupRef = paymentSessionLookupRef("providerSessionId", providerSessionId);
+    if (lookupRef) {
+      batch.set(lookupRef, {
+        ...basePayload,
+        kind: "providerSessionId",
+        value: providerSessionId,
+      }, { merge: true });
+      writes += 1;
+    }
+  }
+
+  if (providerReference) {
+    const lookupRef = paymentSessionLookupRef("providerReference", providerReference);
+    if (lookupRef) {
+      batch.set(lookupRef, {
+        ...basePayload,
+        kind: "providerReference",
+        value: providerReference,
+      }, { merge: true });
+      writes += 1;
+    }
+  }
+
+  if (writes > 0) {
+    await batch.commit();
+  }
+}
+
+async function resolveSessionRefFromLookup(kind, value) {
+  const normalizedValue = String(value || "").trim();
+  const lookupRef = paymentSessionLookupRef(kind, normalizedValue);
+  if (!lookupRef) return null;
+
+  const lookupSnap = await lookupRef.get();
+  if (!lookupSnap.exists) return null;
+
+  const lookupData = lookupSnap.data() || {};
+  const sessionRef = docRefFromPath(lookupData.sessionPath);
+  if (!sessionRef) return null;
+
+  const sessionSnap = await sessionRef.get();
+  if (!sessionSnap.exists) return null;
+
+  const sessionData = sessionSnap.data() || {};
+  if (String(sessionData[kind] || "").trim() !== normalizedValue) {
+    return null;
+  }
+
+  return sessionRef;
+}
+
 async function findEquivalentPaidInvoice({ period, childIds, excludePath = "" }) {
   const normalizedPeriod = String(period || "").trim();
   const coverageKey = childCoverageKey(normalizedPeriod, childIds);
   if (!normalizedPeriod || !coverageKey) return null;
 
-  const snap = await admin.firestore().collectionGroup("invoices").where("period", "==", normalizedPeriod).get();
-  for (const doc of snap.docs) {
-    if (excludePath && doc.ref.path === excludePath) continue;
-    const data = doc.data() || {};
+  const invoices = await loadCoverageLookupInvoices(coverageKey);
+  for (const invoice of invoices) {
+    if (excludePath && invoice.ref.path === excludePath) continue;
+    const data = invoice.data || {};
     if (String(data.status || "").toLowerCase() !== "paid") continue;
-    if (invoiceChildCoverageKey(data) !== coverageKey) continue;
-    return { ref: doc.ref, data };
+    return { ref: invoice.ref, data };
   }
   return null;
 }
@@ -171,16 +416,15 @@ async function syncEquivalentPaidInvoicesFromSource({ sourceRef, sourceInvoice }
   }
 
   const sourceFingerprint = invoicePaymentFingerprint(sourceInvoice);
-  const snap = await admin.firestore().collectionGroup("invoices").where("period", "==", normalizedPeriod).get();
+  const invoices = await loadCoverageLookupInvoices(coverageKey);
   const batch = admin.firestore().batch();
   let updates = 0;
 
-  for (const doc of snap.docs) {
-    if (doc.ref.path === sourceRef.path) continue;
-    const data = doc.data() || {};
-    if (invoiceChildCoverageKey(data) !== coverageKey) continue;
+  for (const invoice of invoices) {
+    if (invoice.ref.path === sourceRef.path) continue;
+    const data = invoice.data || {};
     if (invoicePaymentFingerprint(data) === sourceFingerprint) continue;
-    batch.set(doc.ref, buildPaidInvoiceSyncPatch(sourceInvoice, sourceRef.path), { merge: true });
+    batch.set(invoice.ref, buildPaidInvoiceSyncPatch(sourceInvoice, sourceRef.path), { merge: true });
     updates += 1;
   }
 
@@ -1134,11 +1378,10 @@ const BILLING_REQUIRED_CODES = [
   "registration_transit_oneoff",
   "overtime_after_530",
   "overtime_8pm_12am",
-  "overtime_12am_7am",
   "transport_tadika_month",
   "annual_fee_yearly",
-  "comms_book_4months",
-  "insurance_yearly_age2plus",
+  "comms_book_oneoff",
+  "insurance_oneoff_age2plus",
 ];
 
 function callableError(reason, code = "failed-precondition") {
@@ -2010,6 +2253,37 @@ function casualTransitPhone(raw) {
   return String(raw || "").replace(/[^0-9+]/g, "").trim();
 }
 
+function casualTransitNormalizeTransitType(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  const normalized = feeEngine.normalizeCareMode(value);
+  return [
+    "CASUAL_TRANSIT_1_HOUR",
+    "CASUAL_TRANSIT_1_DAY",
+    "CASUAL_TRANSIT_1_WEEK",
+  ].includes(normalized)
+    ? normalized
+    : "";
+}
+
+function casualTransitNormalizeStaffType(raw) {
+  return String(raw || "").trim().toLowerCase() === "staff" ? "staff" : "nonstaff";
+}
+
+function casualTransitPricingItemsSnapshot(items) {
+  return Array.isArray(items)
+    ? items.map((item) => ({
+      code: String(item && item.code ? item.code : "").trim(),
+      description: String(item && (item.description || item.label) ? (item.description || item.label) : "").trim(),
+      qty: Number(item && Object.prototype.hasOwnProperty.call(item, "qty") ? item.qty : item && item.quantity ? item.quantity : 0),
+      unit: String(item && item.unit ? item.unit : "").trim(),
+      unitPriceSen: moneySen(item && (item.unitPriceSen || item.unitAmountSen)),
+      amountSen: moneySen(item && item.amountSen),
+      policyKey: String(item && item.policyKey ? item.policyKey : "").trim(),
+    }))
+    : [];
+}
+
 function casualTransitReceiptNo(visitRef) {
   return `CT-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${visitRef.id.slice(0, 6).toUpperCase()}`;
 }
@@ -2034,6 +2308,8 @@ exports.casualTransitCreateVisit = onCall({ region: "asia-southeast1" }, async (
     requireAdmin(req);
 
     const childName = String(req.data && req.data.childName ? req.data.childName : "").trim();
+    const transitType = casualTransitNormalizeTransitType(req.data && req.data.transitType) || "CASUAL_TRANSIT_1_DAY";
+    const staffType = casualTransitNormalizeStaffType(req.data && req.data.staffType);
     const guardianName = String(req.data && req.data.guardianName ? req.data.guardianName : "").trim();
     const guardianPhone = casualTransitPhone(req.data && req.data.guardianPhone);
     const guardianRelationship = String(req.data && req.data.guardianRelationship ? req.data.guardianRelationship : "").trim();
@@ -2053,6 +2329,8 @@ exports.casualTransitCreateVisit = onCall({ region: "asia-southeast1" }, async (
       tx.set(visitRef, {
         visitId: visitRef.id,
         childName,
+        transitType,
+        staffType,
         guardianName,
         guardianPhone,
         guardianRelationship,
@@ -2077,6 +2355,8 @@ exports.casualTransitCreateVisit = onCall({ region: "asia-southeast1" }, async (
         actor,
         details: {
           childName,
+          transitType,
+          staffType,
           guardianName,
           guardianPhone,
           guardianRelationship,
@@ -2093,6 +2373,8 @@ exports.casualTransitCreateVisit = onCall({ region: "asia-southeast1" }, async (
       paymentStatus: "PENDING",
       visitDateKey: dayInfo.key,
       childName,
+      transitType,
+      staffType,
       guardianName,
     };
   } catch (err) {
@@ -2106,7 +2388,7 @@ exports.casualTransitCheckoutVisit = onCall({ region: "asia-southeast1" }, async
     requireAdmin(req);
 
     const visitId = String(req.data && req.data.visitId ? req.data.visitId : "").trim();
-    const amountSen = casualTransitMoneySen(req.data && req.data.amountSen, "amount-sen", { required: true, min: 0 });
+    const amountOverrideSen = casualTransitMoneySen(req.data && req.data.amountSen, "amount-sen", { required: false, min: 0 });
     const paymentMethodRaw = String(req.data && req.data.paymentMethod ? req.data.paymentMethod : "Cash").trim();
     const paymentMethod = paymentMethodRaw || "Cash";
     const notes = String(req.data && req.data.notes ? req.data.notes : "").trim();
@@ -2117,6 +2399,8 @@ exports.casualTransitCheckoutVisit = onCall({ region: "asia-southeast1" }, async
     const db = admin.firestore();
     const visitRef = db.collection("casualTransitVisits").doc(visitId);
     const auditRef = db.collection("casualTransitAudit").doc();
+    const table = await loadActiveFeeCatalog();
+    const feePolicy = feeEngine.resolveFeePolicy(table.policy || {});
 
     const result = await db.runTransaction(async (tx) => {
       const visitSnap = await tx.get(visitRef);
@@ -2129,16 +2413,55 @@ exports.casualTransitCheckoutVisit = onCall({ region: "asia-southeast1" }, async
         throw callableError("visit-already-closed", "already-exists");
       }
 
+      const checkoutAt = new Date();
+      const checkInAt = attendanceTimestampToDate(visit.checkInAt);
+      let amountSen = amountOverrideSen;
+      let pricingItems = [];
+      let baseAmountSen = 0;
+      let overtimeAmountSen = 0;
+      let pricingReviewRequired = false;
+      let overtimeBreakdown = [];
+      const transitType = casualTransitNormalizeTransitType(visit.transitType);
+      const staffType = casualTransitNormalizeStaffType(visit.staffType);
+
+      if (amountSen == null) {
+        if (!transitType || !checkInAt) {
+          throw callableError("missing-amount-or-pricing-context", "failed-precondition");
+        }
+        const charge = feeEngine.calculateCasualTransitCharge({
+          payerType: staffType,
+          transitType,
+          ageMonths: null,
+          checkInAt,
+          actualCheckOutAt: checkoutAt,
+          table,
+          policy: feePolicy,
+        });
+        amountSen = moneySen(charge.totalAmountSen);
+        baseAmountSen = moneySen(charge.baseAmountSen);
+        overtimeAmountSen = moneySen(charge.overtimeAmountSen);
+        pricingReviewRequired = Boolean(charge.managementReviewRecommended);
+        overtimeBreakdown = Array.isArray(charge.overtimeBreakdown) ? charge.overtimeBreakdown : [];
+        pricingItems = casualTransitPricingItemsSnapshot(charge.items);
+      }
+
       const receiptNo = String(visit.receiptNo || casualTransitReceiptNo(visitRef));
       tx.set(visitRef, {
         status: "CLOSED",
         paymentStatus: "PAID",
         paymentMethod,
         amountSen,
+        pricingVersion: String(table.version || ""),
+        pricingItems,
+        baseAmountSen,
+        overtimeAmountSen,
+        pricingReviewRequired,
+        overtimeBreakdown,
+        manualAmountOverride: amountOverrideSen != null,
         receiptNo,
         notes,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        checkOutAt: admin.firestore.FieldValue.serverTimestamp(),
+        checkOutAt: admin.firestore.Timestamp.fromDate(checkoutAt),
         checkedOutByUid: actor.uid,
         checkedOutByRole: actor.role,
         checkedOutByName: actor.displayName,
@@ -2154,6 +2477,9 @@ exports.casualTransitCheckoutVisit = onCall({ region: "asia-southeast1" }, async
           guardianName: String(visit.guardianName || ""),
           amountSen,
           paymentMethod,
+          transitType,
+          staffType,
+          pricingItems,
           receiptNo,
           notes,
         },
@@ -2164,6 +2490,7 @@ exports.casualTransitCheckoutVisit = onCall({ region: "asia-southeast1" }, async
         status: "CLOSED",
         paymentStatus: "PAID",
         amountSen,
+        pricingItems,
         paymentMethod,
         receiptNo,
         childName: String(visit.childName || ""),
@@ -2412,40 +2739,11 @@ function ageInMonths(at, birthDate) {
 }
 
 function resolveAgeProfile(months) {
-  if (!Number.isFinite(Number(months))) {
-    return {
-      ageBand: "2y_4y",
-      ageOutOfPolicy: true,
-      agePolicyReason: "missing_birth_date",
-    };
-  }
-
-  const ageMonths = Number(months);
-  if (ageMonths < 3) {
-    return {
-      ageBand: "3m_2y",
-      ageOutOfPolicy: true,
-      agePolicyReason: "under_3_months",
-    };
-  }
-  if (ageMonths < 24) {
-    return {
-      ageBand: "3m_2y",
-      ageOutOfPolicy: false,
-      agePolicyReason: "in_range",
-    };
-  }
-  if (ageMonths < 60) {
-    return {
-      ageBand: "2y_4y",
-      ageOutOfPolicy: false,
-      agePolicyReason: "in_range",
-    };
-  }
+  const ageProfile = feeEngine.determineAgeBand(months);
   return {
-    ageBand: "2y_4y",
-    ageOutOfPolicy: true,
-    agePolicyReason: "age_4y_or_above",
+    ageBand: String(ageProfile.codeSuffix || "2y_4y"),
+    ageOutOfPolicy: Boolean(ageProfile.ageOutOfPolicy),
+    agePolicyReason: String(ageProfile.agePolicyReason || "in_range"),
   };
 }
 
@@ -2463,7 +2761,7 @@ function registrationChargeRequired(child, periodKey) {
   }
 
   const registrationPeriod = monthKey(registrationDate);
-  return !periodKey || registrationPeriod <= periodKey;
+  return !periodKey || registrationPeriod === periodKey;
 }
 
 function resolveBillingAgePolicy({ months, baseCode }) {
@@ -2544,8 +2842,11 @@ function feeTableFromPdf() {
     registration_fulltime_oneoff: { staff: 10000, nonstaff: 10000 },
     registration_transit_oneoff: { staff: 5000, nonstaff: 5000 },
     annual_fee_yearly: { staff: 10000, nonstaff: 10000 },
+    comms_book_oneoff: { staff: 1500, nonstaff: 1500 },
     comms_book_4months: { staff: 1500, nonstaff: 1500 },
+    insurance_oneoff_age2plus: { staff: 2000, nonstaff: 2000 },
     insurance_yearly_age2plus: { staff: 2000, nonstaff: 2000 },
+    policy: feeEngine.resolveFeePolicy(),
   };
 }
 
@@ -2590,6 +2891,7 @@ function normalizeCatalogDoc(raw) {
     table,
     active: Boolean(src.active),
     defaultTransitMonthlyCode: sanitizeTransitCode(src.defaultTransitMonthlyCode),
+    policy: feeEngine.resolveFeePolicy(src.policy || {}),
   };
 }
 
@@ -2648,21 +2950,20 @@ function priceFor({ table, code, payerType }) {
 exports.billingGetFeeCatalog = onCall({ region: "asia-southeast1" }, async (req) => {
   requireAuth(req);
   const table = await loadActiveFeeCatalog();
+  const policy = feeEngine.resolveFeePolicy(table.policy || {});
   return {
     ok: true,
     version: table.version,
     currency: "MYR",
     table: table.table,
     policy: {
+      ...policy,
       defaultTransitMonthlyCode: table.defaultTransitMonthlyCode || "transit_2h_month",
       dueDayOptions: [5, 7],
-      absenceDiscountPercent: 10,
-      absenceDiscountMinDaysWithLetter: 14,
-      annualFeeMonth: 1,
-      commsBookMonths: [1, 5, 9],
-      insuranceMinAgeMonths: 24,
       notes: [
-        "Yuran pendaftaran dikira sebagai yuran bulan pendaftaran.",
+        "Yuran pendaftaran ditambah di atas yuran asas bulan pendaftaran.",
+        "Buku komunikasi dikenakan sekali sahaja semasa pendaftaran.",
+        "Insurans dikenakan sekali sahaja semasa pendaftaran untuk umur 2 tahun ke atas.",
         "Yuran bulan berikutnya perlu dibayar sebelum 5hb atau 7hb.",
         "Potongan 10% jika tidak hadir >14 hari dengan surat.",
       ],
@@ -3027,7 +3328,6 @@ async function buildFamilyInvoiceFromPdfPolicy({ parentId, parentData, period, r
   const invoiceItems = [];
   const childSummaries = [];
   const appliedRegistrationChildIds = [];
-  const appliedUniformChildIds = [];
   const managementReviewChildIds = [];
   const childNames = [];
   let totalSen = 0;
@@ -3085,9 +3385,6 @@ async function buildFamilyInvoiceFromPdfPolicy({ parentId, parentData, period, r
     if (calc.meta && calc.meta.registrationMonth) {
       appliedRegistrationChildIds.push(childId);
     }
-    if (calc.meta && calc.meta.uniformCharged) {
-      appliedUniformChildIds.push(childId);
-    }
     if (calc.meta && calc.meta.managementReviewRecommended) {
       managementReviewChildIds.push(childId);
     }
@@ -3131,7 +3428,6 @@ async function buildFamilyInvoiceFromPdfPolicy({ parentId, parentData, period, r
     dueDay: dueDay === 5 ? 5 : 7,
     pricingVersion,
     registrationFeeChildIds: appliedRegistrationChildIds,
-    uniformFeeChildIds: appliedUniformChildIds,
     billingMeta: {
       invoiceScope: "family",
       childCount: childSummaries.length,
@@ -3143,14 +3439,67 @@ async function buildFamilyInvoiceFromPdfPolicy({ parentId, parentData, period, r
   };
 }
 
+async function findParentInvoiceDocByPeriod(invoiceCol, period) {
+  const normalizedPeriod = String(period || "").trim();
+  if (!invoiceCol || !normalizedPeriod) return null;
+
+  const snap = await invoiceCol.get();
+  for (const doc of snap.docs) {
+    const data = doc.data() || {};
+    if (String(data.period || "").trim() === normalizedPeriod) {
+      return doc;
+    }
+  }
+
+  return null;
+}
+
 async function createParentInvoiceForPeriod({ req, parentId, parentData, period, reqData, createdByKind, fallbackChildId }) {
   const invoiceCol = admin.firestore().collection("parents").doc(parentId).collection("invoices");
-  const existing = await invoiceCol.where("period", "==", period).limit(1).get();
-  if (!existing.empty) {
-    const doc = existing.docs[0];
+  const existingDoc = await findParentInvoiceDocByPeriod(invoiceCol, period);
+  if (existingDoc) {
+    const doc = existingDoc;
     const existingData = doc.data() || {};
     if (String(existingData.status || "").toLowerCase() !== "paid") {
       await repairInvoiceFromEquivalentPaidCopy({ invoiceRef: doc.ref, invoiceData: existingData });
+      const refreshed = await buildFamilyInvoiceFromPdfPolicy({
+        parentId,
+        parentData,
+        period,
+        reqData,
+        fallbackChildId,
+      });
+      if (refreshed && refreshed.ok) {
+        await doc.ref.set({
+          payerType: refreshed.payerType,
+          childId: refreshed.childIds.length === 1 ? refreshed.childIds[0] : null,
+          childName: refreshed.childNameSummary || null,
+          childIds: refreshed.childIds,
+          childCoverageKey: childCoverageKey(period, refreshed.childIds),
+          childNames: refreshed.childNames,
+          items: refreshed.items,
+          subTotalSen: refreshed.subTotalSen,
+          totalSen: refreshed.totalSen,
+          pricingVersion: refreshed.pricingVersion,
+          dueDate: refreshed.dueDate,
+          billingMeta: {
+            ...(refreshed.billingMeta || {}),
+            refreshedAt: admin.firestore.FieldValue.serverTimestamp(),
+            refreshedBy: { uid: req.auth.uid, kind: createdByKind || "billing-refresh" },
+          },
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+        await upsertInvoiceLookupDocs({
+          invoiceRef: doc.ref,
+          invoiceData: {
+            ...existingData,
+            period,
+            childId: refreshed.childIds.length === 1 ? refreshed.childIds[0] : null,
+            childIds: refreshed.childIds,
+            childCoverageKey: childCoverageKey(period, refreshed.childIds),
+          },
+        });
+      }
     }
     return { ok: true, already: true, invoiceId: doc.id, reason: "already-exists" };
   }
@@ -3196,6 +3545,7 @@ async function createParentInvoiceForPeriod({ req, parentId, parentData, period,
   }
 
   await ref.set(invoiceData, { merge: false });
+  await upsertInvoiceLookupDocs({ invoiceRef: ref, invoiceData });
 
   if (calc.registrationFeeChildIds && calc.registrationFeeChildIds.length) {
     await Promise.all(calc.registrationFeeChildIds.map(async (childId) => {
@@ -3205,18 +3555,6 @@ async function createParentInvoiceForPeriod({ req, parentId, parentData, period,
         }, { merge: true });
       } catch (e) {
         logger.error("registration-period-mark-failed", { childId, period, error: String(e && e.message ? e.message : e) });
-      }
-    }));
-  }
-
-  if (calc.uniformFeeChildIds && calc.uniformFeeChildIds.length) {
-    await Promise.all(calc.uniformFeeChildIds.map(async (childId) => {
-      try {
-        await admin.firestore().collection("children").doc(childId).set({
-          uniformFeeAppliedPeriod: period,
-        }, { merge: true });
-      } catch (e) {
-        logger.error("uniform-period-mark-failed", { childId, period, error: String(e && e.message ? e.message : e) });
       }
     }));
   }
@@ -3235,20 +3573,15 @@ async function findInvoiceForChildPeriod({ childId, period }) {
   const normalizedPeriod = String(period || "").trim();
   if (!normalizedChildId || !normalizedPeriod) return null;
 
-  const snap = await admin.firestore().collectionGroup("invoices")
-    .where("period", "==", normalizedPeriod)
-    .get();
-
-  for (const doc of snap.docs) {
-    const data = doc.data() || {};
-    if (!invoiceChildIds(data).includes(normalizedChildId)) continue;
-    const parentRef = doc.ref.parent && doc.ref.parent.parent ? doc.ref.parent.parent : null;
+  const invoices = await loadChildPeriodLookupInvoices(normalizedPeriod, normalizedChildId);
+  for (const invoice of invoices) {
+    const parentRef = invoice.ref.parent && invoice.ref.parent.parent ? invoice.ref.parent.parent : null;
     const parentId = parentRef ? String(parentRef.id || "").trim() : "";
     if (!parentId) continue;
     return {
-      invoiceRef: doc.ref,
-      invoiceId: doc.id,
-      invoiceData: data,
+      invoiceRef: invoice.ref,
+      invoiceId: invoice.ref.id,
+      invoiceData: invoice.data,
       parentId,
     };
   }
@@ -3778,20 +4111,10 @@ async function findBillplzSessionByBillId(billId) {
   const normalizedBillId = String(billId || "").trim();
   if (!normalizedBillId) return null;
 
-  const db = admin.firestore();
-  const providerSessionSnap = await db.collectionGroup("sessions")
-    .where("providerSessionId", "==", normalizedBillId)
-    .limit(1)
-    .get();
-  if (!providerSessionSnap.empty) return providerSessionSnap.docs[0].ref;
+  const providerSessionRef = await resolveSessionRefFromLookup("providerSessionId", normalizedBillId);
+  if (providerSessionRef) return providerSessionRef;
 
-  const providerReferenceSnap = await db.collectionGroup("sessions")
-    .where("providerReference", "==", normalizedBillId)
-    .limit(1)
-    .get();
-  if (!providerReferenceSnap.empty) return providerReferenceSnap.docs[0].ref;
-
-  return null;
+  return resolveSessionRefFromLookup("providerReference", normalizedBillId);
 }
 
 function billplzCompletedAtTimestamp(value) {
@@ -4009,7 +4332,7 @@ async function createDummyCheckoutSessionAdapter({ req, invoiceRef, inv, gateway
   const totalSen = moneySen(inv.totalSen);
   const sessionRef = invoiceRef.collection("sessions").doc();
   const providerReference = dummyProviderReference(sessionRef);
-  await sessionRef.set({
+  const sessionData = {
     provider: gatewayConfig.provider,
     mode: gatewayConfig.mode,
     status: "pending",
@@ -4030,7 +4353,9 @@ async function createDummyCheckoutSessionAdapter({ req, invoiceRef, inv, gateway
     },
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     createdByUid: req.auth.uid,
-  });
+  };
+  await sessionRef.set(sessionData);
+  await upsertSessionLookupDocs({ sessionRef, sessionData });
 
   return {
     ok: true,
@@ -4105,7 +4430,7 @@ async function createBillplzCheckoutSessionAdapter({ req, parentId, invoiceId, i
   }
 
   const sessionRef = invoiceRef.collection("sessions").doc();
-  await sessionRef.set({
+  const sessionData = {
     provider: gatewayConfig.provider,
     mode: gatewayConfig.mode,
     status: "pending",
@@ -4123,7 +4448,9 @@ async function createBillplzCheckoutSessionAdapter({ req, parentId, invoiceId, i
     },
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     createdByUid: req.auth.uid,
-  });
+  };
+  await sessionRef.set(sessionData);
+  await upsertSessionLookupDocs({ sessionRef, sessionData });
 
   return {
     ok: true,
@@ -4149,7 +4476,7 @@ async function finalizeSuccessfulProviderPayment({ req, invoiceRef, sessionRef, 
   const paymentsCol = invoiceRef.parent.parent.collection("payments");
   const actorUid = (req && req.auth && req.auth.uid) ? req.auth.uid : "system";
 
-  return admin.firestore().runTransaction(async (tx) => {
+  const result = await admin.firestore().runTransaction(async (tx) => {
     const [invSnap, sessSnap] = await Promise.all([tx.get(invoiceRef), tx.get(sessionRef)]);
     if (!invSnap.exists) return { ok: false, reason: "invoice-not-found" };
     if (!sessSnap.exists) return { ok: false, reason: "session-not-found" };
@@ -4218,6 +4545,25 @@ async function finalizeSuccessfulProviderPayment({ req, invoiceRef, sessionRef, 
       mode: String(sess.mode || "redirect"),
     };
   });
+
+  if (result && result.ok) {
+    const [invoiceSnap, sessionSnap] = await Promise.all([invoiceRef.get(), sessionRef.get()]);
+    if (invoiceSnap.exists) {
+      const invoiceData = invoiceSnap.data() || {};
+      await upsertInvoiceLookupDocs({ invoiceRef, invoiceData });
+      if (!result.already) {
+        await syncEquivalentPaidInvoicesFromSource({
+          sourceRef: invoiceRef,
+          sourceInvoice: invoiceData,
+        });
+      }
+    }
+    if (sessionSnap.exists) {
+      await upsertSessionLookupDocs({ sessionRef, sessionData: sessionSnap.data() || {} });
+    }
+  }
+
+  return result;
 }
 
 async function completeDummyCheckoutSessionAdapter({ req, invoiceRef, sessionRef, method, bank }) {
@@ -4743,29 +5089,6 @@ function buildBaseFeeItem({ baseCode, unitPriceSen, transitUsage }) {
   };
 }
 
-function uniformItemForPeriod({ child, months, periodKey, isRegistrationMonth }) {
-  if (!child) return null;
-
-  const uniformFeeSen = moneySen(child.uniformFeeSen);
-  if (uniformFeeSen <= 0) return null;
-
-  if (months == null || months < 36 || months >= 60) return null;
-
-  const configuredPeriod = String(child.uniformChargePeriod || "").trim();
-  const appliedPeriod = String(child.uniformFeeAppliedPeriod || "").trim();
-  const shouldCharge = configuredPeriod ? configuredPeriod === periodKey : isRegistrationMonth;
-  if (!shouldCharge || appliedPeriod === periodKey) return null;
-
-  return {
-    code: "uniform_current_price",
-    description: String(child.uniformFeeDescription || "").trim() || "Uniform Taska (3 & 4 tahun)",
-    qty: 1,
-    unit: "oneoff",
-    unitPriceSen: uniformFeeSen,
-    amountSen: uniformFeeSen,
-  };
-}
-
 function dedupePolicyNotes(notes) {
   const seen = new Set();
   const out = [];
@@ -4816,6 +5139,7 @@ function overtimeBucketsFromAttendanceRows(rows) {
 
 async function buildInvoiceItemsFromPdfPolicy({ parentId, childId, period, reqData, payerType }) {
   const table = await loadActiveFeeCatalog();
+  const feePolicy = feeEngine.resolveFeePolicy(table.policy || {});
   const now = new Date();
   const periodDate = new Date(now.getFullYear(), now.getMonth(), 1);
   if (period) {
@@ -4874,159 +5198,80 @@ async function buildInvoiceItemsFromPdfPolicy({ parentId, childId, period, reqDa
     reqData,
     months,
   });
-  const ageProfile = resolveBillingAgePolicy({ months, baseCode });
-  const items = [];
   const periodKey = period || monthKey(now);
-
-  const registrationType = baseCode.startsWith("monthly_") ? "fulltime" : "transit";
-  const regCode = registrationType === "transit"
-    ? "registration_transit_oneoff"
-    : "registration_fulltime_oneoff";
   const isRegistrationMonth = registrationChargeRequired(child, periodKey);
 
-  if (isRegistrationMonth) {
-    const regSen = priceFor({ table, code: regCode, payerType: effectivePayerType });
-    if (regSen != null) {
-      items.push({
-        code: regCode,
-        description: registrationType === "transit"
-          ? "Yuran Pendaftaran Transit (Kiraan bulan pendaftaran)"
-          : "Yuran Pendaftaran Sepenuh Masa (Kiraan bulan pendaftaran)",
-        qty: 1,
-        unit: "oneoff",
-        unitPriceSen: regSen,
-        amountSen: regSen,
-      });
-    }
-  } else {
-    const baseSen = priceFor({ table, code: baseCode, payerType: effectivePayerType });
-    const baseItem = buildBaseFeeItem({ baseCode, unitPriceSen: baseSen, transitUsage });
-    if (baseItem) {
-      items.push(baseItem);
-    }
-  }
+  const absenceAdjustment = childAbsenceAdjustmentForPeriod(child ? { ...child, id: childId } : null, periodKey, reqData);
+  const calculation = feeEngine.generateInvoiceLineItems({
+    periodKey,
+    periodDate,
+    payerType: effectivePayerType,
+    table,
+    policy: feePolicy,
+    careMode: careType,
+    baseCode,
+    ageMonths: months,
+    isRegistrationMonth,
+    transportUsed: Boolean(child && child.transportFromTadika === true),
+    transitUsage,
+    attendanceRows,
+    manualOvertime: reqData && reqData.manualOvertime ? reqData.manualOvertime : null,
+    absenceAdjustment,
+  });
 
-  const periodMonth = monthNumberFromPeriod(periodKey);
-
-  if (periodMonth === 1) {
-    const annualSen = priceFor({ table, code: "annual_fee_yearly", payerType: effectivePayerType });
-    if (annualSen != null) {
-      items.push({
-        code: "annual_fee_yearly",
-        description: "Yuran Tahunan",
-        qty: 1,
-        unit: "year",
-        unitPriceSen: annualSen,
-        amountSen: annualSen,
-      });
-    }
-  }
-
-  if (periodMonth === 1 || periodMonth === 5 || periodMonth === 9) {
-    const bookSen = priceFor({ table, code: "comms_book_4months", payerType: effectivePayerType });
-    if (bookSen != null) {
-      items.push({
-        code: "comms_book_4months",
-        description: "Buku Komunikasi (4 bulan)",
-        qty: 1,
-        unit: "4months",
-        unitPriceSen: bookSen,
-        amountSen: bookSen,
-      });
+  let ageProfile = defaultAgeProfile;
+  if (baseCode === "transit_schoolholiday_month") {
+    const minAgeMonths = Number(feePolicy.schoolHolidayMonthly && feePolicy.schoolHolidayMonthly.minAgeMonths
+      ? feePolicy.schoolHolidayMonthly.minAgeMonths
+      : 48);
+    if (!Number.isFinite(Number(months))) {
+      ageProfile = {
+        ageBand,
+        ageOutOfPolicy: true,
+        agePolicyReason: "school_holiday_requires_known_age",
+      };
+    } else if (Number(months) < minAgeMonths) {
+      ageProfile = {
+        ageBand,
+        ageOutOfPolicy: true,
+        agePolicyReason: "school_holiday_requires_age_4_plus",
+      };
+    } else {
+      ageProfile = {
+        ageBand,
+        ageOutOfPolicy: false,
+        agePolicyReason: "school_holiday_age_allowed",
+      };
     }
   }
 
-  if (periodMonth === 1 && months != null && months >= 24) {
-    const insSen = priceFor({ table, code: "insurance_yearly_age2plus", payerType: effectivePayerType });
-    if (insSen != null) {
-      items.push({
-        code: "insurance_yearly_age2plus",
-        description: "Insurans Tahunan (Umur 2 tahun ke atas)",
-        qty: 1,
-        unit: "year",
-        unitPriceSen: insSen,
-        amountSen: insSen,
-      });
-    }
-  }
-
-  if (child && child.transportFromTadika === true) {
-    const tSen = priceFor({ table, code: "transport_tadika_month", payerType: effectivePayerType });
-    if (tSen != null) {
-      items.push({
-        code: "transport_tadika_month",
-        description: "Pengangkutan Dari Tadika",
-        qty: 1,
-        unit: "month",
-        unitPriceSen: tSen,
-        amountSen: tSen,
-      });
-    }
-  }
-
-  const uniformItem = uniformItemForPeriod({ child, months, periodKey, isRegistrationMonth });
-  if (uniformItem) {
-    items.push(uniformItem);
-  }
-
-  let overtime = {
+  const overtimeSummary = {
     after530Hours: 0,
     h8to12Hours: 0,
     h12to7Hours: 0,
+    lateNightOccurrences: 0,
+    overnightOccurrences: 0,
+    managementReviewRecommended: Boolean(calculation.overtime && calculation.overtime.managementReviewRecommended),
+    totalSen: moneySen(calculation.overtime && calculation.overtime.totalSen),
+    breakdown: calculation.overtime && Array.isArray(calculation.overtime.breakdown)
+      ? calculation.overtime.breakdown
+      : [],
   };
-
-  overtime = overtimeBucketsFromAttendanceRows(attendanceRows);
-
-  const mOver = (reqData && reqData.manualOvertime) ? reqData.manualOvertime : null;
-  if (mOver && typeof mOver === "object") {
-    overtime = {
-      after530Hours: Number.isFinite(Number(mOver.after530Hours)) ? Math.max(0, Math.round(Number(mOver.after530Hours))) : overtime.after530Hours,
-      h8to12Hours: Number.isFinite(Number(mOver.h8to12Hours)) ? Math.max(0, Math.round(Number(mOver.h8to12Hours))) : overtime.h8to12Hours,
-      h12to7Hours: Number.isFinite(Number(mOver.h12to7Hours)) ? Math.max(0, Math.round(Number(mOver.h12to7Hours))) : overtime.h12to7Hours,
-    };
-  }
-
-  const otMap = [
-    { code: "overtime_after_530", label: "Lebih Masa Selepas 5:30 PM", qty: overtime.after530Hours },
-    { code: "overtime_8pm_12am", label: "Lebih Masa 8:00 PM - 12:00 AM", qty: overtime.h8to12Hours },
-    { code: "overtime_12am_7am", label: "Lebih Masa 12:00 AM - 7:00 AM", qty: overtime.h12to7Hours },
-  ];
-  for (const row of otMap) {
-    if (!row.qty || row.qty <= 0) continue;
-    const unitPriceSen = priceFor({ table, code: row.code, payerType: effectivePayerType });
-    if (unitPriceSen == null) continue;
-    items.push({
-      code: row.code,
-      description: row.label,
-      qty: row.qty,
-      unit: "hour",
-      unitPriceSen,
-      amountSen: unitPriceSen * row.qty,
-    });
-  }
-
-  const absenceAdjustment = childAbsenceAdjustmentForPeriod(child ? { ...child, id: childId } : null, periodKey, reqData);
-  const absDays = Number(absenceAdjustment.absenceDaysWithLetter || 0);
-  const hasLetter = Boolean(absenceAdjustment.hasAbsenceLetter);
-  if (hasLetter && Number.isFinite(absDays) && absDays > 14) {
-    const baseItem = items.find((i) => i && i.code && (i.code.startsWith("monthly_") || i.code.startsWith("transit_")));
-    if (baseItem && Number(baseItem.amountSen) > 0) {
-      const discountSen = Math.round(Number(baseItem.amountSen) * 0.10);
-      if (discountSen > 0) {
-        items.push({
-          code: "discount_absence_14days",
-          description: "Potongan 10% (Tidak Hadir >14 Hari + Surat)",
-          qty: 1,
-          unit: "discount",
-          unitPriceSen: -discountSen,
-          amountSen: -discountSen,
-        });
-      }
+  for (const bucket of overtimeSummary.breakdown) {
+    const quantity = Number(bucket && bucket.quantity ? bucket.quantity : 0);
+    if (bucket && bucket.code === "overtime_after_530") {
+      overtimeSummary.after530Hours = quantity;
+    } else if (bucket && bucket.code === "overtime_8pm_12am") {
+      overtimeSummary.h8to12Hours = quantity;
+      overtimeSummary.lateNightOccurrences = Number(bucket.activeDayCount || 0);
+    } else if (bucket && bucket.code === "overtime_12am_7am") {
+      overtimeSummary.h12to7Hours = quantity;
+      overtimeSummary.overnightOccurrences = Number(bucket.activeDayCount || 0);
     }
   }
 
-  const subTotalSen = items.reduce((a, b) => a + moneySen(b.amountSen), 0);
-  const totalSen = moneySen(subTotalSen);
+  const subTotalSen = moneySen(calculation.subTotalSen);
+  const totalSen = moneySen(calculation.totalSen);
   const dueDayRaw = child && Number.isFinite(Number(child.billingDueDay)) ? Number(child.billingDueDay) : 7;
   const dueDay = dueDayRaw === 5 ? 5 : 7;
   const dueDate = new Date(periodDate.getFullYear(), periodDate.getMonth(), dueDay, 23, 59, 59);
@@ -5034,15 +5279,7 @@ async function buildInvoiceItemsFromPdfPolicy({ parentId, childId, period, reqDa
     isRegistrationMonth
       ? "Bayaran pendaftaran dan bayaran ketika mendaftar tidak akan dikembalikan."
       : null,
-    uniformItem
-      ? "Uniform dikenakan sebagai caj semasa untuk kanak-kanak 3 dan 4 tahun."
-      : null,
-    hasLetter && Number.isFinite(absDays) && absDays > 14
-      ? "Potongan 10% telah digunakan kerana tidak hadir melebihi 14 hari dengan surat."
-      : null,
-    overtime.managementReviewRecommended
-      ? "Lebih masa selepas 8:00 malam atau selepas 12:00 malam melebihi 10 hari dan wajar disemak atas budi bicara pengurusan."
-      : null,
+    ...(Array.isArray(calculation.policyNotes) ? calculation.policyNotes : []),
   ]);
 
   if (ageProfile.agePolicyReason === "school_holiday_requires_age_4_plus") {
@@ -5058,7 +5295,7 @@ async function buildInvoiceItemsFromPdfPolicy({ parentId, childId, period, reqDa
     childName,
     table,
     payerType: effectivePayerType,
-    items,
+    items: calculation.items,
     subTotalSen,
     totalSen,
     dueDate,
@@ -5069,10 +5306,9 @@ async function buildInvoiceItemsFromPdfPolicy({ parentId, childId, period, reqDa
       months,
       registrationMonth: isRegistrationMonth,
       transitUsage,
-      uniformCharged: Boolean(uniformItem),
       policyNotes,
-      managementReviewRecommended: Boolean(overtime.managementReviewRecommended || ageProfile.ageOutOfPolicy),
-      overtime,
+      managementReviewRecommended: Boolean(calculation.managementReviewRecommended || ageProfile.ageOutOfPolicy),
+      overtime: overtimeSummary,
       absenceAdjustment,
       resolvedBaseCode: baseCode,
       ageOutOfPolicy: Boolean(ageProfile.ageOutOfPolicy),
@@ -5316,6 +5552,26 @@ exports.billingCompleteDummyCheckoutSession = onCall({ region: "asia-southeast1"
 });
 
 exports.billingCompleteDemoCheckoutSession = exports.billingCompleteDummyCheckoutSession;
+
+exports.syncBillingInvoiceLookups = onDocumentWritten(
+  "parents/{parentId}/invoices/{invoiceId}",
+  async (event) => {
+    const afterSnap = event.data && event.data.after ? event.data.after : null;
+    if (!afterSnap || !afterSnap.exists) return null;
+    await upsertInvoiceLookupDocs({ invoiceRef: afterSnap.ref, invoiceData: afterSnap.data() || {} });
+    return null;
+  },
+);
+
+exports.syncBillingSessionLookups = onDocumentWritten(
+  "parents/{parentId}/invoices/{invoiceId}/sessions/{sessionId}",
+  async (event) => {
+    const afterSnap = event.data && event.data.after ? event.data.after : null;
+    if (!afterSnap || !afterSnap.exists) return null;
+    await upsertSessionLookupDocs({ sessionRef: afterSnap.ref, sessionData: afterSnap.data() || {} });
+    return null;
+  },
+);
 
 exports.syncSharedChildInvoicePayments = onDocumentWritten(
   "parents/{parentId}/invoices/{invoiceId}",

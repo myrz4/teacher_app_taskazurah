@@ -12,6 +12,7 @@
     "serve": "firebase emulators:start --only functions",
     "shell": "firebase functions:shell",
     "start": "npm run shell",
+    "test:fee-engine": "node fee-engine-check.js",
     "e2e:attendance": "npx --yes firebase-tools emulators:exec --project taskazurah --only firestore \"node e2e-attendance-check.js\"",
     "e2e:casual-transit": "npx --yes firebase-tools emulators:exec --project taskazurah --only firestore \"node e2e-casual-transit-check.js\"",
     "e2e:billing": "npx firebase-tools emulators:exec --project taskazurah --only firestore \"node e2e-billing-check.js\"",
