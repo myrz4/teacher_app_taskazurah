@@ -157,8 +157,10 @@ function billingSessionLookupDocId(kind, value) {
   return `${String(kind || "").trim()}:${crypto.createHash("sha1").update(String(value || "").trim()).digest("hex")}`;
 }
 
-async function seedAttendanceOvertime(childId) {
-  const base = new Date();
+async function seedAttendanceOvertime(childId, options = {}) {
+  const base = options.baseDate
+    ? new Date(options.baseDate)
+    : new Date();
   const y = base.getFullYear();
   const m = base.getMonth();
 
@@ -180,8 +182,10 @@ async function seedAttendanceOvertime(childId) {
   }, { merge: true });
 }
 
-async function seedAttendanceRows(childId, rows) {
-  const base = new Date();
+async function seedAttendanceRows(childId, rows, options = {}) {
+  const base = options.baseDate
+    ? new Date(options.baseDate)
+    : new Date();
   const y = base.getFullYear();
   const m = base.getMonth();
 
@@ -221,8 +225,10 @@ async function seedAttendanceRows(childId, rows) {
   await Promise.all(writes);
 }
 
-async function seedCanonicalAttendanceRecord(childId, row) {
-  const base = new Date();
+async function seedCanonicalAttendanceRecord(childId, row, options = {}) {
+  const base = options.baseDate
+    ? new Date(options.baseDate)
+    : new Date();
   const y = base.getFullYear();
   const m = base.getMonth();
   const day = Number(row.day || 1);
@@ -310,14 +316,22 @@ async function run() {
     "Case1a: same-period refresh should keep the original total");
   console.log("PASS Case1a same-parent refresh keeps registration-month charges");
 
-  // Case 2: Transit + overtime + absence discount with due day 7
+  // Case 2: Current invoice should bill the previous closed-month overtime cycle
+  const previousPeriodDate = new Date();
+  previousPeriodDate.setMonth(previousPeriodDate.getMonth() - 1, 1);
+  const previousPeriod = monthKey(previousPeriodDate);
+  const currentSourcePeriodDate = new Date();
+  currentSourcePeriodDate.setDate(1);
+  const nextPeriodDate = new Date();
+  nextPeriodDate.setMonth(nextPeriodDate.getMonth() + 1, 5);
+  const nextPeriod = monthKey(nextPeriodDate);
+  const registeredBeforeOvertime = new Date(previousPeriodDate.getFullYear(), previousPeriodDate.getMonth() - 1, 1, 9, 0, 0);
+
   const parent2 = "e2e-parent-transit";
   const child2 = "e2e-child-transit";
   await createParent({ parentId: parent2, phoneE164: phone });
   await clearInvoicesByPeriod(parent2, currentPeriod);
 
-  const lastMonth = new Date();
-  lastMonth.setMonth(lastMonth.getMonth() - 1);
   await createChild({
     childId: child2,
     name: "E2E Child Transit",
@@ -326,11 +340,11 @@ async function run() {
     staffChild: false,
     billingDueDay: 7,
     birthDate: "2023-01-15",
-    registeredAt: admin.firestore.Timestamp.fromDate(lastMonth),
+    registeredAt: admin.firestore.Timestamp.fromDate(registeredBeforeOvertime),
     transportFromTadika: true,
-    registrationFeeAppliedPeriod: monthKey(lastMonth),
+    registrationFeeAppliedPeriod: monthKey(registeredBeforeOvertime),
   });
-  await seedAttendanceOvertime(child2);
+  await seedAttendanceOvertime(child2, { baseDate: previousPeriodDate });
 
   const trRes = await fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
     uid,
@@ -340,7 +354,6 @@ async function run() {
       childId: child2,
       hasAbsenceLetter: true,
       absenceDaysWithLetter: 15,
-      manualOvertime: { after530Hours: 2, h8to12Hours: 1, h12to7Hours: 0 },
     },
   }));
   assertTrue(trRes && trRes.ok, "Case2: billingCreateDemoInvoiceForCurrentMonth failed");
@@ -353,11 +366,17 @@ async function run() {
   assertTrue(items2.some((i) => i.code === "overtime_8pm_12am"), "Case2: overtime_8pm_12am item missing");
   assertTrue(items2.some((i) => i.code === "transport_tadika_month"), "Case2: transport item missing");
   assertTrue(items2.some((i) => i.code === "discount_absence_14days"), "Case2: absence discount item missing");
+  const childSummaries2 = Array.isArray(inv2.data.billingMeta && inv2.data.billingMeta.children)
+    ? inv2.data.billingMeta.children
+    : [];
+  const childBillingMeta2 = childSummaries2[0] && childSummaries2[0].billingMeta ? childSummaries2[0].billingMeta : null;
+  assertTrue(childBillingMeta2 && childBillingMeta2.overtime && childBillingMeta2.overtime.sourcePeriod === previousPeriod,
+    "Case2: overtime should be sourced from the previous billing period");
   const due2 = inv2.data.dueDate && inv2.data.dueDate.toDate ? inv2.data.dueDate.toDate() : null;
   assertTrue(due2 && due2.getDate() === 7, "Case2: due day expected 7");
-  console.log("PASS Case2 transit + overtime + discount + due day 7");
+  console.log("PASS Case2 current invoice bills previous closed-month overtime");
 
-  // Case 2aa: Attendance override should refresh an unpaid invoice for the affected month
+  // Case 2aa: Attendance override should refresh the next invoice when overtime is carried forward
   const parentRefresh = "e2e-parent-att-refresh";
   const childRefresh = "e2e-child-att-refresh";
   await createParent({ parentId: parentRefresh, phoneE164: phone });
@@ -365,7 +384,7 @@ async function run() {
     childIds: [childRefresh],
     childNames: ["E2E Child Attendance Refresh"],
   });
-  await clearInvoicesByPeriod(parentRefresh, currentPeriod);
+  await clearInvoicesByPeriod(parentRefresh, nextPeriod);
 
   await createChild({
     childId: childRefresh,
@@ -375,33 +394,33 @@ async function run() {
     staffChild: false,
     billingDueDay: 7,
     birthDate: "2023-04-18",
-    registeredAt: admin.firestore.Timestamp.fromDate(lastMonth),
+    registeredAt: admin.firestore.Timestamp.fromDate(registeredBeforeOvertime),
     transportFromTadika: false,
-    registrationFeeAppliedPeriod: monthKey(lastMonth),
+    registrationFeeAppliedPeriod: monthKey(registeredBeforeOvertime),
   });
 
   const seededAttendance = await seedCanonicalAttendanceRecord(childRefresh, {
     day: 15,
     checkInHour: 8,
     checkOutHour: 21,
-  });
+  }, { baseDate: currentSourcePeriodDate });
 
-  const refreshCreateRes = await fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
+  const refreshCreateRes = await withMockDate(nextPeriodDate, () => fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
     uid,
     phone,
     data: { parentId: parentRefresh, childId: childRefresh },
-  }));
+  })));
   assertTrue(refreshCreateRes && refreshCreateRes.ok, "Case2aa: invoice creation failed");
 
-  const beforeRefresh = await fetchInvoiceByPeriod({ parentId: parentRefresh, period: currentPeriod });
+  const beforeRefresh = await fetchInvoiceByPeriod({ parentId: parentRefresh, period: nextPeriod });
   assertTrue(beforeRefresh, "Case2aa: invoice missing before refresh");
   const beforeRefreshItems = Array.isArray(beforeRefresh.data.items) ? beforeRefresh.data.items : [];
   assertTrue(beforeRefreshItems.some((item) => item.code === "overtime_after_530"), "Case2aa: expected overtime_after_530 before refresh");
   assertTrue(beforeRefreshItems.some((item) => item.code === "overtime_8pm_12am"), "Case2aa: expected overtime_8pm_12am before refresh");
   const beforeRefreshTotal = Number(beforeRefresh.data.totalSen || 0);
 
-  const editedCheckIn = new Date(new Date().getFullYear(), new Date().getMonth(), 15, 8, 0, 0);
-  const editedCheckOut = new Date(new Date().getFullYear(), new Date().getMonth(), 15, 17, 0, 0);
+  const editedCheckIn = new Date(currentSourcePeriodDate.getFullYear(), currentSourcePeriodDate.getMonth(), 15, 8, 0, 0);
+  const editedCheckOut = new Date(currentSourcePeriodDate.getFullYear(), currentSourcePeriodDate.getMonth(), 15, 17, 0, 0);
   const refreshOverrideRes = await fns.attendanceAdminOverride.run(mkAdminReq({
     uid: "e2e-admin-refresh",
     phone,
@@ -410,7 +429,7 @@ async function run() {
       childId: childRefresh,
       attendanceDate: seededAttendance.dateKey,
       reason: "Shortened recorded pickup time",
-      notes: "Billing should remove overtime",
+      notes: "Billing should remove overtime from the next invoice",
       adminName: "E2E Admin",
       checkInAt: editedCheckIn.toISOString(),
       checkOutAt: editedCheckOut.toISOString(),
@@ -418,21 +437,24 @@ async function run() {
   }));
   assertTrue(refreshOverrideRes && refreshOverrideRes.ok, `Case2aa: attendance override failed: ${JSON.stringify(refreshOverrideRes)}`);
   assertTrue(refreshOverrideRes.billingRefresh && refreshOverrideRes.billingRefresh.ok, `Case2aa: billing refresh failed: ${JSON.stringify(refreshOverrideRes.billingRefresh)}`);
+  assertTrue(Array.isArray(refreshOverrideRes.billingRefresh.refreshedPeriods)
+    && refreshOverrideRes.billingRefresh.refreshedPeriods.includes(nextPeriod),
+  "Case2aa: next-period invoice should be refreshed");
 
-  const afterRefresh = await fetchInvoiceByPeriod({ parentId: parentRefresh, period: currentPeriod });
+  const afterRefresh = await fetchInvoiceByPeriod({ parentId: parentRefresh, period: nextPeriod });
   assertTrue(afterRefresh, "Case2aa: invoice missing after refresh");
   const afterRefreshItems = Array.isArray(afterRefresh.data.items) ? afterRefresh.data.items : [];
   assertTrue(!afterRefreshItems.some((item) => item.code === "overtime_after_530"), "Case2aa: overtime_after_530 should be removed after refresh");
   assertTrue(!afterRefreshItems.some((item) => item.code === "overtime_8pm_12am"), "Case2aa: overtime_8pm_12am should be removed after refresh");
   const afterRefreshTotal = Number(afterRefresh.data.totalSen || 0);
-  assertTrue(afterRefreshTotal < beforeRefreshTotal, "Case2aa: refreshed invoice total should decrease");
+  assertTrue(afterRefreshTotal < beforeRefreshTotal, "Case2aa: refreshed next-period invoice total should decrease");
   const attendanceRefreshMeta = afterRefresh.data.billingMeta && afterRefresh.data.billingMeta.attendanceRefresh
     ? afterRefresh.data.billingMeta.attendanceRefresh
     : null;
   assertTrue(attendanceRefreshMeta && attendanceRefreshMeta.action === "EDIT_RECORD", "Case2aa: attendance refresh metadata missing");
-  console.log("PASS Case2aa unpaid invoice refresh after attendance override");
+  console.log("PASS Case2aa attendance override refreshes the carried overtime invoice");
 
-  // Case 2ab: Paid invoice should keep totals intact and record a pending attendance adjustment
+  // Case 2ab: Paid carried-overtime invoice should keep totals intact and record a pending adjustment
   const parentPaidAdjust = "e2e-parent-paid-adjust";
   const childPaidAdjust = "e2e-child-paid-adjust";
   await createParent({ parentId: parentPaidAdjust, phoneE164: phone });
@@ -440,7 +462,7 @@ async function run() {
     childIds: [childPaidAdjust],
     childNames: ["E2E Child Paid Adjust"],
   });
-  await clearInvoicesByPeriod(parentPaidAdjust, currentPeriod);
+  await clearInvoicesByPeriod(parentPaidAdjust, nextPeriod);
 
   await createChild({
     childId: childPaidAdjust,
@@ -450,25 +472,25 @@ async function run() {
     staffChild: false,
     billingDueDay: 7,
     birthDate: "2023-05-11",
-    registeredAt: admin.firestore.Timestamp.fromDate(lastMonth),
+    registeredAt: admin.firestore.Timestamp.fromDate(registeredBeforeOvertime),
     transportFromTadika: false,
-    registrationFeeAppliedPeriod: monthKey(lastMonth),
+    registrationFeeAppliedPeriod: monthKey(registeredBeforeOvertime),
   });
 
   const paidAttendance = await seedCanonicalAttendanceRecord(childPaidAdjust, {
     day: 16,
     checkInHour: 8,
     checkOutHour: 21,
-  });
+  }, { baseDate: currentSourcePeriodDate });
 
-  const paidAdjustCreate = await fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
+  const paidAdjustCreate = await withMockDate(nextPeriodDate, () => fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
     uid,
     phone,
     data: { parentId: parentPaidAdjust, childId: childPaidAdjust },
-  }));
+  })));
   assertTrue(paidAdjustCreate && paidAdjustCreate.ok, "Case2ab: paid-adjust invoice creation failed");
 
-  const beforePaidAdjust = await fetchInvoiceByPeriod({ parentId: parentPaidAdjust, period: currentPeriod });
+  const beforePaidAdjust = await fetchInvoiceByPeriod({ parentId: parentPaidAdjust, period: nextPeriod });
   assertTrue(beforePaidAdjust, "Case2ab: invoice missing before paid adjustment");
   const paidAdjustTotalBefore = Number(beforePaidAdjust.data.totalSen || 0);
   await db.collection("parents").doc(parentPaidAdjust).collection("invoices").doc(beforePaidAdjust.id).set({
@@ -489,18 +511,19 @@ async function run() {
       childId: childPaidAdjust,
       attendanceDate: paidAttendance.dateKey,
       reason: "Pickup time corrected after payment",
-      notes: "Should create a pending credit adjustment",
+      notes: "Should create a pending credit adjustment on the next invoice",
       adminName: "E2E Admin",
-      checkInAt: new Date(new Date().getFullYear(), new Date().getMonth(), 16, 8, 0, 0).toISOString(),
-      checkOutAt: new Date(new Date().getFullYear(), new Date().getMonth(), 16, 17, 0, 0).toISOString(),
+      checkInAt: new Date(currentSourcePeriodDate.getFullYear(), currentSourcePeriodDate.getMonth(), 16, 8, 0, 0).toISOString(),
+      checkOutAt: new Date(currentSourcePeriodDate.getFullYear(), currentSourcePeriodDate.getMonth(), 16, 17, 0, 0).toISOString(),
     },
   }));
   assertTrue(paidAdjustOverride && paidAdjustOverride.ok, `Case2ab: attendance override failed: ${JSON.stringify(paidAdjustOverride)}`);
   assertTrue(paidAdjustOverride.billingRefresh && paidAdjustOverride.billingRefresh.ok, `Case2ab: paid invoice adjustment recording failed: ${JSON.stringify(paidAdjustOverride.billingRefresh)}`);
-  assertTrue(paidAdjustOverride.billingRefresh.paidInvoice === true, "Case2ab: expected paid invoice adjustment path");
-  assertTrue(paidAdjustOverride.billingRefresh.adjustmentRequired === true, "Case2ab: expected adjustment to be required");
+  assertTrue(Array.isArray(paidAdjustOverride.billingRefresh.results)
+    && paidAdjustOverride.billingRefresh.results.some((entry) => entry.period === nextPeriod && entry.paidInvoice === true && entry.adjustmentRequired === true),
+  "Case2ab: expected paid next-period invoice adjustment path");
 
-  const afterPaidAdjust = await fetchInvoiceByPeriod({ parentId: parentPaidAdjust, period: currentPeriod });
+  const afterPaidAdjust = await fetchInvoiceByPeriod({ parentId: parentPaidAdjust, period: nextPeriod });
   assertTrue(afterPaidAdjust, "Case2ab: invoice missing after paid adjustment");
   assertTrue(String(afterPaidAdjust.data.status || "") === "paid", "Case2ab: invoice status should remain paid");
   assertTrue(Number(afterPaidAdjust.data.totalSen || 0) === paidAdjustTotalBefore, "Case2ab: paid invoice total should not be rewritten");
@@ -517,7 +540,58 @@ async function run() {
   assertTrue(String(paidAdjustments[0].data.status || "") === "pending", "Case2ab: adjustment should stay pending");
   assertTrue(String(paidAdjustments[0].data.type || "") === "credit", "Case2ab: adjustment type should be credit");
   assertTrue(Number(paidAdjustments[0].data.deltaSen || 0) < 0, "Case2ab: adjustment delta should be negative for a credit");
-  console.log("PASS Case2ab paid invoice records pending attendance adjustment");
+  console.log("PASS Case2ab paid carried-overtime invoice records pending adjustment");
+
+  // Case 2ac: First closed overtime cycle should start from registration date, not the first of the month
+  const parentPartialCycle = "e2e-parent-partial-cycle";
+  const childPartialCycle = "e2e-child-partial-cycle";
+  await createParent({ parentId: parentPartialCycle, phoneE164: phone });
+  await clearInvoicesByPeriod(parentPartialCycle, currentPeriod);
+
+  const registrationMidPreviousMonth = new Date(previousPeriodDate.getFullYear(), previousPeriodDate.getMonth(), 15, 9, 0, 0);
+  await createChild({
+    childId: childPartialCycle,
+    name: "E2E Child Partial Cycle",
+    careType: "fulltime",
+    registrationType: "fulltime",
+    staffChild: false,
+    billingDueDay: 7,
+    birthDate: "2024-04-10",
+    registeredAt: admin.firestore.Timestamp.fromDate(registrationMidPreviousMonth),
+    transportFromTadika: false,
+    registrationFeeAppliedPeriod: previousPeriod,
+  });
+  await seedAttendanceRows(childPartialCycle, [
+    { day: 10, checkInHour: 8, checkOutHour: 19 },
+    { day: 20, checkInHour: 8, checkOutHour: 19 },
+  ], { baseDate: previousPeriodDate });
+
+  const partialCycleRes = await fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
+    uid,
+    phone,
+    data: { parentId: parentPartialCycle, childId: childPartialCycle },
+  }));
+  assertTrue(partialCycleRes && partialCycleRes.ok, "Case2ac: partial-cycle invoice creation failed");
+
+  const partialCycleInvoice = await fetchInvoiceByPeriod({ parentId: parentPartialCycle, period: currentPeriod });
+  assertTrue(partialCycleInvoice, "Case2ac: partial-cycle invoice missing");
+  const partialItems = Array.isArray(partialCycleInvoice.data.items) ? partialCycleInvoice.data.items : [];
+  const partialOvertimeItem = partialItems.find((item) => item.code === "overtime_after_530");
+  assertTrue(partialOvertimeItem && Number(partialOvertimeItem.amountSen || 0) === 1200,
+    "Case2ac: only post-registration overtime should be billed in the first closed cycle");
+  assertTrue(!partialItems.some((item) => item.code === "overtime_8pm_12am"), "Case2ac: no late-night overtime expected");
+  const partialChildSummaries = Array.isArray(partialCycleInvoice.data.billingMeta && partialCycleInvoice.data.billingMeta.children)
+    ? partialCycleInvoice.data.billingMeta.children
+    : [];
+  const partialChildMeta = partialChildSummaries[0] && partialChildSummaries[0].billingMeta ? partialChildSummaries[0].billingMeta : null;
+  assertTrue(Boolean(partialChildMeta && partialChildMeta.overtime && partialChildMeta.overtime.partialRegistrationMonth),
+    "Case2ac: partial registration-month overtime metadata missing");
+  const partialNotes = Array.isArray(partialCycleInvoice.data.billingMeta && partialCycleInvoice.data.billingMeta.policyNotes)
+    ? partialCycleInvoice.data.billingMeta.policyNotes
+    : [];
+  assertTrue(partialNotes.some((note) => String(note).includes("tarikh pendaftaran")),
+    "Case2ac: invoice should explain the registration-date overtime cutoff");
+  console.log("PASS Case2ac first overtime cycle starts from registration date");
 
   // Case 2a: Attendance-based transit variants without uniform billing
   const parentUsage = "e2e-parent-usage";
@@ -635,7 +709,7 @@ async function run() {
     checkInHour: 8,
     checkOutHour: 20,
     checkOutMinute: 30,
-  })));
+  })), { baseDate: previousPeriodDate });
   await seedAttendanceRows(childTransitAuto2h, [
     { day: 18, checkInHour: 8, checkOutHour: 10 },
     { day: 19, checkInHour: 8, checkOutHour: 10 },
@@ -744,9 +818,6 @@ async function run() {
   console.log("PASS Case2b family invoice aggregates linked children into one parent-period invoice");
 
   // Case 2c: Admin batch generation should create missing family invoices and skip existing ones
-  const nextMonthDate = new Date();
-  nextMonthDate.setMonth(nextMonthDate.getMonth() + 1);
-  const nextPeriod = monthKey(nextMonthDate);
   await clearInvoicesByPeriod(parentFamily, nextPeriod);
 
   const batchRes1 = await fns.billingAdminGenerateInvoicesForPeriod.run(mkAdminReq({

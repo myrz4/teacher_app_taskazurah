@@ -275,6 +275,32 @@ function buildLineItem({
   };
 }
 
+const MALAYSIA_UTC_OFFSET_MINUTES = 8 * 60;
+
+function malaysiaShift(date) {
+  return new Date(date.getTime() + (MALAYSIA_UTC_OFFSET_MINUTES * 60 * 1000));
+}
+
+function malaysiaDateParts(date) {
+  const shifted = malaysiaShift(date);
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth(),
+    day: shifted.getUTCDate(),
+    hour: shifted.getUTCHours(),
+    minute: shifted.getUTCMinutes(),
+  };
+}
+
+function malaysiaLocalDate(year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0) {
+  return new Date(Date.UTC(year, month, day, hour, minute, second, millisecond) - (MALAYSIA_UTC_OFFSET_MINUTES * 60 * 1000));
+}
+
+function malaysiaSameDayAt(date, hour, minute = 0) {
+  const parts = malaysiaDateParts(date);
+  return malaysiaLocalDate(parts.year, parts.month, parts.day, hour, minute, 0, 0);
+}
+
 function dedupeNotes(notes) {
   const seen = new Set();
   const out = [];
@@ -477,7 +503,8 @@ function buildBaseFeeItem({ baseCode, payerType, table, transitUsage }) {
 }
 
 function startOfLocalDay(date) {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
+  const parts = malaysiaDateParts(date);
+  return malaysiaLocalDate(parts.year, parts.month, parts.day, 0, 0, 0, 0);
 }
 
 function addMinutes(date, minuteOffset) {
@@ -485,7 +512,8 @@ function addMinutes(date, minuteOffset) {
 }
 
 function dayKey(date) {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  const parts = malaysiaDateParts(date);
+  return `${parts.year}-${String(parts.month + 1).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
 
 function minutesBetween(start, end) {
@@ -536,7 +564,7 @@ function aggregateOvertimeFromIntervals({ intervals, policy = DEFAULT_FEE_POLICY
     if (!rawEnd || Number.isNaN(rawEnd.getTime())) continue;
     const rawStart = interval && interval.start instanceof Date && !Number.isNaN(interval.start.getTime())
       ? interval.start
-      : new Date(rawEnd.getFullYear(), rawEnd.getMonth(), rawEnd.getDate(), 17, 30, 0, 0);
+      : malaysiaSameDayAt(rawEnd, 17, 30);
     if (rawEnd.getTime() <= rawStart.getTime()) continue;
 
     let dayCursor = startOfLocalDay(rawStart);
@@ -680,6 +708,7 @@ function generateInvoiceLineItems({
   transportUsed,
   transitUsage,
   attendanceRows,
+  overtimeChargeOverride,
   manualOvertime,
   absenceAdjustment,
 }) {
@@ -807,13 +836,20 @@ function generateInvoiceLineItems({
     start: asDate(row && (row.checkInAt || row.check_in_time || row.checkInTime || row.checkinTime)),
     end: asDate(row && (row.checkOutAt || row.check_out_time || row.checkOutTime || row.checkoutTime)),
   }));
-  const overtime = calculateOvertimeCharge({
-    intervals,
-    manualOvertime,
-    payerType: normalizedPayerType,
-    table,
-    policy: resolvedPolicy,
-  });
+  const overtime = overtimeChargeOverride && typeof overtimeChargeOverride === "object"
+    ? {
+      items: Array.isArray(overtimeChargeOverride.items) ? overtimeChargeOverride.items : [],
+      totalSen: moneySen(overtimeChargeOverride.totalSen),
+      breakdown: Array.isArray(overtimeChargeOverride.breakdown) ? overtimeChargeOverride.breakdown : [],
+      managementReviewRecommended: Boolean(overtimeChargeOverride.managementReviewRecommended),
+    }
+    : calculateOvertimeCharge({
+      intervals,
+      manualOvertime,
+      payerType: normalizedPayerType,
+      table,
+      policy: resolvedPolicy,
+    });
   items.push(...overtime.items);
 
   const absenceDaysWithLetter = Number(absenceAdjustment && absenceAdjustment.absenceDaysWithLetter ? absenceAdjustment.absenceDaysWithLetter : 0);
