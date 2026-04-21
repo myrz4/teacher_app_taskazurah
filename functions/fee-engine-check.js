@@ -151,6 +151,7 @@ function runOvertimeChecks() {
 
   assertAmount(overtimeInvoice.items, "overtime_after_530", 1800, "after-5:30 overtime should round 2.5 hours to 3 hours");
   assertAmount(overtimeInvoice.items, "overtime_8pm_12am", 2600, "8pm-12am overtime should round 70 minutes to 2 hours");
+
   console.log("PASS overtime windows and rounding");
 }
 
