@@ -2751,7 +2751,9 @@ function registrationChargeRequired(child, periodKey) {
   if (!child) return false;
 
   const appliedPeriod = String(child.registrationFeeAppliedPeriod || "").trim();
-  if (appliedPeriod) return false;
+  if (appliedPeriod) {
+    return !periodKey || appliedPeriod === String(periodKey).trim();
+  }
 
   const registrationDate = child.registeredAt && typeof child.registeredAt.toDate === "function"
     ? child.registeredAt.toDate()
@@ -5332,10 +5334,12 @@ exports.billingCreateDemoInvoiceForCurrentMonth = onCall({ region: "asia-southea
     parentData,
     period,
     reqData: req.data || {},
-    createdByKind: "parent-demo",
+    createdByKind: "parent-app",
     fallbackChildId: childId,
   });
 });
+
+exports.billingCreateInvoiceForCurrentMonth = exports.billingCreateDemoInvoiceForCurrentMonth;
 
 exports.billingAdminGenerateInvoicesForPeriod = onCall({ region: "asia-southeast1" }, async (req) => {
   try {

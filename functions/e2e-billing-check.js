@@ -289,6 +289,27 @@ async function run() {
   assertTrue(due1 && due1.getDate() === 5, "Case1: due day expected 5");
   console.log("PASS Case1 registration-month + due day 5");
 
+  const regRefreshRes = await fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
+    uid,
+    phone,
+    data: { parentId: parent1, childId: child1 },
+  }));
+  assertTrue(regRefreshRes && regRefreshRes.ok, "Case1a: refresh invoice creation failed");
+  assertTrue(regRefreshRes.already === true, "Case1a: refresh should reuse the existing invoice");
+
+  const inv1Refreshed = await fetchInvoiceByPeriod({ parentId: parent1, period: currentPeriod });
+  assertTrue(inv1Refreshed, "Case1a: refreshed invoice missing");
+  const refreshedItems1 = Array.isArray(inv1Refreshed.data.items) ? inv1Refreshed.data.items : [];
+  assertTrue(refreshedItems1.some((item) => item.code === "registration_fulltime_oneoff"),
+    "Case1a: registration fee must survive same-period refresh");
+  assertTrue(refreshedItems1.some((item) => item.code === "monthly_fulltime_3m_2y"),
+    "Case1a: monthly fee must survive same-period refresh");
+  assertTrue(refreshedItems1.some((item) => item.code === "comms_book_oneoff" || item.code === "comms_book_4months"),
+    "Case1a: communication book fee must survive same-period refresh");
+  assertTrue(Number(inv1Refreshed.data.totalSen || 0) === Number(inv1.data.totalSen || 0),
+    "Case1a: same-period refresh should keep the original total");
+  console.log("PASS Case1a same-parent refresh keeps registration-month charges");
+
   // Case 2: Transit + overtime + absence discount with due day 7
   const parent2 = "e2e-parent-transit";
   const child2 = "e2e-child-transit";
@@ -941,10 +962,10 @@ async function run() {
     registrationType: "fulltime",
     staffChild: false,
     billingDueDay: 7,
-    birthDate: "2024-01-15",
-    registeredAt: admin.firestore.Timestamp.fromDate(lastMonth),
+      birthDate: "2025-02-10",
+      registeredAt: nowTs(),
     transportFromTadika: false,
-    registrationFeeAppliedPeriod: monthKey(lastMonth),
+      registrationFeeAppliedPeriod: "",
   });
 
   const sharedInvoiceA = await fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
@@ -959,6 +980,33 @@ async function run() {
   }));
   assertTrue(sharedInvoiceA && sharedInvoiceA.ok, "Case3da: shared invoice A creation failed");
   assertTrue(sharedInvoiceB && sharedInvoiceB.ok, "Case3da: shared invoice B creation failed");
+
+    const sharedInvoiceDocAUnpaid = await fetchInvoiceByPeriod({ parentId: sharedParentA, period: currentPeriod });
+    const sharedInvoiceDocBUnpaid = await fetchInvoiceByPeriod({ parentId: sharedParentB, period: currentPeriod });
+    assertTrue(sharedInvoiceDocAUnpaid, "Case3da: shared invoice A missing before payment");
+    assertTrue(sharedInvoiceDocBUnpaid, "Case3da: shared invoice B missing before payment");
+      const sharedUnpaidItemsA = Array.isArray(sharedInvoiceDocAUnpaid.data.items) ? sharedInvoiceDocAUnpaid.data.items : [];
+      const sharedUnpaidItemsB = Array.isArray(sharedInvoiceDocBUnpaid.data.items) ? sharedInvoiceDocBUnpaid.data.items : [];
+      const sharedMonthlyItemA = sharedUnpaidItemsA.find((item) => item && item.code === "monthly_fulltime_3m_2y");
+      const sharedMonthlyItemB = sharedUnpaidItemsB.find((item) => item && item.code === "monthly_fulltime_3m_2y");
+      const sharedRegistrationItemA = sharedUnpaidItemsA.find((item) => item && item.code === "registration_fulltime_oneoff");
+      const sharedRegistrationItemB = sharedUnpaidItemsB.find((item) => item && item.code === "registration_fulltime_oneoff");
+      const sharedBookItemA = sharedUnpaidItemsA.find((item) => item && (item.code === "comms_book_oneoff" || item.code === "comms_book_4months"));
+      const sharedBookItemB = sharedUnpaidItemsB.find((item) => item && (item.code === "comms_book_oneoff" || item.code === "comms_book_4months"));
+      assertTrue(Number(sharedMonthlyItemA && sharedMonthlyItemA.amountSen) === 40000,
+        "Case3da: shared invoice A should keep the monthly fee");
+      assertTrue(Number(sharedMonthlyItemB && sharedMonthlyItemB.amountSen) === 40000,
+        "Case3da: shared invoice B should keep the monthly fee");
+      assertTrue(Number(sharedRegistrationItemA && sharedRegistrationItemA.amountSen) === 10000,
+        "Case3da: shared invoice A should keep the registration fee");
+      assertTrue(Number(sharedRegistrationItemB && sharedRegistrationItemB.amountSen) === 10000,
+        "Case3da: shared invoice B should keep the registration fee");
+      assertTrue(Number(sharedBookItemA && sharedBookItemA.amountSen) === 1500,
+        "Case3da: shared invoice A should keep the communication book fee");
+      assertTrue(Number(sharedBookItemB && sharedBookItemB.amountSen) === 1500,
+        "Case3da: shared invoice B should keep the communication book fee");
+    assertTrue(Number(sharedInvoiceDocAUnpaid.data.totalSen || 0) === Number(sharedInvoiceDocBUnpaid.data.totalSen || 0),
+      "Case3da: both parents should see the same payable total before payment");
 
   const sharedSession = await fns.billingCreateCheckoutSession.run(mkReq({
     uid,
