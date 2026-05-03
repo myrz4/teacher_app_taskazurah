@@ -43,6 +43,11 @@ service cloud.firestore {
       return signedIn() && (normalizedRole() == null || normalizedRole() == 'parent');
     }
 
+    // ESP32 NFC device account (email+password, no custom claims)
+    function isDevice() {
+      return signedIn() && request.auth.token.email == 'esp32@taska.com';
+    }
+
     // Parent derived email support: p_<digits>@taskazurah.local
     function isDerivedParentEmail(email) {
       return email != null && email.matches('^p_[0-9]+@taskazurah\\.local$');
@@ -238,6 +243,13 @@ service cloud.firestore {
     match /attendance/{docId} {
       allow read: if isAdmin() || isTeacher() || isParentForAttendanceDoc();
       allow create, update: if isAdmin() || isTeacher();
+      allow delete: if isAdmin();
+    }
+
+    // Latest scanner bridge event used by JavaFX child CRUD dialogs to auto-fill NFC UID.
+    match /nfcCapture/{docId} {
+      allow read: if isAdmin() || isTeacher() || isDevice();
+      allow create, update: if isDevice();
       allow delete: if isAdmin();
     }
 
