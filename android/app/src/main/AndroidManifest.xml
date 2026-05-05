@@ -30,7 +30,7 @@
 
     <application
         android:name="${applicationName}"
-        android:label="Taska Zurah Teacher"
+        android:label="TZ Teacher"
         android:icon="@mipmap/ic_launcher"
         android:hardwareAccelerated="true"
         android:allowBackup="true"

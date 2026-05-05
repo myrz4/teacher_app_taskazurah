@@ -68,7 +68,7 @@ class _LoginScreenState extends State<LoginScreen> {
       Future<String?> readRoleOnce() async {
         final r = await user.getIdTokenResult(true);
         final v = r.claims?['role'];
-        return v == null ? null : v.toString();
+        return v?.toString();
       }
 
       var role = await readRoleOnce();
@@ -206,6 +206,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
     try {
       final email = _emailFromPhone(phoneE164);
+      // ignore: deprecated_member_use
       final methods = await FirebaseAuth.instance.fetchSignInMethodsForEmail(email);
       if (!mounted) return;
 

@@ -12,7 +12,13 @@ import 'package:teacher_app_taskazurah/main.dart';
 
 void main() {
   testWidgets('App builds smoke test', (WidgetTester tester) async {
-    await tester.pumpWidget(const MyApp());
+    await tester.pumpWidget(
+      const MyApp(
+        home: Scaffold(body: Text('Smoke test')),
+      ),
+    );
+
     expect(find.byType(MaterialApp), findsOneWidget);
+    expect(find.text('Smoke test'), findsOneWidget);
   });
 }

@@ -13,7 +13,8 @@ import 'package:intl/intl.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'qr_scanner_screen.dart';
+import 'qr_scanner_screen.dart'
+  if (dart.library.html) 'qr_scanner_screen_web.dart';
 import 'attendance_list_screen.dart';
 import 'salary_tips_screen.dart';
 import 'profile_screen.dart';
@@ -573,17 +574,24 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final backgroundColor = theme.scaffoldBackgroundColor;
+    final cardColor = theme.cardColor;
+    final titleColor = isDark ? Colors.white : const Color(0xFF2E7D32);
+    final mutedTextColor = isDark ? Colors.white70 : Colors.black54;
+
     if (_isLoading) {
-      return const Scaffold(
-        backgroundColor: Colors.white,
+      return Scaffold(
+        backgroundColor: backgroundColor,
         body: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              CircularProgressIndicator(color: Colors.green),
-              SizedBox(height: 10),
+              CircularProgressIndicator(color: theme.colorScheme.primary),
+              const SizedBox(height: 10),
               Text("Loading dashboard...",
-                  style: TextStyle(color: Colors.black54)),
+                  style: TextStyle(color: mutedTextColor)),
             ],
           ),
         ),
@@ -595,10 +603,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
         "${currentDate.day}/${currentDate.month}/${currentDate.year}";
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF8FFF8),
+      backgroundColor: backgroundColor,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF2E7D32),
-        foregroundColor: Colors.white,
         title: const Text(
           "Teacher Dashboard",
           style: TextStyle(fontWeight: FontWeight.bold),
@@ -608,7 +614,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
       // 🟢 Sidebar Drawer
       drawer: Drawer(
         child: Container(
-          color: const Color(0xFFF9FFF9),
+          color: theme.drawerTheme.backgroundColor ?? cardColor,
           child: ListView(
             padding: EdgeInsets.zero,
             children: [
@@ -769,18 +775,18 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text("Welcome back,",
-                        style: TextStyle(color: Colors.black54, fontSize: 14)),
+                        style: TextStyle(fontSize: 14)),
                     Text(
                       widget.name,
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 22,
                         fontWeight: FontWeight.bold,
-                        color: Color(0xFF2E7D32),
+                        color: titleColor,
                       ),
                     ),
                     Text("Date: $formattedDate",
-                        style: const TextStyle(
-                            fontSize: 13, color: Colors.black54)),
+                        style: TextStyle(
+                            fontSize: 13, color: mutedTextColor)),
                   ],
                 ),
               ],
@@ -792,6 +798,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
               children: [
                 Expanded(
                   child: _summaryCard(
+                    context,
                     "Base Salary",
                     "RM${_baseSalary.toStringAsFixed(2)}",
                     Icons.attach_money,
@@ -801,6 +808,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                 const SizedBox(width: 10),
                 Expanded(
                   child: _summaryCard(
+                    context,
                     "Bonus",
                     "RM${_bonus.toStringAsFixed(2)}",
                     Icons.star_rate,
@@ -813,6 +821,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
 
             // 👨‍👩‍👧‍👦 Attendance Summary + Smart Bar
             _summaryCard(
+              context,
               "Today's Attendance",
               "$todayAttendanceCount Children",
               Icons.people,
@@ -826,7 +835,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                 margin: const EdgeInsets.only(bottom: 20),
                 padding: const EdgeInsets.all(15),
                 decoration: BoxDecoration(
-                  color: Colors.white,
+                  color: cardColor,
                   borderRadius: BorderRadius.circular(15),
                   boxShadow: [
                     BoxShadow(
@@ -840,9 +849,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text("Attendance Overview",
-                        style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: Colors.black87)),
+                      style: TextStyle(fontWeight: FontWeight.bold)),
                     const SizedBox(height: 8),
                     LinearProgressIndicator(
                       value: totalStudentCount == 0
@@ -939,12 +946,22 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
   }
 
   // 🌿 Summary Card
-  Widget _summaryCard(String title, String value, IconData icon, Color color) {
+  Widget _summaryCard(
+    BuildContext context,
+    String title,
+    String value,
+    IconData icon,
+    Color color,
+  ) {
+    final theme = Theme.of(context);
+    final mutedColor = theme.brightness == Brightness.dark
+        ? Colors.white70
+        : Colors.black54;
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 8),
       padding: const EdgeInsets.all(15),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: theme.cardColor,
         borderRadius: BorderRadius.circular(15),
         boxShadow: [
           BoxShadow(
@@ -964,8 +981,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(title,
-                    style: const TextStyle(
-                        color: Colors.black54,
+                  style: TextStyle(
+                    color: mutedColor,
                         fontWeight: FontWeight.w500,
                         fontSize: 13)),
                 const SizedBox(height: 4),
@@ -989,6 +1006,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
   // 📦 Menu Card
   Widget _menuCard(BuildContext context, String title, IconData icon,
       Color color, VoidCallback onTap) {
+    final theme = Theme.of(context);
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(20),
@@ -996,7 +1014,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
         width: MediaQuery.of(context).size.width / 2 - 30,
         height: 150,
         decoration: BoxDecoration(
-          color: Colors.white,
+          color: theme.cardColor,
           borderRadius: BorderRadius.circular(20),
           boxShadow: [
             BoxShadow(

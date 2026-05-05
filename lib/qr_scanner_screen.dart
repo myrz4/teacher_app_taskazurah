@@ -7,7 +7,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:qr_code_scanner/qr_code_scanner.dart';
 import 'package:fluttertoast/fluttertoast.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:intl/intl.dart';
 
@@ -15,15 +14,13 @@ class QRScannerScreen extends StatefulWidget {
   final String teacherUsername;
   final String teacherName;
 
-  const QRScannerScreen({Key? key, required this.teacherUsername, required this.teacherName})
-      : super(key: key);
+  const QRScannerScreen({super.key, required this.teacherUsername, required this.teacherName});
 
   @override
   State<QRScannerScreen> createState() => _QRScannerScreenState();
 }
 
 class _QRScannerScreenState extends State<QRScannerScreen> {
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final GlobalKey qrKey = GlobalKey(debugLabel: 'QR');
   QRViewController? controller;
   bool scanned = false;
@@ -54,7 +51,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
       'qrToken': qrToken,
       'teacherName': teacherName,
     });
-    return Map<String, dynamic>.from(response.data ?? const <String, dynamic>{});
+    return Map<String, dynamic>.from(response.data);
   }
 
   String _reasonToMessage(String reason) {
@@ -191,7 +188,7 @@ class VerificationResultScreen extends StatelessWidget {
   final String teacherUsername;
 
   const VerificationResultScreen({
-    Key? key,
+    super.key,
     required this.isVerified,
     required this.parentName,
     required this.phone,
@@ -201,7 +198,7 @@ class VerificationResultScreen extends StatelessWidget {
     required this.representativeRole,
     required this.expiryDate,
     required this.teacherUsername,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -253,7 +250,7 @@ class VerificationResultScreen extends StatelessWidget {
               children: [
                 CircleAvatar(
                   radius: 45,
-                  backgroundColor: mainColor.withOpacity(0.15),
+                  backgroundColor: mainColor.withValues(alpha: 0.15),
                   child: Icon(
                     isVerified
                         ? Icons.verified_user

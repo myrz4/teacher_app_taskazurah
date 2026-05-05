@@ -280,7 +280,7 @@ class _TeacherBootstrapperState extends State<_TeacherBootstrapper> {
       Future<String?> readRoleOnce() async {
         final r = await user.getIdTokenResult(true);
         final v = r.claims?['role'];
-        return v == null ? null : v.toString();
+        return v?.toString();
       }
 
       var role = await readRoleOnce();
