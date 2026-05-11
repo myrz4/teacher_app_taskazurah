@@ -1045,7 +1045,6 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
 
     if (!childId) throw callableError("missing-child-id", "invalid-argument");
     if (!attendanceDate) throw callableError("missing-attendance-date", "invalid-argument");
-    if (!reason) throw callableError("missing-reason", "invalid-argument");
 
     const allowedActions = new Set([
       "MANUAL_CHECK_IN",
