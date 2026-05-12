@@ -645,6 +645,13 @@ exports.attendanceNfcCheckIn = onCall({ region: "asia-southeast1" }, async (req)
     const childName = attendanceChildName(childData) || childId;
     const parentName = attendanceParentName(childData, null);
     const dayInfo = attendanceDayInfo();
+    const operatingDecision = await attendanceCheckInPolicyDecision(new Date());
+    if (!operatingDecision.ok) {
+      throw callableError(
+        operatingDecision.reason === "taska-closed" ? "taska-closed-today" : "outside-working-hours",
+        "failed-precondition",
+      );
+    }
     const attendanceId = `${dayInfo.key}_${childId}`;
     const attendanceRef = db.collection("attendance").doc(attendanceId);
     const auditRef = db.collection("attendanceAudit").doc();
@@ -1059,6 +1066,12 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
 
     const checkInAt = attendanceTimestampField(req.data && req.data.checkInAt, "check-in-at", action === "MANUAL_CHECK_IN");
     const checkOutAt = attendanceTimestampField(req.data && req.data.checkOutAt, "check-out-at", false);
+    const operatingDecision = action === "MANUAL_CHECK_IN"
+      ? await attendanceCheckInPolicyDecision(checkInAt)
+      : null;
+    if (action === "MANUAL_CHECK_IN" && operatingDecision && !operatingDecision.ok && !reason) {
+      throw callableError("manual-check-in-requires-reason", "failed-precondition");
+    }
     const dayInfo = attendanceDayInfoFromDateKey(attendanceDate);
     const canonicalAttendanceId = `${dayInfo.key}_${childId}`;
     const db = admin.firestore();
@@ -1229,6 +1242,7 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
           previousCheckOutAt: existingCheckOut,
           nextCheckInAt: nextCheckIn,
           nextCheckOutAt: nextCheckOut,
+          operatingHoursDecision: operatingDecision ? operatingDecision.reason : "in_window",
           notes,
         },
       }));
@@ -1372,17 +1386,37 @@ exports.sendChatNotification = onDocumentCreated(
 // ------------------ Billing / Payments (demo path on dummy provider now, real-ready later) ------------------
 
 const BILLING_REQUIRED_CODES = [
+  "monthly_fee_baby_to_2",
+  "monthly_fee_age_2_to_3",
+  "monthly_fee_age_4",
+  "registration_fee",
+  "insurance_takaful",
+  "yearly_maintenance_fee",
+  "overtime_weekday_half_hour",
+  "overtime_saturday_half_hour",
+  "transit_1hour",
+  "transit_1day",
+  "transit_1week",
+];
+
+const LEGACY_BILLING_CODES = [
   "monthly_fulltime_3m_2y",
   "monthly_fulltime_2y_4y",
-  "registration_fulltime_oneoff",
-  "registration_transit_oneoff",
+  "transit_halfday_month",
+  "transit_2h_month",
+  "transit_schoolholiday_month",
   "overtime_after_530",
   "overtime_8pm_12am",
   "transport_tadika_month",
+  "registration_fulltime_oneoff",
+  "registration_transit_oneoff",
   "annual_fee_yearly",
   "comms_book_oneoff",
   "insurance_oneoff_age2plus",
 ];
+
+const TASKA_ZURAH_CATALOG_ID = "taska_zurah_2026";
+const TASKA_ZURAH_CATALOG_VERSION = "taska_zurah_2026";
 
 function callableError(reason, code = "failed-precondition") {
   const err = new Error(String(reason || "unknown-error"));
@@ -2741,7 +2775,7 @@ function ageInMonths(at, birthDate) {
 function resolveAgeProfile(months) {
   const ageProfile = feeEngine.determineAgeBand(months);
   return {
-    ageBand: String(ageProfile.codeSuffix || "2y_4y"),
+    ageBand: String(ageProfile.codeSuffix || "AGE_4"),
     ageOutOfPolicy: Boolean(ageProfile.ageOutOfPolicy),
     agePolicyReason: String(ageProfile.agePolicyReason || "in_range"),
   };
@@ -2825,28 +2859,11 @@ async function assertParentOwnerByPhone({ parentId, authToken }) {
 }
 
 function feeTableFromPdf() {
+  const catalog = feeEngine.buildDefaultCatalog();
   return {
-    version: "pdf-2026-03-18",
-    monthly_fulltime_3m_2y: { staff: 35000, nonstaff: 40000 },
-    monthly_fulltime_2y_4y: { staff: 30000, nonstaff: 35000 },
-    transit_halfday_month: { staff: 15000, nonstaff: 25000 },
-    transit_2h_month: { staff: 10000, nonstaff: 18000 },
-    transit_schoolholiday_month: { staff: 25000, nonstaff: 30000 },
-    transit_1day: { staff: 1500, nonstaff: 2000 },
-    transit_1week: { staff: 7000, nonstaff: 10000 },
-    transit_1hour: { staff: 350, nonstaff: 400 },
-    overtime_after_530: { staff: 500, nonstaff: 600 },
-    overtime_8pm_12am: { staff: 1000, nonstaff: 1300 },
-    overtime_12am_7am: { staff: 700, nonstaff: 1000 },
-    transport_tadika_month: { staff: 15000, nonstaff: 15000 },
-    registration_fulltime_oneoff: { staff: 10000, nonstaff: 10000 },
-    registration_transit_oneoff: { staff: 5000, nonstaff: 5000 },
-    annual_fee_yearly: { staff: 10000, nonstaff: 10000 },
-    comms_book_oneoff: { staff: 1500, nonstaff: 1500 },
-    comms_book_4months: { staff: 1500, nonstaff: 1500 },
-    insurance_oneoff_age2plus: { staff: 2000, nonstaff: 2000 },
-    insurance_yearly_age2plus: { staff: 2000, nonstaff: 2000 },
-    policy: feeEngine.resolveFeePolicy(),
+    version: String(catalog.version || "taska_zurah_2026"),
+    table: catalog.table,
+    policy: catalog.policy,
   };
 }
 
@@ -2887,12 +2904,75 @@ function normalizeCatalogDoc(raw) {
   }
 
   return {
-    version: String(src.version || "pdf-2026-03-18"),
+    version: String(src.version || TASKA_ZURAH_CATALOG_VERSION),
     table,
     active: Boolean(src.active),
     defaultTransitMonthlyCode: sanitizeTransitCode(src.defaultTransitMonthlyCode),
     policy: feeEngine.resolveFeePolicy(src.policy || {}),
   };
+}
+
+function isLegacyBillingCatalog(table) {
+  const rows = table && table.table ? table.table : (table || {});
+  return LEGACY_BILLING_CODES.some((code) => Object.prototype.hasOwnProperty.call(rows, code));
+}
+
+function isTaskaZurahCatalog(table) {
+  const rows = table && table.table ? table.table : (table || {});
+  return BILLING_REQUIRED_CODES.every((code) => Object.prototype.hasOwnProperty.call(rows, code));
+}
+
+function canonicalTaskaZurahCatalog() {
+  return normalizeCatalogDoc({
+    ...feeTableFromPdf(),
+    version: TASKA_ZURAH_CATALOG_VERSION,
+    active: true,
+    defaultTransitMonthlyCode: "",
+  });
+}
+
+function canonicalTaskaZurahCatalogPayload(updatedBy = "") {
+  const canonical = canonicalTaskaZurahCatalog();
+  return {
+    version: TASKA_ZURAH_CATALOG_VERSION,
+    active: true,
+    table: canonical.table,
+    defaultTransitMonthlyCode: "",
+    policy: canonical.policy,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedBy: String(updatedBy || ""),
+  };
+}
+
+async function enforceCanonicalTaskaZurahCatalog({ pruneLegacy = false, updatedBy = "" } = {}) {
+  const db = admin.firestore();
+  const snap = await db.collection("billingCatalog").get();
+  const batch = db.batch();
+  const canonicalRef = db.collection("billingCatalog").doc(TASKA_ZURAH_CATALOG_ID);
+
+  snap.docs.forEach((doc) => {
+    const normalized = normalizeCatalogDoc(doc.data() || {});
+    const legacy = isLegacyBillingCatalog(normalized);
+    if (legacy && pruneLegacy) {
+      batch.delete(doc.ref);
+      return;
+    }
+    if (doc.id !== TASKA_ZURAH_CATALOG_ID && doc.get("active") === true) {
+      batch.set(doc.ref, { active: false }, { merge: true });
+    }
+  });
+
+  batch.set(canonicalRef, canonicalTaskaZurahCatalogPayload(updatedBy), { merge: true });
+  batch.set(db.collection("billingConfig").doc("current"), {
+    activeCatalogId: TASKA_ZURAH_CATALOG_ID,
+    defaultTransitMonthlyCode: "",
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedBy: String(updatedBy || ""),
+  }, { merge: true });
+
+  await batch.commit();
+  catalogCache = { ts: 0, catalog: null };
+  return canonicalTaskaZurahCatalog();
 }
 
 async function loadActiveFeeCatalog() {
@@ -2901,7 +2981,7 @@ async function loadActiveFeeCatalog() {
     return catalogCache.catalog;
   }
 
-  const fallback = normalizeCatalogDoc(feeTableFromPdf());
+  const fallback = canonicalTaskaZurahCatalog();
   const db = admin.firestore();
 
   try {
@@ -2914,11 +2994,17 @@ async function loadActiveFeeCatalog() {
         const cat = await db.collection("billingCatalog").doc(activeId).get();
         if (cat.exists) {
           const normalized = normalizeCatalogDoc(cat.data() || {});
-          if (Object.keys(normalized.table).length > 0) {
+          if (isTaskaZurahCatalog(normalized)) {
             normalized.defaultTransitMonthlyCode = configuredTransitCode || normalized.defaultTransitMonthlyCode || "";
             catalogCache = { ts: now, catalog: normalized };
             return normalized;
           }
+          const repaired = await enforceCanonicalTaskaZurahCatalog({
+            pruneLegacy: true,
+            updatedBy: String((pointer.data() || {}).updatedBy || ""),
+          });
+          catalogCache = { ts: now, catalog: repaired };
+          return repaired;
         }
       }
     }
@@ -2926,18 +3012,34 @@ async function loadActiveFeeCatalog() {
     const activeSnap = await db.collection("billingCatalog").where("active", "==", true).limit(1).get();
     if (!activeSnap.empty) {
       const normalized = normalizeCatalogDoc(activeSnap.docs[0].data() || {});
-      if (Object.keys(normalized.table).length > 0) {
+      if (isTaskaZurahCatalog(normalized)) {
         normalized.defaultTransitMonthlyCode = normalized.defaultTransitMonthlyCode || "";
         catalogCache = { ts: now, catalog: normalized };
         return normalized;
       }
+      const repaired = await enforceCanonicalTaskaZurahCatalog({
+        pruneLegacy: true,
+        updatedBy: String(activeSnap.docs[0].get("updatedBy") || ""),
+      });
+      catalogCache = { ts: now, catalog: repaired };
+      return repaired;
     }
+
+    const repaired = await enforceCanonicalTaskaZurahCatalog({ pruneLegacy: true });
+    catalogCache = { ts: now, catalog: repaired };
+    return repaired;
   } catch (err) {
     logger.error("billing-catalog-load-failed", err);
   }
 
   catalogCache = { ts: now, catalog: fallback };
   return fallback;
+}
+
+async function attendanceCheckInPolicyDecision(at) {
+  const table = await loadActiveFeeCatalog();
+  const policy = feeEngine.resolveFeePolicy(table.policy || {});
+  return feeEngine.canCheckIn(at, policy);
 }
 
 function priceFor({ table, code, payerType }) {
@@ -2958,14 +3060,14 @@ exports.billingGetFeeCatalog = onCall({ region: "asia-southeast1" }, async (req)
     table: table.table,
     policy: {
       ...policy,
-      defaultTransitMonthlyCode: table.defaultTransitMonthlyCode || "transit_2h_month",
-      dueDayOptions: [5, 7],
+      defaultTransitMonthlyCode: table.defaultTransitMonthlyCode || "",
+      dueDayOptions: [7],
       notes: [
-        "Yuran pendaftaran ditambah di atas yuran asas bulan pendaftaran.",
-        "Buku komunikasi dikenakan sekali sahaja semasa pendaftaran.",
-        "Insurans dikenakan sekali sahaja semasa pendaftaran untuk umur 2 tahun ke atas.",
-        "Yuran bulan berikutnya perlu dibayar sebelum 5hb atau 7hb.",
-        "Potongan 10% jika tidak hadir >14 hari dengan surat.",
+        "Registered-child billing now uses the Taska Zurah age-based model only.",
+        "Registration includes the registration fee, insurance or takaful, yearly maintenance fee, and the current month monthly fee.",
+        "Monthly invoices are generated on the 21st and due on the 7th of the invoice month.",
+        "Overtime is billed separately using the 21st-to-20th cycle.",
+        "Casual transit remains separate from registered monthly billing.",
       ],
     },
   };
@@ -2973,27 +3075,26 @@ exports.billingGetFeeCatalog = onCall({ region: "asia-southeast1" }, async (req)
 
 function billingCatalogHealthSnapshot(table) {
   const rows = table && table.table ? table.table : (table || {});
+  const resolvedPolicy = feeEngine.resolveFeePolicy(table && table.policy ? table.policy : {});
   const configuredDefaultTransitCode = sanitizeTransitCode(table && table.defaultTransitMonthlyCode);
   const resolvedDefaultTransitCode = pickDefaultTransitCode({ table, configuredCode: configuredDefaultTransitCode });
   const missingRequiredCodes = BILLING_REQUIRED_CODES.filter((code) => !rows[code]);
   const transitMonthlyCodes = Object.keys(rows)
     .filter((code) => String(code).startsWith("transit_") && String(code).endsWith("_month"))
     .sort();
-  const defaultTransitConfiguredValid = Boolean(configuredDefaultTransitCode && rows[configuredDefaultTransitCode]);
-  const defaultTransitResolvedValid = Boolean(resolvedDefaultTransitCode && rows[resolvedDefaultTransitCode]);
-  const isValid = missingRequiredCodes.length === 0
-    && transitMonthlyCodes.length > 0
-    && defaultTransitResolvedValid;
+  const isValid = missingRequiredCodes.length === 0;
 
   return {
     version: String((table && table.version) || ""),
     rowCount: Object.keys(rows).length,
     requiredCodeCount: BILLING_REQUIRED_CODES.length,
     missingRequiredCodes,
+    policyVersion: String(resolvedPolicy.policyVersion || ""),
+    activeBillingModel: String(resolvedPolicy.activeBillingModel || ""),
     configuredDefaultTransitCode: configuredDefaultTransitCode || "",
     resolvedDefaultTransitCode: resolvedDefaultTransitCode || "",
-    defaultTransitConfiguredValid,
-    defaultTransitResolvedValid,
+    defaultTransitConfiguredValid: !configuredDefaultTransitCode || Boolean(rows[configuredDefaultTransitCode]),
+    defaultTransitResolvedValid: !resolvedDefaultTransitCode || Boolean(rows[resolvedDefaultTransitCode]),
     transitMonthlyCodes,
     isValid,
   };
@@ -3020,9 +3121,13 @@ exports.billingGetHealth = onCall({ region: "asia-southeast1" }, async (req) => 
 exports.billingAdminListCatalogs = onCall({ region: "asia-southeast1" }, async (req) => {
   try {
     requireAdmin(req);
+    await enforceCanonicalTaskaZurahCatalog({ pruneLegacy: true, updatedBy: String(req.auth.uid || "") });
     const snap = await admin.firestore().collection("billingCatalog").get();
     const catalogs = snap.docs.map((doc) => {
       const normalized = normalizeCatalogDoc(doc.data() || {});
+      if (isLegacyBillingCatalog(normalized)) {
+        return null;
+      }
       return {
         id: doc.id,
         version: normalized.version,
@@ -3030,7 +3135,7 @@ exports.billingAdminListCatalogs = onCall({ region: "asia-southeast1" }, async (
         defaultTransitMonthlyCode: normalized.defaultTransitMonthlyCode || "",
         table: normalized.table,
       };
-    }).sort((a, b) => {
+    }).filter(Boolean).sort((a, b) => {
       if (a.active && !b.active) return -1;
       if (!a.active && b.active) return 1;
       return String(a.version || "").localeCompare(String(b.version || ""));
@@ -3066,6 +3171,7 @@ exports.billingAdminSaveCatalog = onCall({ region: "asia-southeast1" }, async (r
       active: false,
       table: normalized.table,
       defaultTransitMonthlyCode: health.resolvedDefaultTransitCode || "",
+      policy: normalized.policy,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedBy: String(req.auth.uid || ""),
     };
@@ -3182,6 +3288,65 @@ exports.billingAdminListAudit = onCall({ region: "asia-southeast1" }, async (req
   }
 });
 
+exports.billingAdminBackfillChildMetadata = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+    const data = req.data && typeof req.data === "object" ? req.data : {};
+    const requestedPeriod = String(data.period || "").trim();
+    const requestedLimit = Number(data.limit || 50);
+    const limit = Math.max(1, Math.min(200, Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : 50));
+    const period = /^\d{4}-\d{2}$/.test(requestedPeriod) ? requestedPeriod : monthKey(new Date());
+    const force = Boolean(data.force);
+    const startAfterId = String(data.startAfterId || "").trim();
+    const childIds = Array.isArray(data.childIds)
+      ? uniqueSortedIds(data.childIds).slice(0, limit)
+      : [];
+
+    const activeCatalog = await loadActiveFeeCatalog();
+    assertInvoiceCatalogReady({ table: activeCatalog });
+
+    const result = await backfillChildBillingMetadata({
+      period,
+      limit,
+      force,
+      startAfterId,
+      childIds,
+    });
+
+    await recordBillingAudit({
+      action: "child_billing_metadata_backfilled",
+      catalogId: "",
+      version: String(activeCatalog.version || ""),
+      req,
+      details: {
+        period,
+        limit,
+        force,
+        startAfterId,
+        requestedChildIds: childIds.slice(0, 50),
+        scannedCount: result.scannedCount,
+        patchedCount: result.patchedCount,
+        unchangedCount: result.unchangedCount,
+        skippedMigratedCount: result.skippedMigratedCount,
+        failedCount: result.failedCount,
+        hasMore: result.hasMore,
+        nextStartAfterId: result.nextStartAfterId,
+        patchedChildIds: result.patchedChildIds.slice(0, 50),
+        failedChildIds: result.failedChildIds.slice(0, 50),
+      },
+    });
+
+    return {
+      ok: true,
+      activeCatalogVersion: String(activeCatalog.version || ""),
+      ...result,
+    };
+  } catch (err) {
+    logger.error("billing-admin-backfill-child-metadata-failed", err);
+    return billingCallableFailureFromError(err);
+  }
+});
+
 exports.salaryGetTeacherConfigForCurrentUser = onCall({ region: "asia-southeast1" }, async (req) => {
   requireAuth(req);
 
@@ -3252,7 +3417,7 @@ function startOfLocalDay(dt) {
 function childRegistrationDate(child) {
   if (!child || typeof child !== "object") return null;
 
-  const registeredAt = child.registeredAt || child.registrationDate || child.createdAt || null;
+  const registeredAt = child.registrationDate || child.registeredAt || child.createdAt || null;
   if (!registeredAt) return null;
 
   const dt = registeredAt && typeof registeredAt.toDate === "function"
@@ -3451,9 +3616,9 @@ async function buildFamilyInvoiceFromPdfPolicy({ parentId, parentData, period, r
   }
 
   const policyNotes = dedupePolicyNotes([
-    `Bayaran bulan berikutnya hendaklah dijelaskan sebelum ${dueDay === 5 ? 5 : 7}hb.`,
-    "Yuran bulanan dibayar penuh jika tidak hadir tanpa notis bertulis.",
-    "Resit bayaran dikeluarkan selepas pembayaran diterima.",
+    `Next-month invoices are generated on the 21st and due on the ${dueDay === 5 ? 5 : 7}th of the invoice month.`,
+    "Overtime is billed as a separate line item using the 21st-to-20th cycle.",
+    "Casual transit remains separate from registered monthly billing.",
     ...childSummaries.flatMap((summary) => {
       const notes = Array.isArray(summary.billingMeta && summary.billingMeta.policyNotes)
         ? summary.billingMeta.policyNotes
@@ -3488,6 +3653,230 @@ async function buildFamilyInvoiceFromPdfPolicy({ parentId, parentData, period, r
       managementReviewChildIds,
     },
   };
+}
+
+function invoiceChildFieldPatchFromSummary({ period, childSummary }) {
+  const billingMeta = childSummary && childSummary.billingMeta && typeof childSummary.billingMeta === "object"
+    ? childSummary.billingMeta
+    : {};
+  const patch = {
+    activeBillingModel: String(billingMeta.activeBillingModel || "TASKA_ZURAH_AGE_BASED"),
+    feePolicyVersion: String(billingMeta.feePolicyVersion || "TASKA_ZURAH_2026"),
+    ageBand: String(billingMeta.resolvedAgeBand || billingMeta.ageBand || ""),
+    invoiceDueDay: Number.isFinite(Number(billingMeta.invoiceDueDay)) ? Number(billingMeta.invoiceDueDay) : 7,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  if (Number.isFinite(Number(billingMeta.monthlyFeeSen)) && Number(billingMeta.monthlyFeeSen) > 0) {
+    patch.monthlyFeeSen = moneySen(billingMeta.monthlyFeeSen);
+  }
+  if (billingMeta.registrationDate) {
+    patch.registrationDate = String(billingMeta.registrationDate);
+  }
+  if (Number.isFinite(Number(billingMeta.yearlyFeeCoveredYear))) {
+    patch.yearlyFeeCoveredYear = Number(billingMeta.yearlyFeeCoveredYear);
+  }
+  if (billingMeta.registrationMonth) {
+    patch.registrationFeeAppliedPeriod = String(period || "").trim();
+  }
+  return patch;
+}
+
+function childBillingBackfillPatch({ period, child, calc }) {
+  const childSummary = {
+    childId: String(calc && calc.childId ? calc.childId : ""),
+    childName: String(calc && calc.childName ? calc.childName : ""),
+    billingMeta: calc && calc.meta && typeof calc.meta === "object"
+      ? calc.meta
+      : {},
+  };
+  const billingMeta = childSummary.billingMeta;
+  const patch = invoiceChildFieldPatchFromSummary({ period, childSummary });
+  const existingRegistrationDate = String(child && child.registrationDate ? child.registrationDate : "").trim();
+
+  patch.billingDueDay = Number.isFinite(Number(patch.invoiceDueDay)) ? Number(patch.invoiceDueDay) : 7;
+  patch.careType = "fulltime";
+  patch.feePlan = "monthly";
+  patch.registrationType = "fulltime";
+  patch.transportFromTadika = false;
+  patch.schoolHolidayTransit = false;
+  patch.ageOutOfPolicy = Boolean(billingMeta.ageOutOfPolicy);
+  patch.agePolicyReason = String(billingMeta.agePolicyReason || "");
+  patch.billingReviewRequired = Boolean(billingMeta.ageOutOfPolicy);
+  patch.billingReviewReason = patch.billingReviewRequired
+    ? String(billingMeta.agePolicyReason || "manual_review")
+    : "";
+
+  if (existingRegistrationDate) {
+    patch.registrationDate = existingRegistrationDate;
+  } else if (!String(patch.registrationDate || "").trim()) {
+    delete patch.registrationDate;
+  }
+
+  return patch;
+}
+
+function childBillingPatchMatches(child, patch) {
+  const current = child && typeof child === "object" ? child : {};
+  return sameBillingString(current.activeBillingModel, patch.activeBillingModel)
+    && sameBillingString(current.feePolicyVersion, patch.feePolicyVersion)
+    && sameBillingString(current.ageBand, patch.ageBand)
+    && sameBillingOptionalNumber(current.monthlyFeeSen, patch.monthlyFeeSen)
+    && sameBillingOptionalNumber(current.invoiceDueDay, patch.invoiceDueDay)
+    && sameBillingOptionalNumber(current.billingDueDay, patch.billingDueDay)
+    && sameBillingString(current.careType, patch.careType)
+    && sameBillingString(current.feePlan, patch.feePlan)
+    && sameBillingString(current.registrationType, patch.registrationType)
+    && sameBillingBoolean(current.transportFromTadika, patch.transportFromTadika)
+    && sameBillingBoolean(current.schoolHolidayTransit, patch.schoolHolidayTransit)
+    && sameBillingBoolean(current.ageOutOfPolicy, patch.ageOutOfPolicy)
+    && sameBillingString(current.agePolicyReason, patch.agePolicyReason)
+    && sameBillingBoolean(current.billingReviewRequired, patch.billingReviewRequired)
+    && sameBillingString(current.billingReviewReason, patch.billingReviewReason)
+    && sameBillingString(current.registrationDate, patch.registrationDate)
+    && sameBillingOptionalNumber(current.yearlyFeeCoveredYear, patch.yearlyFeeCoveredYear);
+}
+
+function sameBillingString(left, right) {
+  return String(left || "") === String(right || "");
+}
+
+function sameBillingBoolean(left, right) {
+  return Boolean(left) === Boolean(right);
+}
+
+function sameBillingOptionalNumber(left, right) {
+  const normalizedLeft = Number.isFinite(Number(left)) ? Number(left) : null;
+  const normalizedRight = Number.isFinite(Number(right)) ? Number(right) : null;
+  return normalizedLeft === normalizedRight;
+}
+
+async function backfillChildBillingMetadata({ period, limit, force, startAfterId, childIds }) {
+  const db = admin.firestore();
+  const normalizedPeriod = /^\d{4}-\d{2}$/.test(String(period || "").trim())
+    ? String(period).trim()
+    : monthKey(new Date());
+  const normalizedLimit = Math.max(1, Math.min(200, Number.isFinite(Number(limit)) ? Math.trunc(Number(limit)) : 50));
+  const normalizedStartAfterId = String(startAfterId || "").trim();
+  const requestedChildIds = Array.isArray(childIds)
+    ? uniqueSortedIds(childIds).slice(0, normalizedLimit)
+    : [];
+  const result = {
+    period: normalizedPeriod,
+    limit: normalizedLimit,
+    force: Boolean(force),
+    startAfterId: normalizedStartAfterId,
+    requestedChildIds,
+    scannedCount: 0,
+    patchedCount: 0,
+    unchangedCount: 0,
+    skippedMigratedCount: 0,
+    failedCount: 0,
+    patchedChildIds: [],
+    failedChildIds: [],
+    hasMore: false,
+    nextStartAfterId: "",
+  };
+
+  const markFailure = (childId) => {
+    result.failedCount += 1;
+    if (childId) {
+      result.failedChildIds.push(String(childId));
+    }
+  };
+
+  const handleChildSnapshot = async (docSnap, requestedChildId = "") => {
+    const childId = String(requestedChildId || (docSnap && docSnap.id) || "").trim();
+    if (!docSnap || !docSnap.exists) {
+      markFailure(childId);
+      return;
+    }
+
+    result.scannedCount += 1;
+    const child = docSnap.data() || {};
+    if (String(child.migratedToChildId || "").trim()) {
+      result.skippedMigratedCount += 1;
+      return;
+    }
+
+    try {
+      const calc = await buildInvoiceItemsFromPdfPolicy({
+        childId,
+        period: normalizedPeriod,
+        reqData: {},
+        payerType: Boolean(child.staffChild) ? "staff" : "nonstaff",
+      });
+      if (!calc || !calc.meta || typeof calc.meta !== "object") {
+        markFailure(childId);
+        return;
+      }
+
+      const patch = childBillingBackfillPatch({ period: normalizedPeriod, child, calc });
+      if (!force && childBillingPatchMatches(child, patch)) {
+        result.unchangedCount += 1;
+        return;
+      }
+
+      await docSnap.ref.set(patch, { merge: true });
+      result.patchedCount += 1;
+      result.patchedChildIds.push(childId);
+    } catch (err) {
+      logger.error("billing-child-backfill-failed", {
+        childId,
+        period: normalizedPeriod,
+        error: String(err && err.message ? err.message : err),
+      });
+      markFailure(childId);
+    }
+  };
+
+  if (requestedChildIds.length) {
+    for (const childId of requestedChildIds) {
+      const docSnap = await db.collection("children").doc(childId).get();
+      await handleChildSnapshot(docSnap, childId);
+    }
+    return result;
+  }
+
+  let query = db.collection("children")
+    .orderBy(admin.firestore.FieldPath.documentId());
+  if (normalizedStartAfterId) {
+    query = query.startAfter(normalizedStartAfterId);
+  }
+
+  const snap = await query
+    .limit(normalizedLimit + 1)
+    .get();
+  const docsToProcess = snap.docs.slice(0, normalizedLimit);
+  if (snap.docs.length > normalizedLimit && docsToProcess.length) {
+    result.hasMore = true;
+    result.nextStartAfterId = String(docsToProcess[docsToProcess.length - 1].id || "");
+  }
+
+  for (const docSnap of docsToProcess) {
+    await handleChildSnapshot(docSnap);
+  }
+
+  return result;
+}
+
+async function syncChildBillingFieldsFromInvoiceChildren({ period, childSummaries }) {
+  await Promise.all((childSummaries || []).map(async (childSummary) => {
+    const childId = String(childSummary && childSummary.childId ? childSummary.childId : "").trim();
+    if (!childId) return;
+    try {
+      await admin.firestore().collection("children").doc(childId).set(
+        invoiceChildFieldPatchFromSummary({ period, childSummary }),
+        { merge: true },
+      );
+    } catch (err) {
+      logger.error("child-billing-field-sync-failed", {
+        childId,
+        period,
+        error: String(err && err.message ? err.message : err),
+      });
+    }
+  }));
 }
 
 async function findParentInvoiceDocByPeriod(invoiceCol, period) {
@@ -3550,6 +3939,10 @@ async function createParentInvoiceForPeriod({ req, parentId, parentData, period,
             childCoverageKey: childCoverageKey(period, refreshed.childIds),
           },
         });
+        await syncChildBillingFieldsFromInvoiceChildren({
+          period,
+          childSummaries: refreshed.childSummaries,
+        });
       }
     }
     return { ok: true, already: true, invoiceId: doc.id, reason: "already-exists" };
@@ -3597,18 +3990,10 @@ async function createParentInvoiceForPeriod({ req, parentId, parentData, period,
 
   await ref.set(invoiceData, { merge: false });
   await upsertInvoiceLookupDocs({ invoiceRef: ref, invoiceData });
-
-  if (calc.registrationFeeChildIds && calc.registrationFeeChildIds.length) {
-    await Promise.all(calc.registrationFeeChildIds.map(async (childId) => {
-      try {
-        await admin.firestore().collection("children").doc(childId).set({
-          registrationFeeAppliedPeriod: period,
-        }, { merge: true });
-      } catch (e) {
-        logger.error("registration-period-mark-failed", { childId, period, error: String(e && e.message ? e.message : e) });
-      }
-    }));
-  }
+  await syncChildBillingFieldsFromInvoiceChildren({
+    period,
+    childSummaries: calc.childSummaries,
+  });
 
   return {
     ok: true,
@@ -4979,15 +5364,6 @@ function paymentAdapterFor(config) {
 function assertInvoiceCatalogReady({ table, defaultTransitCode }) {
   const rows = table && table.table ? table.table : (table || {});
   const missing = BILLING_REQUIRED_CODES.filter((code) => !rows[code]);
-  const hasTransitMonthly = Object.keys(rows).some((code) => code.startsWith("transit_") && code.endsWith("_month"));
-
-  if (!hasTransitMonthly) {
-    missing.push("transit_*_month");
-  }
-
-  if (!defaultTransitCode || !rows[defaultTransitCode]) {
-    missing.push(`defaultTransitMonthlyCode:${defaultTransitCode || "<empty>"}`);
-  }
 
   if (missing.length > 0) {
     throw callableError(`billing-catalog-missing-required-codes:${missing.join(",")}`, "failed-precondition");
@@ -5188,6 +5564,29 @@ async function loadAttendanceRowsForChildPeriod(childId, periodDate) {
   }
 }
 
+async function loadAttendanceRowsForChildRange(childId, startDate, endDate) {
+  if (!childId || !(startDate instanceof Date) || Number.isNaN(startDate.getTime()) || !(endDate instanceof Date) || Number.isNaN(endDate.getTime())) {
+    return [];
+  }
+
+  try {
+    const att = await admin.firestore().collection("attendance")
+      .where("childId", "==", childId)
+      .where("date", ">=", startDate)
+      .where("date", "<=", endDate)
+      .get();
+    return att.docs.map((doc) => doc.data() || {});
+  } catch (err) {
+    logger.error("attendance-range-fetch-failed", {
+      childId,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      error: String(err && err.message ? err.message : err),
+    });
+    return [];
+  }
+}
+
 function manualOvertimeOverrideForChild(reqData, childId) {
   const req = reqData && typeof reqData === "object" ? reqData : {};
   const normalizedChildId = String(childId || "").trim();
@@ -5209,19 +5608,16 @@ function emptyOvertimeCharge() {
     items: [],
     totalSen: 0,
     breakdown: [],
+    weekdayBlocks: 0,
+    saturdayBlocks: 0,
     managementReviewRecommended: false,
   };
 }
 
 async function buildClosedOvertimeChargeForInvoice({ child, childId, invoicePeriod, baseCode, payerType, table, feePolicy, reqData }) {
-  if (!overtimeUsesClosedPreviousMonthCycle(baseCode)) {
-    return { applied: false, overtime: null };
-  }
-
-  const sourcePeriod = shiftPeriodKey(invoicePeriod, -1);
-  const sourcePeriodLabel = periodLabel(sourcePeriod);
   const empty = emptyOvertimeCharge();
-  if (!sourcePeriod) {
+  const invoiceDate = periodKeyToDate(invoicePeriod);
+  if (!invoiceDate) {
     return {
       applied: true,
       overtime: empty,
@@ -5235,55 +5631,42 @@ async function buildClosedOvertimeChargeForInvoice({ child, childId, invoicePeri
   }
 
   const registrationDate = childRegistrationDate(child);
-  const registrationPeriod = registrationDate ? monthKey(registrationDate) : "";
-  if (registrationPeriod && sourcePeriod < registrationPeriod) {
+  const cycle = feeEngine.determineOvertimeCycleForInvoice({
+    invoiceMonth: invoiceDate,
+    registrationDate,
+    policy: feePolicy,
+  });
+
+  if (!cycle.applies || !cycle.cycleStart || !cycle.cycleEnd) {
     return {
       applied: true,
       overtime: empty,
-      sourcePeriod,
-      sourcePeriodLabel,
-      cycleStart: null,
-      cycleEnd: null,
-      partialRegistrationMonth: false,
+      sourcePeriod: "",
+      sourcePeriodLabel: "",
+      cycleStart: cycle.cycleStart || null,
+      cycleEnd: cycle.cycleEnd || null,
+      partialRegistrationMonth: Boolean(cycle.partialRegistrationMonth),
       attendanceRowCount: 0,
     };
   }
 
-  const sourcePeriodDate = periodKeyToDate(sourcePeriod);
-  const cycleEnd = sourcePeriodDate ? endOfMonth(sourcePeriodDate) : null;
-  let cycleStart = sourcePeriodDate ? startOfMonth(sourcePeriodDate) : null;
-  let partialRegistrationMonth = false;
-  if (registrationDate && registrationPeriod === sourcePeriod) {
-    cycleStart = startOfLocalDay(registrationDate);
-    partialRegistrationMonth = Boolean(cycleStart);
-  }
-
   const manualOvertime = manualOvertimeOverrideForChild(reqData, childId);
-  const sourceAttendanceRows = manualOvertime || !sourcePeriodDate
+  const sourceAttendanceRows = manualOvertime
     ? []
-    : await loadAttendanceRowsForChildPeriod(childId, sourcePeriodDate);
-
-  const intervals = [];
-  let attendanceRowCount = 0;
-  for (const row of sourceAttendanceRows) {
-    const checkIn = attendanceTimestampToDate(row && (row.checkInAt || row.check_in_time || row.checkInTime || row.checkinTime));
-    const checkOut = attendanceTimestampToDate(row && (row.checkOutAt || row.check_out_time || row.checkOutTime || row.checkoutTime));
-    const attendanceAnchor = attendanceTimestampToDate(row && row.date) || checkIn || checkOut;
-    if (!attendanceAnchor || !cycleStart || !cycleEnd) continue;
-    if (attendanceAnchor.getTime() < cycleStart.getTime() || attendanceAnchor.getTime() > cycleEnd.getTime()) {
-      continue;
-    }
-    attendanceRowCount += 1;
-    intervals.push({ start: checkIn, end: checkOut });
-  }
-
-  const rawOvertime = feeEngine.calculateOvertimeCharge({
-    intervals,
-    manualOvertime,
-    payerType,
-    table,
-    policy: feePolicy,
-  });
+    : await loadAttendanceRowsForChildRange(childId, cycle.cycleStart, cycle.cycleEnd);
+  const closedRows = sourceAttendanceRows.filter((row) => attendanceHasCheckOut(row));
+  const rawOvertime = manualOvertime
+    ? feeEngine.calculateOvertimeCharge({ manualOvertime, policy: feePolicy })
+    : feeEngine.calculateOvertimeForCycle({
+      attendanceRows: closedRows,
+      cycleStart: cycle.cycleStart,
+      cycleEnd: cycle.cycleEnd,
+      policy: feePolicy,
+    });
+  const sourcePeriod = cycle.cycleEnd ? monthKey(cycle.cycleEnd) : "";
+  const sourcePeriodLabel = cycle.cycleStart && cycle.cycleEnd
+    ? `${attendanceDateKey(cycle.cycleStart)} to ${attendanceDateKey(cycle.cycleEnd)}`
+    : "";
 
   return {
     applied: true,
@@ -5295,24 +5678,26 @@ async function buildClosedOvertimeChargeForInvoice({ child, childId, invoicePeri
         notes: [
           ...(Array.isArray(item.notes) ? item.notes : []),
           sourcePeriod ? `Closed overtime cycle ${sourcePeriod}` : "",
-          partialRegistrationMonth && cycleStart ? `Cycle started on registration date ${attendanceDateKey(cycleStart)}` : "",
+          cycle.partialRegistrationMonth && cycle.cycleStart ? `Cycle started on registration date ${attendanceDateKey(cycle.cycleStart)}` : "",
         ].filter(Boolean),
         sourcePeriod,
         sourcePeriodLabel,
-        cycleStartDate: cycleStart ? attendanceDateKey(cycleStart) : "",
-        cycleEndDate: cycleEnd ? attendanceDateKey(cycleEnd) : "",
-        cycleType: "closed-month-overtime",
+        cycleStartDate: cycle.cycleStart ? attendanceDateKey(cycle.cycleStart) : "",
+        cycleEndDate: cycle.cycleEnd ? attendanceDateKey(cycle.cycleEnd) : "",
+        cycleType: "21-to-20-overtime-cycle",
       })),
       totalSen: moneySen(rawOvertime.totalSen),
       breakdown: Array.isArray(rawOvertime.breakdown) ? rawOvertime.breakdown : [],
+      weekdayBlocks: Number(rawOvertime.weekdayBlocks || 0),
+      saturdayBlocks: Number(rawOvertime.saturdayBlocks || 0),
       managementReviewRecommended: Boolean(rawOvertime.managementReviewRecommended),
     },
     sourcePeriod,
     sourcePeriodLabel,
-    cycleStart,
-    cycleEnd,
-    partialRegistrationMonth,
-    attendanceRowCount,
+    cycleStart: cycle.cycleStart,
+    cycleEnd: cycle.cycleEnd,
+    partialRegistrationMonth: Boolean(cycle.partialRegistrationMonth),
+    attendanceRowCount: closedRows.length,
   };
 }
 
@@ -5433,100 +5818,46 @@ async function buildInvoiceItemsFromPdfPolicy({ parentId, childId, period, reqDa
   }
 
   const childName = child ? String(child.name || child.childName || "").trim() : "";
+  const registrationDate = childRegistrationDate(child);
   const dob = child ? parseIsoDateOnly(child.birthDate) : null;
   const months = dob ? ageInMonths(periodDate, dob) : null;
-  const defaultAgeProfile = resolveAgeProfile(months);
-  const ageBand = defaultAgeProfile.ageBand;
-  // Authoritative payer type is derived from child.staffChild (admin-selected simple toggle).
-  // Legacy fallback keeps older data working if the flag is missing.
+  const ageProfile = resolveAgeProfile(months);
   const effectivePayerType = (child && typeof child.staffChild === "boolean")
     ? (child.staffChild ? "staff" : "nonstaff")
     : payerType;
 
-  const feePlan = child ? String(child.feePlan || "").trim().toLowerCase() : "";
-  const careType = child ? String(child.careType || "fulltime") : "fulltime";
-  const defaultTransitCode = pickDefaultTransitCode({
-    table,
-    configuredCode: sanitizeTransitCode(table.defaultTransitMonthlyCode),
-  });
-  assertInvoiceCatalogReady({ table, defaultTransitCode });
-  const attendanceRows = await loadAttendanceRowsForChildPeriod(childId, periodDate);
-
-  const transitUsage = transitUsageFromAttendanceRows(attendanceRows);
-  const baseCode = resolveBillingBaseCode({
-    child: child ? { ...child, id: childId } : null,
-    feePlan,
-    careType,
-    ageBand,
-    defaultTransitCode,
-    transitUsage,
-    reqData,
-    months,
-  });
+  assertInvoiceCatalogReady({ table });
   const periodKey = period || monthKey(now);
   const isRegistrationMonth = registrationChargeRequired(child, periodKey);
   const closedOvertimeCharge = await buildClosedOvertimeChargeForInvoice({
     child,
     childId,
     invoicePeriod: periodKey,
-    baseCode,
-    payerType: effectivePayerType,
-    table,
     feePolicy,
     reqData,
   });
 
-  const absenceAdjustment = childAbsenceAdjustmentForPeriod(child ? { ...child, id: childId } : null, periodKey, reqData);
   const calculation = feeEngine.generateInvoiceLineItems({
     periodKey,
     periodDate,
     payerType: effectivePayerType,
     table,
     policy: feePolicy,
-    careMode: careType,
-    baseCode,
+    careMode: "REGISTERED_CHILD",
     ageMonths: months,
     isRegistrationMonth,
-    transportUsed: Boolean(child && child.transportFromTadika === true),
-    transitUsage,
-    attendanceRows,
+    registrationDate,
+    yearlyFeeCoveredYear: child && Number.isFinite(Number(child.yearlyFeeCoveredYear))
+      ? Number(child.yearlyFeeCoveredYear)
+      : null,
     overtimeChargeOverride: closedOvertimeCharge.applied ? closedOvertimeCharge.overtime : null,
     manualOvertime: closedOvertimeCharge.applied ? null : manualOvertimeOverrideForChild(reqData, childId),
-    absenceAdjustment,
   });
 
-  let ageProfile = defaultAgeProfile;
-  if (baseCode === "transit_schoolholiday_month") {
-    const minAgeMonths = Number(feePolicy.schoolHolidayMonthly && feePolicy.schoolHolidayMonthly.minAgeMonths
-      ? feePolicy.schoolHolidayMonthly.minAgeMonths
-      : 48);
-    if (!Number.isFinite(Number(months))) {
-      ageProfile = {
-        ageBand,
-        ageOutOfPolicy: true,
-        agePolicyReason: "school_holiday_requires_known_age",
-      };
-    } else if (Number(months) < minAgeMonths) {
-      ageProfile = {
-        ageBand,
-        ageOutOfPolicy: true,
-        agePolicyReason: "school_holiday_requires_age_4_plus",
-      };
-    } else {
-      ageProfile = {
-        ageBand,
-        ageOutOfPolicy: false,
-        agePolicyReason: "school_holiday_age_allowed",
-      };
-    }
-  }
-
+  const monthlyFeeItem = (calculation.items || []).find((item) => String(item && item.code ? item.code : "") === "monthly_fee");
   const overtimeSummary = {
-    after530Hours: 0,
-    h8to12Hours: 0,
-    h12to7Hours: 0,
-    lateNightOccurrences: 0,
-    overnightOccurrences: 0,
+    weekdayHalfHourBlocks: Number(calculation.overtime && calculation.overtime.weekdayBlocks ? calculation.overtime.weekdayBlocks : 0),
+    saturdayHalfHourBlocks: Number(calculation.overtime && calculation.overtime.saturdayBlocks ? calculation.overtime.saturdayBlocks : 0),
     managementReviewRecommended: Boolean(calculation.overtime && calculation.overtime.managementReviewRecommended),
     totalSen: moneySen(calculation.overtime && calculation.overtime.totalSen),
     billedInPeriod: periodKey,
@@ -5536,48 +5867,31 @@ async function buildInvoiceItemsFromPdfPolicy({ parentId, childId, period, reqDa
     cycleEndDate: closedOvertimeCharge.cycleEnd ? attendanceDateKey(closedOvertimeCharge.cycleEnd) : "",
     partialRegistrationMonth: Boolean(closedOvertimeCharge.partialRegistrationMonth),
     attendanceRowCount: Number(closedOvertimeCharge.attendanceRowCount || 0),
-    cycleMode: closedOvertimeCharge.applied ? "previous-month-closed" : "same-period",
+    cycleMode: closedOvertimeCharge.applied ? "21-to-20-closed" : "same-period",
     breakdown: calculation.overtime && Array.isArray(calculation.overtime.breakdown)
       ? calculation.overtime.breakdown
       : [],
   };
-  for (const bucket of overtimeSummary.breakdown) {
-    const quantity = Number(bucket && bucket.quantity ? bucket.quantity : 0);
-    if (bucket && bucket.code === "overtime_after_530") {
-      overtimeSummary.after530Hours = quantity;
-    } else if (bucket && bucket.code === "overtime_8pm_12am") {
-      overtimeSummary.h8to12Hours = quantity;
-      overtimeSummary.lateNightOccurrences = Number(bucket.activeDayCount || 0);
-    } else if (bucket && bucket.code === "overtime_12am_7am") {
-      overtimeSummary.h12to7Hours = quantity;
-      overtimeSummary.overnightOccurrences = Number(bucket.activeDayCount || 0);
-    }
-  }
 
   const subTotalSen = moneySen(calculation.subTotalSen);
   const totalSen = moneySen(calculation.totalSen);
-  const dueDayRaw = child && Number.isFinite(Number(child.billingDueDay)) ? Number(child.billingDueDay) : 7;
-  const dueDay = dueDayRaw === 5 ? 5 : 7;
+  const dueDay = Number(feePolicy.invoiceSchedule && feePolicy.invoiceSchedule.dueDay ? feePolicy.invoiceSchedule.dueDay : 7);
   const dueDate = new Date(periodDate.getFullYear(), periodDate.getMonth(), dueDay, 23, 59, 59);
   const policyNotes = dedupePolicyNotes([
     isRegistrationMonth
-      ? "Bayaran pendaftaran dan bayaran ketika mendaftar tidak akan dikembalikan."
+      ? "Registration billing includes the registration fee, insurance or takaful, yearly maintenance fee, and the current month monthly fee."
       : null,
     closedOvertimeCharge.applied && overtimeSummary.totalSen > 0 && closedOvertimeCharge.sourcePeriodLabel
-      ? `Lebih masa bagi ${closedOvertimeCharge.sourcePeriodLabel} dimasukkan secara berasingan dalam invois ini selepas kitaran bulan tersebut ditutup.`
+      ? `Overtime from ${closedOvertimeCharge.sourcePeriodLabel} is billed separately in this invoice.`
       : null,
     closedOvertimeCharge.applied && overtimeSummary.totalSen > 0 && closedOvertimeCharge.partialRegistrationMonth && closedOvertimeCharge.cycleStart
-      ? `Kiraan lebih masa untuk ${closedOvertimeCharge.sourcePeriodLabel} bermula pada ${attendanceDateKey(closedOvertimeCharge.cycleStart)} mengikut tarikh pendaftaran.`
+      ? `The first overtime cycle started on ${attendanceDateKey(closedOvertimeCharge.cycleStart)} based on the registration date.`
       : null,
     ...(Array.isArray(calculation.policyNotes) ? calculation.policyNotes : []),
   ]);
 
-  if (ageProfile.agePolicyReason === "school_holiday_requires_age_4_plus") {
-    policyNotes.unshift("Transit penuh cuti sekolah hanya dibenarkan untuk umur 4 tahun ke atas.");
-  } else if (ageProfile.agePolicyReason === "school_holiday_requires_known_age") {
-    policyNotes.unshift("Tarikh lahir diperlukan untuk menggunakan transit penuh cuti sekolah.");
-  } else if (ageProfile.ageOutOfPolicy) {
-    policyNotes.unshift("Umur kanak-kanak berada di luar julat yuran PDF (3 bulan hingga bawah 4 tahun). Invois ini menggunakan kadar terdekat dan perlu disemak secara manual.");
+  if (ageProfile.ageOutOfPolicy) {
+    policyNotes.unshift("Child age is outside the supported Taska Zurah range. The invoice remains flagged for manual review.");
   }
 
   return {
@@ -5591,19 +5905,23 @@ async function buildInvoiceItemsFromPdfPolicy({ parentId, childId, period, reqDa
     dueDate,
     dueDay,
     meta: {
-      careType,
-      ageBand,
+      careType: "REGISTERED_CHILD",
+      ageBand: ageProfile.ageBand,
       months,
       registrationMonth: isRegistrationMonth,
-      transitUsage,
       policyNotes,
       managementReviewRecommended: Boolean(calculation.managementReviewRecommended || ageProfile.ageOutOfPolicy),
       overtime: overtimeSummary,
-      absenceAdjustment,
-      resolvedBaseCode: baseCode,
+      resolvedBaseCode: "monthly_fee",
       ageOutOfPolicy: Boolean(ageProfile.ageOutOfPolicy),
       agePolicyReason: ageProfile.agePolicyReason,
-      resolvedAgeBand: ageBand,
+      resolvedAgeBand: ageProfile.ageBand,
+      feePolicyVersion: String(calculation.feePolicyVersion || feePolicy.policyVersion || "TASKA_ZURAH_2026"),
+      activeBillingModel: String(calculation.activeBillingModel || feePolicy.activeBillingModel || "TASKA_ZURAH_AGE_BASED"),
+      yearlyFeeCoveredYear: Number.isFinite(Number(calculation.yearlyFeeCoveredYear)) ? Number(calculation.yearlyFeeCoveredYear) : null,
+      monthlyFeeSen: monthlyFeeItem ? moneySen(monthlyFeeItem.amountSen) : 0,
+      registrationDate: registrationDate ? registrationDate.toISOString() : "",
+      invoiceDueDay: dueDay,
     },
   };
 }

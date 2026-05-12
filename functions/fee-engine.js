@@ -1,112 +1,119 @@
 const DEFAULT_FEE_POLICY = Object.freeze({
+  policyVersion: "TASKA_ZURAH_2026",
+  activeBillingModel: "TASKA_ZURAH_AGE_BASED",
+  currency: "MYR",
+  supportedAgeMinMonths: 0,
+  supportedAgeMaxMonthsExclusive: 60,
   ageBands: {
-    BAND_A: {
-      key: "BAND_A",
-      codeSuffix: "3m_2y",
-      minMonths: 3,
+    BABY_TO_2: {
+      key: "BABY_TO_2",
+      codeSuffix: "BABY_TO_2",
+      label: "Baby to below 2 years",
+      minMonths: 0,
       maxMonthsExclusive: 24,
+      monthlyFeeCode: "monthly_fee_baby_to_2",
+      monthlyFeeSen: 75000,
     },
-    BAND_B: {
-      key: "BAND_B",
-      codeSuffix: "2y_4y",
+    AGE_2_TO_3: {
+      key: "AGE_2_TO_3",
+      codeSuffix: "AGE_2_TO_3",
+      label: "2 years to below 4 years",
       minMonths: 24,
       maxMonthsExclusive: 48,
+      monthlyFeeCode: "monthly_fee_age_2_to_3",
+      monthlyFeeSen: 70000,
+    },
+    AGE_4: {
+      key: "AGE_4",
+      codeSuffix: "AGE_4",
+      label: "4 years to below 5 years",
+      minMonths: 48,
+      maxMonthsExclusive: 60,
+      monthlyFeeCode: "monthly_fee_age_4",
+      monthlyFeeSen: 65000,
     },
   },
-  annualFeeMonth: 1,
-  absenceDiscountPercent: 10,
-  absenceDiscountMinDaysWithLetter: 14,
   registration: {
-    FULL_TIME: {
-      codeCandidates: ["registration_fulltime_oneoff"],
-      label: "Yuran Pendaftaran Sepenuh Masa",
-      unit: "oneoff",
-      policyKey: "registration.full_time",
-    },
-    MONTHLY_TRANSIT: {
-      codeCandidates: ["registration_transit_oneoff"],
-      label: "Yuran Pendaftaran Transit",
-      unit: "oneoff",
-      policyKey: "registration.monthly_transit",
-    },
-  },
-  annualFee: {
-    codeCandidates: ["annual_fee_yearly"],
-    label: "Yuran Tahunan",
-    unit: "year",
-    policyKey: "annual_fee.active_children_january",
-  },
-  communicationBook: {
-    codeCandidates: ["comms_book_oneoff", "comms_book_4months"],
-    label: "Buku Komunikasi",
+    code: "registration_fee",
+    label: "Registration Fee",
     unit: "oneoff",
-    policyKey: "communication_book.registration_only",
+    amountSen: 10000,
+    policyKey: "taska_zurah.registration_fee",
   },
   insurance: {
-    codeCandidates: ["insurance_oneoff_age2plus", "insurance_yearly_age2plus"],
-    label: "Insurans",
+    code: "insurance_takaful",
+    label: "Insurance / Takaful",
     unit: "oneoff",
-    minAgeMonths: 24,
-    policyKey: "insurance.registration_age_2_plus",
+    amountSen: 1500,
+    policyKey: "taska_zurah.insurance_takaful",
   },
-  transport: {
-    codeCandidates: ["transport_tadika_month", "transport_month"],
-    label: "Pengangkutan",
-    unit: "month",
-    eligibleCareModes: [
-      "FULL_TIME",
-      "TRANSIT_MONTHLY_HALF_DAY",
-      "TRANSIT_MONTHLY_2_HOURS",
-      "TRANSIT_MONTHLY_SCHOOL_HOLIDAY_FULL",
-    ],
-    policyKey: "transport.optional_monthly",
+  yearlyMaintenance: {
+    code: "yearly_maintenance_fee",
+    label: "Yearly Maintenance Fee",
+    unit: "year",
+    amountSen: 40000,
+    januaryChargeMonth: 1,
+    carryForwardRegistrationMonths: [11, 12],
+    policyKey: "taska_zurah.yearly_maintenance_fee",
   },
-  schoolHolidayMonthly: {
-    enabled: true,
-    minAgeMonths: 48,
-    policyKey: "transit.school_holiday_monthly",
+  invoiceSchedule: {
+    generationDay: 21,
+    dueDay: 7,
   },
-  overtime: {
-    roundingMode: "ROUND_UP_TO_NEXT_HOUR",
-    policyKey: "overtime.windows",
-    windows: [
-      {
-        code: "overtime_after_530",
-        label: "Lebih Masa Selepas 5:30 PM",
-        unit: "hour",
-        manualKey: "after530Hours",
-        startMinute: (17 * 60) + 30,
-        endMinute: 20 * 60,
-        managementReviewThresholdDays: 10,
-      },
-      {
-        code: "overtime_8pm_12am",
-        label: "Lebih Masa 8:00 PM - 12:00 AM",
-        unit: "hour",
-        manualKey: "h8to12Hours",
-        startMinute: 20 * 60,
-        endMinute: 24 * 60,
-        managementReviewThresholdDays: 10,
-      },
-    ],
+  overtimeCycle: {
+    startDay: 21,
+    endDay: 20,
+    policyKey: "taska_zurah.overtime_cycle",
+  },
+  operatingHours: {
+    weekday: {
+      dayKeys: [1, 2, 3, 4, 5],
+      label: "Weekday",
+      openingMinute: 7 * 60,
+      closingMinute: 19 * 60,
+      overtimeHalfHourRateCode: "overtime_weekday_half_hour",
+      overtimeHalfHourRateSen: 500,
+    },
+    saturday: {
+      dayKeys: [6],
+      label: "Saturday",
+      openingMinute: 7 * 60,
+      closingMinute: (14 * 60) + 30,
+      overtimeHalfHourRateCode: "overtime_saturday_half_hour",
+      overtimeHalfHourRateSen: 600,
+    },
+    sunday: {
+      dayKeys: [0],
+      label: "Sunday",
+      closed: true,
+    },
+  },
+  casualTransit: {
+    policyKey: "casual_transit.separate",
+    table: {
+      transit_1hour: { staff: 350, nonstaff: 400 },
+      transit_1day: { staff: 1500, nonstaff: 2000 },
+      transit_1week: { staff: 7000, nonstaff: 10000 },
+    },
   },
 });
 
 const CARE_MODE_ALIASES = Object.freeze({
-  FULL_TIME: "FULL_TIME",
-  full_time: "FULL_TIME",
-  fulltime: "FULL_TIME",
-  monthly_fulltime_3m_2y: "FULL_TIME",
-  monthly_fulltime_2y_4y: "FULL_TIME",
-  TRANSIT_MONTHLY_HALF_DAY: "TRANSIT_MONTHLY_HALF_DAY",
-  transit_monthly_half_day: "TRANSIT_MONTHLY_HALF_DAY",
-  transit_halfday_month: "TRANSIT_MONTHLY_HALF_DAY",
-  TRANSIT_MONTHLY_2_HOURS: "TRANSIT_MONTHLY_2_HOURS",
-  transit_monthly_2_hours: "TRANSIT_MONTHLY_2_HOURS",
-  transit_2h_month: "TRANSIT_MONTHLY_2_HOURS",
-  TRANSIT_MONTHLY_SCHOOL_HOLIDAY_FULL: "TRANSIT_MONTHLY_SCHOOL_HOLIDAY_FULL",
-  transit_monthly_school_holiday_full: "TRANSIT_MONTHLY_SCHOOL_HOLIDAY_FULL",
-  transit_schoolholiday_month: "TRANSIT_MONTHLY_SCHOOL_HOLIDAY_FULL",
+  REGISTERED_CHILD: "REGISTERED_CHILD",
+  FULL_TIME: "REGISTERED_CHILD",
+  full_time: "REGISTERED_CHILD",
+  fulltime: "REGISTERED_CHILD",
+  monthly: "REGISTERED_CHILD",
+  monthly_fulltime: "REGISTERED_CHILD",
+  monthly_fulltime_3m_2y: "REGISTERED_CHILD",
+  monthly_fulltime_2y_4y: "REGISTERED_CHILD",
+  transit: "REGISTERED_CHILD",
+  transit_monthly_half_day: "REGISTERED_CHILD",
+  transit_halfday_month: "REGISTERED_CHILD",
+  transit_monthly_2_hours: "REGISTERED_CHILD",
+  transit_2h_month: "REGISTERED_CHILD",
+  transit_monthly_school_holiday_full: "REGISTERED_CHILD",
+  transit_schoolholiday_month: "REGISTERED_CHILD",
   CASUAL_TRANSIT_1_HOUR: "CASUAL_TRANSIT_1_HOUR",
   casual_transit_1_hour: "CASUAL_TRANSIT_1_HOUR",
   transit_1hour: "CASUAL_TRANSIT_1_HOUR",
@@ -120,6 +127,8 @@ const CARE_MODE_ALIASES = Object.freeze({
   transit_1week: "CASUAL_TRANSIT_1_WEEK",
   "1 week": "CASUAL_TRANSIT_1_WEEK",
 });
+
+const MALAYSIA_UTC_OFFSET_MINUTES = 8 * 60;
 
 function deepClone(value) {
   if (Array.isArray(value)) {
@@ -149,9 +158,7 @@ function deepMerge(base, override) {
   }
 
   for (const [key, value] of Object.entries(override)) {
-    if (value === undefined) {
-      continue;
-    }
+    if (value === undefined) continue;
     if (Array.isArray(value)) {
       next[key] = value.map((entry) => deepClone(entry));
       continue;
@@ -173,6 +180,54 @@ function moneySen(raw) {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) return 0;
   return Math.round(parsed);
+}
+
+function sanitizeQuantity(rawQuantity) {
+  const parsed = Number(rawQuantity);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+  const rounded = Math.round(parsed * 100) / 100;
+  return rounded > 0 ? rounded : 0;
+}
+
+function buildLineItem({
+  code,
+  label,
+  description,
+  quantity,
+  unit,
+  unitAmountSen,
+  taxable = false,
+  notes = [],
+  policyKey = "",
+}) {
+  const safeCode = String(code || "").trim();
+  const safeLabel = String(label || description || safeCode || "Item").trim() || "Item";
+  const safeDescription = String(description || safeLabel).trim() || safeLabel;
+  const safeUnit = String(unit || "unit").trim() || "unit";
+  const safeQuantity = sanitizeQuantity(quantity);
+  const safeUnitAmountSen = moneySen(unitAmountSen);
+  const lineTotalSen = moneySen(safeQuantity * safeUnitAmountSen);
+  const normalizedNotes = (Array.isArray(notes) ? notes : [notes])
+    .map((note) => String(note || "").trim())
+    .filter(Boolean);
+
+  return {
+    code: safeCode,
+    label: safeLabel,
+    description: safeDescription,
+    quantity: safeQuantity,
+    qty: safeQuantity,
+    unit: safeUnit,
+    unitAmountSen: safeUnitAmountSen,
+    unitPriceSen: safeUnitAmountSen,
+    lineTotalSen,
+    amountSen: lineTotalSen,
+    taxable: taxable === true,
+    notes: normalizedNotes,
+    policyKey: String(policyKey || "").trim(),
+  };
 }
 
 function asDate(raw) {
@@ -197,9 +252,9 @@ function normalizePayerType(raw) {
 function normalizeCareMode(raw) {
   const normalized = String(raw || "").trim();
   if (!normalized) {
-    return "FULL_TIME";
+    return "REGISTERED_CHILD";
   }
-  return CARE_MODE_ALIASES[normalized] || CARE_MODE_ALIASES[normalized.toLowerCase()] || normalized;
+  return CARE_MODE_ALIASES[normalized] || CARE_MODE_ALIASES[normalized.toLowerCase()] || "REGISTERED_CHILD";
 }
 
 function rowMap(table) {
@@ -229,54 +284,6 @@ function lookupPrice({ table, codeCandidates, payerType }) {
   return null;
 }
 
-function sanitizeQuantity(rawQuantity) {
-  const parsed = Number(rawQuantity);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return 0;
-  }
-  const rounded = Math.round(parsed * 100) / 100;
-  return rounded > 0 ? rounded : 0;
-}
-
-function buildLineItem({
-  code,
-  label,
-  quantity,
-  unit,
-  unitAmountSen,
-  taxable = false,
-  notes = [],
-  policyKey = "",
-}) {
-  const safeCode = String(code || "").trim();
-  const safeLabel = String(label || safeCode || "Item").trim() || "Item";
-  const safeUnit = String(unit || "unit").trim() || "unit";
-  const safeQuantity = sanitizeQuantity(quantity);
-  const safeUnitAmountSen = moneySen(unitAmountSen);
-  const lineTotalSen = moneySen(safeUnitAmountSen * safeQuantity);
-  const normalizedNotes = (Array.isArray(notes) ? notes : [notes])
-    .map((note) => String(note || "").trim())
-    .filter(Boolean);
-
-  return {
-    code: safeCode,
-    label: safeLabel,
-    description: safeLabel,
-    quantity: safeQuantity,
-    qty: safeQuantity,
-    unit: safeUnit,
-    unitAmountSen: safeUnitAmountSen,
-    unitPriceSen: safeUnitAmountSen,
-    lineTotalSen,
-    amountSen: lineTotalSen,
-    taxable: taxable === true,
-    notes: normalizedNotes,
-    policyKey: String(policyKey || "").trim(),
-  };
-}
-
-const MALAYSIA_UTC_OFFSET_MINUTES = 8 * 60;
-
 function malaysiaShift(date) {
   return new Date(date.getTime() + (MALAYSIA_UTC_OFFSET_MINUTES * 60 * 1000));
 }
@@ -289,6 +296,7 @@ function malaysiaDateParts(date) {
     day: shifted.getUTCDate(),
     hour: shifted.getUTCHours(),
     minute: shifted.getUTCMinutes(),
+    dayOfWeek: shifted.getUTCDay(),
   };
 }
 
@@ -301,398 +309,587 @@ function malaysiaSameDayAt(date, hour, minute = 0) {
   return malaysiaLocalDate(parts.year, parts.month, parts.day, hour, minute, 0, 0);
 }
 
+function malaysiaDateKey(date) {
+  const parts = malaysiaDateParts(date);
+  return `${parts.year}-${String(parts.month + 1).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+}
+
+function startOfMalaysiaDay(date) {
+  const parts = malaysiaDateParts(date);
+  return malaysiaLocalDate(parts.year, parts.month, parts.day, 0, 0, 0, 0);
+}
+
+function periodDateFromKey(periodKey) {
+  const match = String(periodKey || "").trim().match(/^(\d{4})-(\d{2})$/);
+  if (!match) return null;
+  return malaysiaLocalDate(Number(match[1]), Number(match[2]) - 1, 1, 0, 0, 0, 0);
+}
+
+function shiftPeriodKey(periodKey, monthOffset) {
+  const base = periodDateFromKey(periodKey);
+  if (!base) return "";
+  const parts = malaysiaDateParts(base);
+  const shifted = malaysiaLocalDate(parts.year, parts.month + Number(monthOffset || 0), 1, 0, 0, 0, 0);
+  const shiftedParts = malaysiaDateParts(shifted);
+  return `${shiftedParts.year}-${String(shiftedParts.month + 1).padStart(2, "0")}`;
+}
+
+function resolveDateInput(value, fallback = null) {
+  const direct = asDate(value);
+  return direct || fallback;
+}
+
 function dedupeNotes(notes) {
   const seen = new Set();
   const out = [];
   for (const note of notes || []) {
-    const value = String(note || "").trim();
-    if (!value || seen.has(value)) continue;
-    seen.add(value);
-    out.push(value);
+    const text = String(note || "").trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
   }
   return out;
+}
+
+function monthlyFeeCodeForAgeBand(ageBand) {
+  return ageBand && ageBand.monthlyFeeCode ? String(ageBand.monthlyFeeCode) : "monthly_fee_age_4";
 }
 
 function determineAgeBand(ageMonths, rawPolicy = DEFAULT_FEE_POLICY) {
   const policy = resolveFeePolicy(rawPolicy);
   const parsedMonths = Number(ageMonths);
-  const bandA = policy.ageBands && policy.ageBands.BAND_A ? policy.ageBands.BAND_A : DEFAULT_FEE_POLICY.ageBands.BAND_A;
-  const bandB = policy.ageBands && policy.ageBands.BAND_B ? policy.ageBands.BAND_B : DEFAULT_FEE_POLICY.ageBands.BAND_B;
+  const bands = Object.values(policy.ageBands || DEFAULT_FEE_POLICY.ageBands)
+    .sort((left, right) => Number(left.minMonths || 0) - Number(right.minMonths || 0));
+  const firstBand = bands[0] || DEFAULT_FEE_POLICY.ageBands.BABY_TO_2;
+  const lastBand = bands[bands.length - 1] || DEFAULT_FEE_POLICY.ageBands.AGE_4;
 
   if (!Number.isFinite(parsedMonths)) {
     return {
-      bandKey: bandB.key,
-      codeSuffix: bandB.codeSuffix,
+      bandKey: lastBand.key,
+      codeSuffix: lastBand.codeSuffix,
+      label: lastBand.label,
+      monthlyFeeCode: lastBand.monthlyFeeCode,
+      monthlyFeeSen: moneySen(lastBand.monthlyFeeSen),
+      ageMonths: null,
       ageOutOfPolicy: true,
       agePolicyReason: "missing_birth_date",
-      ageMonths: null,
     };
   }
 
-  if (parsedMonths < bandA.minMonths) {
+  for (const band of bands) {
+    const minMonths = Number(band.minMonths || 0);
+    const maxMonthsExclusive = Number(band.maxMonthsExclusive || policy.supportedAgeMaxMonthsExclusive || 60);
+    if (parsedMonths >= minMonths && parsedMonths < maxMonthsExclusive) {
+      return {
+        bandKey: band.key,
+        codeSuffix: band.codeSuffix,
+        label: band.label,
+        monthlyFeeCode: band.monthlyFeeCode,
+        monthlyFeeSen: moneySen(band.monthlyFeeSen),
+        ageMonths: parsedMonths,
+        ageOutOfPolicy: false,
+        agePolicyReason: "in_range",
+      };
+    }
+  }
+
+  if (parsedMonths < Number(firstBand.minMonths || 0)) {
     return {
-      bandKey: bandA.key,
-      codeSuffix: bandA.codeSuffix,
+      bandKey: firstBand.key,
+      codeSuffix: firstBand.codeSuffix,
+      label: firstBand.label,
+      monthlyFeeCode: firstBand.monthlyFeeCode,
+      monthlyFeeSen: moneySen(firstBand.monthlyFeeSen),
+      ageMonths: parsedMonths,
       ageOutOfPolicy: true,
-      agePolicyReason: "under_3_months",
-      ageMonths: parsedMonths,
-    };
-  }
-
-  if (parsedMonths < bandA.maxMonthsExclusive) {
-    return {
-      bandKey: bandA.key,
-      codeSuffix: bandA.codeSuffix,
-      ageOutOfPolicy: false,
-      agePolicyReason: "in_range",
-      ageMonths: parsedMonths,
-    };
-  }
-
-  if (parsedMonths < bandB.maxMonthsExclusive) {
-    return {
-      bandKey: bandB.key,
-      codeSuffix: bandB.codeSuffix,
-      ageOutOfPolicy: false,
-      agePolicyReason: "in_range",
-      ageMonths: parsedMonths,
+      agePolicyReason: "age_below_supported_range",
     };
   }
 
   return {
-    bandKey: bandB.key,
-    codeSuffix: bandB.codeSuffix,
-    ageOutOfPolicy: true,
-    agePolicyReason: "age_4y_or_above",
+    bandKey: lastBand.key,
+    codeSuffix: lastBand.codeSuffix,
+    label: lastBand.label,
+    monthlyFeeCode: lastBand.monthlyFeeCode,
+    monthlyFeeSen: moneySen(lastBand.monthlyFeeSen),
     ageMonths: parsedMonths,
+    ageOutOfPolicy: true,
+    agePolicyReason: "age_5_or_above",
   };
 }
 
 function isJanuaryInvoice({ periodKey, periodDate, policy = DEFAULT_FEE_POLICY }) {
   const resolvedPolicy = resolveFeePolicy(policy);
-  const monthMatch = String(periodKey || "").match(/^\d{4}-(\d{2})$/);
-  if (monthMatch) {
-    return Number(monthMatch[1]) === Number(resolvedPolicy.annualFeeMonth || 1);
+  const januaryMonth = Number(resolvedPolicy.yearlyMaintenance && resolvedPolicy.yearlyMaintenance.januaryChargeMonth
+    ? resolvedPolicy.yearlyMaintenance.januaryChargeMonth
+    : 1);
+  const byKey = String(periodKey || "").match(/^\d{4}-(\d{2})$/);
+  if (byKey) {
+    return Number(byKey[1]) === januaryMonth;
   }
-  if (periodDate instanceof Date && !Number.isNaN(periodDate.getTime())) {
-    return (periodDate.getMonth() + 1) === Number(resolvedPolicy.annualFeeMonth || 1);
-  }
-  return false;
+  const dt = asDate(periodDate);
+  if (!dt) return false;
+  return (malaysiaDateParts(dt).month + 1) === januaryMonth;
 }
 
-function isRegisteredCareMode(careMode) {
-  return !String(normalizeCareMode(careMode)).startsWith("CASUAL_TRANSIT_");
-}
-
-function isInsuranceApplicable({ ageMonths, careMode, isRegistrationMonth, policy = DEFAULT_FEE_POLICY }) {
+function determineYearlyFeeCoveredYear(registrationDate, policy = DEFAULT_FEE_POLICY) {
   const resolvedPolicy = resolveFeePolicy(policy);
-  const parsedAge = Number(ageMonths);
-  return Boolean(isRegistrationMonth)
-    && isRegisteredCareMode(careMode)
-    && Number.isFinite(parsedAge)
-    && parsedAge >= Number(resolvedPolicy.insurance && resolvedPolicy.insurance.minAgeMonths ? resolvedPolicy.insurance.minAgeMonths : 24);
+  const dt = asDate(registrationDate);
+  if (!dt) return null;
+  const parts = malaysiaDateParts(dt);
+  const month = parts.month + 1;
+  const carryForwardMonths = Array.isArray(resolvedPolicy.yearlyMaintenance && resolvedPolicy.yearlyMaintenance.carryForwardRegistrationMonths)
+    ? resolvedPolicy.yearlyMaintenance.carryForwardRegistrationMonths.map((value) => Number(value))
+    : [11, 12];
+  return carryForwardMonths.includes(month) ? parts.year + 1 : parts.year;
 }
 
-function isTransportEligible({ careMode, policy = DEFAULT_FEE_POLICY }) {
+function shouldChargeYearlyMaintenance({ invoiceMonth, registrationDate, yearlyFeeCoveredYear, policy = DEFAULT_FEE_POLICY }) {
   const resolvedPolicy = resolveFeePolicy(policy);
-  const normalizedCareMode = normalizeCareMode(careMode);
-  const eligibleCareModes = Array.isArray(resolvedPolicy.transport && resolvedPolicy.transport.eligibleCareModes)
-    ? resolvedPolicy.transport.eligibleCareModes.map((entry) => normalizeCareMode(entry))
-    : DEFAULT_FEE_POLICY.transport.eligibleCareModes;
-  return eligibleCareModes.includes(normalizedCareMode);
+  const invoiceDate = resolveDateInput(invoiceMonth);
+  if (!invoiceDate) return false;
+  if (!isJanuaryInvoice({ periodDate: invoiceDate, policy: resolvedPolicy })) {
+    return false;
+  }
+
+  const invoiceYear = malaysiaDateParts(invoiceDate).year;
+  const coveredYear = Number.isFinite(Number(yearlyFeeCoveredYear))
+    ? Number(yearlyFeeCoveredYear)
+    : determineYearlyFeeCoveredYear(registrationDate, resolvedPolicy);
+  if (!Number.isFinite(coveredYear)) {
+    return true;
+  }
+  return invoiceYear > coveredYear;
 }
 
-function baseCodeForCareMode({ careMode, ageBand }) {
-  const normalizedCareMode = normalizeCareMode(careMode);
-  if (normalizedCareMode === "FULL_TIME") {
-    return ageBand && ageBand.codeSuffix === "3m_2y"
-      ? "monthly_fulltime_3m_2y"
-      : "monthly_fulltime_2y_4y";
-  }
-  if (normalizedCareMode === "TRANSIT_MONTHLY_HALF_DAY") return "transit_halfday_month";
-  if (normalizedCareMode === "TRANSIT_MONTHLY_2_HOURS") return "transit_2h_month";
-  if (normalizedCareMode === "TRANSIT_MONTHLY_SCHOOL_HOLIDAY_FULL") return "transit_schoolholiday_month";
-  if (normalizedCareMode === "CASUAL_TRANSIT_1_HOUR") return "transit_1hour";
-  if (normalizedCareMode === "CASUAL_TRANSIT_1_DAY") return "transit_1day";
-  if (normalizedCareMode === "CASUAL_TRANSIT_1_WEEK") return "transit_1week";
-  return String(careMode || "").trim();
+function configuredAmount({ table, payerType, code, fallbackSen }) {
+  const lookedUp = lookupPrice({ table, codeCandidates: [code], payerType });
+  return {
+    code: String(code || "").trim(),
+    unitAmountSen: lookedUp ? moneySen(lookedUp.unitAmountSen) : moneySen(fallbackSen),
+    sourceCode: lookedUp ? lookedUp.code : String(code || "").trim(),
+  };
 }
 
-function inferRegistrationType({ baseCode, careMode }) {
-  const normalizedCareMode = normalizeCareMode(careMode || baseCode);
-  return normalizedCareMode === "FULL_TIME" ? "FULL_TIME" : "MONTHLY_TRANSIT";
+function calculateMonthlyFee({ ageMonths, payerType, table, policy = DEFAULT_FEE_POLICY }) {
+  const resolvedPolicy = resolveFeePolicy(policy);
+  const ageBand = determineAgeBand(ageMonths, resolvedPolicy);
+  const amount = configuredAmount({
+    table,
+    payerType,
+    code: monthlyFeeCodeForAgeBand(ageBand),
+    fallbackSen: ageBand.monthlyFeeSen,
+  });
+
+  return {
+    ageBand,
+    monthlyFeeCode: monthlyFeeCodeForAgeBand(ageBand),
+    monthlyFeeSen: moneySen(amount.unitAmountSen),
+  };
 }
 
-function registeredBaseLabel(baseCode) {
-  switch (String(baseCode || "").trim()) {
-    case "monthly_fulltime_3m_2y":
-    case "monthly_fulltime_2y_4y":
-      return "Yuran Asas Bulanan";
-    case "transit_halfday_month":
-      return "Transit 1/2 Hari (Bulanan)";
-    case "transit_2h_month":
-      return "Transit 2 Jam (Bulanan)";
-    case "transit_schoolholiday_month":
-      return "Transit Penuh Cuti Sekolah (Bulanan)";
-    case "transit_1day":
-      return "Transit 1 Hari";
-    case "transit_1week":
-      return "Transit 1 Minggu";
-    case "transit_1hour":
-      return "Transit 1 Jam";
-    default:
-      return "Yuran";
-  }
-}
-
-function buildBaseFeeItem({ baseCode, payerType, table, transitUsage }) {
-  const price = lookupPrice({ table, codeCandidates: [baseCode], payerType });
-  if (!price) return null;
-
-  if (baseCode === "transit_1day") {
-    const quantity = sanitizeQuantity(transitUsage && transitUsage.dayCount ? transitUsage.dayCount : 0);
-    if (quantity <= 0) return null;
-    return buildLineItem({
-      code: price.code,
-      label: registeredBaseLabel(baseCode),
-      quantity,
-      unit: "day",
-      unitAmountSen: price.unitAmountSen,
-      taxable: false,
-      policyKey: "base.transit_1day",
-    });
-  }
-
-  if (baseCode === "transit_1week") {
-    const quantity = sanitizeQuantity(transitUsage && transitUsage.weekCount ? transitUsage.weekCount : 0);
-    if (quantity <= 0) return null;
-    return buildLineItem({
-      code: price.code,
-      label: registeredBaseLabel(baseCode),
-      quantity,
-      unit: "week",
-      unitAmountSen: price.unitAmountSen,
-      taxable: false,
-      policyKey: "base.transit_1week",
-    });
-  }
-
-  if (baseCode === "transit_1hour") {
-    const quantity = sanitizeQuantity(transitUsage && transitUsage.hourCount ? transitUsage.hourCount : 0);
-    if (quantity <= 0) return null;
-    return buildLineItem({
-      code: price.code,
-      label: registeredBaseLabel(baseCode),
-      quantity,
-      unit: "hour",
-      unitAmountSen: price.unitAmountSen,
-      taxable: false,
-      policyKey: "base.transit_1hour",
-    });
-  }
-
+function registeredMonthlyFeeItem({ ageBand, monthlyFeeSen, policy = DEFAULT_FEE_POLICY }) {
+  const resolvedPolicy = resolveFeePolicy(policy);
   return buildLineItem({
-    code: price.code,
-    label: registeredBaseLabel(baseCode),
+    code: "monthly_fee",
+    label: "Monthly Fee",
+    description: `Monthly Fee (${String(ageBand && ageBand.label ? ageBand.label : "Registered Child").trim()})`,
     quantity: 1,
     unit: "month",
-    unitAmountSen: price.unitAmountSen,
+    unitAmountSen: monthlyFeeSen,
     taxable: false,
-    policyKey: `base.${baseCode}`,
+    policyKey: `${resolvedPolicy.activeBillingModel}.monthly_fee.${String(ageBand && ageBand.codeSuffix ? ageBand.codeSuffix : "UNKNOWN")}`,
   });
 }
 
-function startOfLocalDay(date) {
-  const parts = malaysiaDateParts(date);
-  return malaysiaLocalDate(parts.year, parts.month, parts.day, 0, 0, 0, 0);
+function isInsuranceApplicable({ isRegistrationMonth }) {
+  return Boolean(isRegistrationMonth);
 }
 
-function addMinutes(date, minuteOffset) {
-  return new Date(date.getTime() + (minuteOffset * 60 * 1000));
-}
-
-function dayKey(date) {
-  const parts = malaysiaDateParts(date);
-  return `${parts.year}-${String(parts.month + 1).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
-}
-
-function minutesBetween(start, end) {
-  const value = (end.getTime() - start.getTime()) / 60000;
-  return value > 0 ? value : 0;
-}
-
-function overlapMinutes(intervalStart, intervalEnd, windowStart, windowEnd) {
-  const start = intervalStart.getTime() > windowStart.getTime() ? intervalStart : windowStart;
-  const end = intervalEnd.getTime() < windowEnd.getTime() ? intervalEnd : windowEnd;
-  return end.getTime() > start.getTime() ? minutesBetween(start, end) : 0;
-}
-
-function windowRangeForDay(dayStart, window) {
-  const startMinute = Number(window.startMinute || 0);
-  const endMinute = Number(window.endMinute || 0);
-  const start = addMinutes(dayStart, startMinute);
-  const sameDayEnd = endMinute > startMinute ? addMinutes(dayStart, endMinute) : addMinutes(dayStart, endMinute + (24 * 60));
-  return { start, end: sameDayEnd };
-}
-
-function roundHours(minutes, roundingMode) {
-  if (!Number.isFinite(minutes) || minutes <= 0) return 0;
-  const hours = minutes / 60;
-  if (String(roundingMode || "").trim().toUpperCase() === "PRO_RATE_BY_MINUTE") {
-    return Math.round(hours * 100) / 100;
-  }
-  return Math.ceil(hours);
-}
-
-function aggregateOvertimeFromIntervals({ intervals, policy = DEFAULT_FEE_POLICY }) {
+function getOperatingHoursForDate(date, policy = DEFAULT_FEE_POLICY) {
   const resolvedPolicy = resolveFeePolicy(policy);
-  const windows = Array.isArray(resolvedPolicy.overtime && resolvedPolicy.overtime.windows)
-    ? resolvedPolicy.overtime.windows
-    : [];
-  const aggregates = new Map();
-  for (const window of windows) {
-    aggregates.set(window.code, {
-      window,
-      totalMinutes: 0,
-      activeDayKeys: new Set(),
-      dailyBreakdown: [],
-    });
+  const dt = asDate(date);
+  if (!dt) {
+    return {
+      dayType: "UNKNOWN",
+      dayOfWeek: null,
+      isWorkingDay: false,
+      openingMinute: null,
+      closingMinute: null,
+      overtimeHalfHourRateSen: 0,
+      overtimeHalfHourRateCode: "",
+      label: "Unknown",
+      closedMessage: "Taska is closed today",
+    };
   }
 
-  for (const interval of intervals || []) {
-    const rawEnd = interval && interval.end instanceof Date ? interval.end : null;
-    if (!rawEnd || Number.isNaN(rawEnd.getTime())) continue;
-    const rawStart = interval && interval.start instanceof Date && !Number.isNaN(interval.start.getTime())
-      ? interval.start
-      : malaysiaSameDayAt(rawEnd, 17, 30);
-    if (rawEnd.getTime() <= rawStart.getTime()) continue;
+  const parts = malaysiaDateParts(dt);
+  const dayOfWeek = parts.dayOfWeek;
+  const { weekday, saturday, sunday } = resolvedPolicy.operatingHours || DEFAULT_FEE_POLICY.operatingHours;
 
-    let dayCursor = startOfLocalDay(rawStart);
-    const finalDay = startOfLocalDay(rawEnd);
-
-    while (dayCursor.getTime() <= finalDay.getTime()) {
-      for (const window of windows) {
-        const bucket = aggregates.get(window.code);
-        if (!bucket) continue;
-        const range = windowRangeForDay(dayCursor, window);
-        const minutes = overlapMinutes(rawStart, rawEnd, range.start, range.end);
-        if (minutes <= 0) continue;
-        bucket.totalMinutes += minutes;
-        bucket.activeDayKeys.add(dayKey(dayCursor));
-        bucket.dailyBreakdown.push({
-          dateKey: dayKey(dayCursor),
-          code: window.code,
-          label: String(window.label || window.code || "").trim(),
-          minutes: Math.round(minutes),
-        });
-      }
-      dayCursor = addMinutes(dayCursor, 24 * 60);
-    }
+  if (Array.isArray(weekday.dayKeys) && weekday.dayKeys.includes(dayOfWeek)) {
+    return {
+      dayType: "WEEKDAY",
+      dayOfWeek,
+      isWorkingDay: true,
+      openingMinute: Number(weekday.openingMinute),
+      closingMinute: Number(weekday.closingMinute),
+      overtimeHalfHourRateSen: moneySen(weekday.overtimeHalfHourRateSen),
+      overtimeHalfHourRateCode: String(weekday.overtimeHalfHourRateCode || ""),
+      label: String(weekday.label || "Weekday"),
+      closedMessage: "",
+    };
   }
 
-  const overtimeRows = [];
-  for (const value of aggregates.values()) {
-    overtimeRows.push({
-      code: value.window.code,
-      label: value.window.label,
-      unit: value.window.unit || "hour",
-      manualKey: value.window.manualKey,
-      totalMinutes: Math.round(value.totalMinutes),
-      activeDayCount: value.activeDayKeys.size,
-      managementReviewThresholdDays: Number(value.window.managementReviewThresholdDays || 0),
-      dailyBreakdown: value.dailyBreakdown,
-    });
+  if (Array.isArray(saturday.dayKeys) && saturday.dayKeys.includes(dayOfWeek)) {
+    return {
+      dayType: "SATURDAY",
+      dayOfWeek,
+      isWorkingDay: true,
+      openingMinute: Number(saturday.openingMinute),
+      closingMinute: Number(saturday.closingMinute),
+      overtimeHalfHourRateSen: moneySen(saturday.overtimeHalfHourRateSen),
+      overtimeHalfHourRateCode: String(saturday.overtimeHalfHourRateCode || ""),
+      label: String(saturday.label || "Saturday"),
+      closedMessage: "",
+    };
   }
-  return overtimeRows;
-}
 
-function overtimeLineItemsFromManual({ manualOvertime, payerType, table, policy = DEFAULT_FEE_POLICY }) {
-  const resolvedPolicy = resolveFeePolicy(policy);
-  const windows = Array.isArray(resolvedPolicy.overtime && resolvedPolicy.overtime.windows)
-    ? resolvedPolicy.overtime.windows
-    : [];
-  const items = [];
-  const breakdown = [];
-  let totalSen = 0;
-  for (const window of windows) {
-    const quantity = sanitizeQuantity(manualOvertime && Object.prototype.hasOwnProperty.call(manualOvertime, window.manualKey)
-      ? manualOvertime[window.manualKey]
-      : 0);
-    if (quantity <= 0) continue;
-    const price = lookupPrice({ table, codeCandidates: [window.code], payerType });
-    if (!price) continue;
-    const lineItem = buildLineItem({
-      code: price.code,
-      label: String(window.label || window.code || "Overtime").trim(),
-      quantity,
-      unit: window.unit || "hour",
-      unitAmountSen: price.unitAmountSen,
-      taxable: false,
-      notes: ["Manual overtime override"],
-      policyKey: `${resolvedPolicy.overtime.policyKey}.${window.code}`,
-    });
-    items.push(lineItem);
-    totalSen += moneySen(lineItem.amountSen);
-    breakdown.push({
-      code: window.code,
-      quantity,
-      totalMinutes: Math.round(quantity * 60),
-      activeDayCount: 0,
-      dailyBreakdown: [],
-    });
-  }
   return {
-    items,
-    totalSen: moneySen(totalSen),
-    breakdown,
+    dayType: "SUNDAY",
+    dayOfWeek,
+    isWorkingDay: false,
+    openingMinute: null,
+    closingMinute: null,
+    overtimeHalfHourRateSen: 0,
+    overtimeHalfHourRateCode: "",
+    label: String(sunday && sunday.label ? sunday.label : "Sunday"),
+    closedMessage: "Taska is closed today",
+  };
+}
+
+function minutesSinceMidnightMalaysia(date) {
+  const parts = malaysiaDateParts(date);
+  return (parts.hour * 60) + parts.minute;
+}
+
+function isWorkingDay(date, policy = DEFAULT_FEE_POLICY) {
+  return getOperatingHoursForDate(date, policy).isWorkingDay;
+}
+
+function isWithinCheckInWindow(dateTime, policy = DEFAULT_FEE_POLICY) {
+  const dt = asDate(dateTime);
+  if (!dt) return false;
+  const schedule = getOperatingHoursForDate(dt, policy);
+  if (!schedule.isWorkingDay) return false;
+  const minuteOfDay = minutesSinceMidnightMalaysia(dt);
+  return minuteOfDay >= schedule.openingMinute && minuteOfDay <= schedule.closingMinute;
+}
+
+function canCheckIn(dateTime, policy = DEFAULT_FEE_POLICY) {
+  const dt = asDate(dateTime);
+  if (!dt) {
+    return { ok: false, reason: "invalid-date", message: "Invalid attendance time" };
+  }
+  const schedule = getOperatingHoursForDate(dt, policy);
+  if (!schedule.isWorkingDay) {
+    return { ok: false, reason: "taska-closed", message: "Taska is closed today" };
+  }
+  if (!isWithinCheckInWindow(dt, policy)) {
+    return { ok: false, reason: "outside-working-hours", message: "Outside working hours" };
+  }
+  return { ok: true, reason: "", message: "" };
+}
+
+function canCheckOut(dateTime) {
+  const dt = asDate(dateTime);
+  if (!dt) {
+    return { ok: false, reason: "invalid-date", message: "Invalid attendance time" };
+  }
+  return { ok: true, reason: "", message: "" };
+}
+
+function determineOvertimeCycleForInvoice({ invoiceMonth, registrationDate, policy = DEFAULT_FEE_POLICY }) {
+  const resolvedPolicy = resolveFeePolicy(policy);
+  const invoiceDate = resolveDateInput(invoiceMonth);
+  if (!invoiceDate) {
+    return {
+      applies: false,
+      cycleStart: null,
+      cycleEnd: null,
+      cycleStartDateKey: "",
+      cycleEndDateKey: "",
+    };
+  }
+
+  const invoiceParts = malaysiaDateParts(invoiceDate);
+  const cycleEnd = malaysiaLocalDate(
+    invoiceParts.year,
+    invoiceParts.month - 1,
+    Number(resolvedPolicy.overtimeCycle.endDay || 20),
+    23,
+    59,
+    59,
+    999,
+  );
+  const normalCycleStart = malaysiaLocalDate(
+    invoiceParts.year,
+    invoiceParts.month - 2,
+    Number(resolvedPolicy.overtimeCycle.startDay || 21),
+    0,
+    0,
+    0,
+    0,
+  );
+
+  const registrationDt = asDate(registrationDate);
+  if (!registrationDt) {
+    return {
+      applies: true,
+      cycleStart: normalCycleStart,
+      cycleEnd,
+      cycleStartDateKey: malaysiaDateKey(normalCycleStart),
+      cycleEndDateKey: malaysiaDateKey(cycleEnd),
+      partialRegistrationMonth: false,
+    };
+  }
+
+  if (registrationDt.getTime() > cycleEnd.getTime()) {
+    return {
+      applies: false,
+      cycleStart: null,
+      cycleEnd,
+      cycleStartDateKey: "",
+      cycleEndDateKey: malaysiaDateKey(cycleEnd),
+      partialRegistrationMonth: false,
+    };
+  }
+
+  const cycleStart = registrationDt.getTime() > normalCycleStart.getTime()
+    ? startOfMalaysiaDay(registrationDt)
+    : normalCycleStart;
+
+  return {
+    applies: true,
+    cycleStart,
+    cycleEnd,
+    cycleStartDateKey: malaysiaDateKey(cycleStart),
+    cycleEndDateKey: malaysiaDateKey(cycleEnd),
+    partialRegistrationMonth: cycleStart.getTime() !== normalCycleStart.getTime(),
+  };
+}
+
+function attendanceAnchorDate(attendanceRecord) {
+  return asDate(attendanceRecord && (
+    attendanceRecord.date
+    || attendanceRecord.checkInAt
+    || attendanceRecord.check_in_time
+    || attendanceRecord.checkInTime
+    || attendanceRecord.checkinTime
+    || attendanceRecord.checkOutAt
+    || attendanceRecord.check_out_time
+    || attendanceRecord.checkOutTime
+    || attendanceRecord.checkoutTime
+  ));
+}
+
+function calculateOvertimeForAttendance(attendanceRecord, policy = DEFAULT_FEE_POLICY) {
+  const resolvedPolicy = resolveFeePolicy(policy);
+  const checkOutAt = asDate(attendanceRecord && (
+    attendanceRecord.checkOutAt
+    || attendanceRecord.check_out_time
+    || attendanceRecord.checkOutTime
+    || attendanceRecord.checkoutTime
+  ));
+  const anchor = attendanceAnchorDate(attendanceRecord) || checkOutAt;
+
+  if (!checkOutAt || !anchor) {
+    return {
+      applies: false,
+      blocks: 0,
+      minutes: 0,
+      totalSen: 0,
+      rateSen: 0,
+      dayType: "UNKNOWN",
+      dateKey: "",
+    };
+  }
+
+  const schedule = getOperatingHoursForDate(anchor, resolvedPolicy);
+  if (!schedule.isWorkingDay || !Number.isFinite(schedule.closingMinute)) {
+    return {
+      applies: false,
+      blocks: 0,
+      minutes: 0,
+      totalSen: 0,
+      rateSen: 0,
+      dayType: schedule.dayType,
+      dateKey: malaysiaDateKey(anchor),
+      reason: schedule.isWorkingDay ? "missing-closing-time" : "taska-closed",
+    };
+  }
+
+  const closingHour = Math.floor(schedule.closingMinute / 60);
+  const closingMinute = schedule.closingMinute % 60;
+  const closingDate = malaysiaSameDayAt(anchor, closingHour, closingMinute);
+  const overtimeMinutes = Math.max(0, Math.ceil((checkOutAt.getTime() - closingDate.getTime()) / 60000));
+  const blocks = overtimeMinutes <= 0 ? 0 : Math.ceil(overtimeMinutes / 30);
+  const totalSen = moneySen(blocks * moneySen(schedule.overtimeHalfHourRateSen));
+
+  return {
+    applies: blocks > 0,
+    blocks,
+    minutes: blocks > 0 ? blocks * 30 : 0,
+    rawMinutes: overtimeMinutes,
+    totalSen,
+    rateSen: moneySen(schedule.overtimeHalfHourRateSen),
+    dayType: schedule.dayType,
+    dateKey: malaysiaDateKey(anchor),
+    closingMinute: schedule.closingMinute,
+    closingTimeLabel: `${String(closingHour).padStart(2, "0")}:${String(closingMinute).padStart(2, "0")}`,
+    overtimeHalfHourRateCode: schedule.overtimeHalfHourRateCode,
+  };
+}
+
+function manualOvertimeCharge(manualOvertime, policy = DEFAULT_FEE_POLICY) {
+  const resolvedPolicy = resolveFeePolicy(policy);
+  if (!manualOvertime || typeof manualOvertime !== "object") {
+    return null;
+  }
+
+  if (Number.isFinite(Number(manualOvertime.totalSen))) {
+    const totalSen = moneySen(manualOvertime.totalSen);
+    return {
+      items: totalSen > 0
+        ? [buildLineItem({
+          code: "overtime_charge",
+          label: "Overtime Charge",
+          description: "Overtime Charge",
+          quantity: 1,
+          unit: "invoice",
+          unitAmountSen: totalSen,
+          taxable: false,
+          notes: ["Manual overtime override"],
+          policyKey: `${resolvedPolicy.activeBillingModel}.overtime_charge.manual`,
+        })]
+        : [],
+      totalSen,
+      breakdown: [],
+      weekdayBlocks: 0,
+      saturdayBlocks: 0,
+      managementReviewRecommended: false,
+    };
+  }
+
+  const weekdayBlocks = Math.max(
+    0,
+    Number(manualOvertime.weekdayHalfHourBlocks || 0)
+      || Math.ceil(Number(manualOvertime.weekdayHours || 0) * 2)
+      || Math.ceil((Number(manualOvertime.after530Hours || 0) + Number(manualOvertime.h8to12Hours || 0) + Number(manualOvertime.h12to7Hours || 0)) * 2),
+  );
+  const saturdayBlocks = Math.max(
+    0,
+    Number(manualOvertime.saturdayHalfHourBlocks || 0)
+      || Math.ceil(Number(manualOvertime.saturdayHours || 0) * 2),
+  );
+  const weekdayRate = moneySen(resolvedPolicy.operatingHours.weekday.overtimeHalfHourRateSen);
+  const saturdayRate = moneySen(resolvedPolicy.operatingHours.saturday.overtimeHalfHourRateSen);
+  const totalSen = moneySen((weekdayBlocks * weekdayRate) + (saturdayBlocks * saturdayRate));
+
+  return {
+    items: totalSen > 0
+      ? [buildLineItem({
+        code: "overtime_charge",
+        label: "Overtime Charge",
+        description: "Overtime Charge",
+        quantity: 1,
+        unit: "invoice",
+        unitAmountSen: totalSen,
+        taxable: false,
+        notes: dedupeNotes([
+          weekdayBlocks > 0 ? `Weekday overtime: ${weekdayBlocks} x 30 min` : "",
+          saturdayBlocks > 0 ? `Saturday overtime: ${saturdayBlocks} x 30 min` : "",
+          "Manual overtime override",
+        ]),
+        policyKey: `${resolvedPolicy.activeBillingModel}.overtime_charge.manual`,
+      })]
+      : [],
+    totalSen,
+    breakdown: [],
+    weekdayBlocks,
+    saturdayBlocks,
     managementReviewRecommended: false,
   };
 }
 
-function calculateOvertimeCharge({ intervals, manualOvertime, payerType, table, policy = DEFAULT_FEE_POLICY }) {
-  if (manualOvertime && typeof manualOvertime === "object") {
-    return overtimeLineItemsFromManual({ manualOvertime, payerType, table, policy });
+function calculateOvertimeCharge({ intervals, attendanceRows, manualOvertime, policy = DEFAULT_FEE_POLICY }) {
+  const resolvedPolicy = resolveFeePolicy(policy);
+  const manual = manualOvertimeCharge(manualOvertime, resolvedPolicy);
+  if (manual) {
+    return manual;
   }
 
-  const resolvedPolicy = resolveFeePolicy(policy);
-  const aggregated = aggregateOvertimeFromIntervals({ intervals, policy: resolvedPolicy });
-  const items = [];
-  let totalSen = 0;
-  let managementReviewRecommended = false;
-  const roundingMode = String(resolvedPolicy.overtime && resolvedPolicy.overtime.roundingMode
-    ? resolvedPolicy.overtime.roundingMode
-    : DEFAULT_FEE_POLICY.overtime.roundingMode).trim().toUpperCase();
+  const rows = Array.isArray(attendanceRows) && attendanceRows.length > 0
+    ? attendanceRows
+    : (Array.isArray(intervals) ? intervals.map((entry) => ({
+      checkInAt: entry && entry.start ? entry.start : null,
+      checkOutAt: entry && entry.end ? entry.end : null,
+      date: entry && (entry.start || entry.end) ? (entry.start || entry.end) : null,
+    })) : []);
 
-  for (const bucket of aggregated) {
-    if (bucket.totalMinutes <= 0) continue;
-    const price = lookupPrice({ table, codeCandidates: [bucket.code], payerType });
-    if (!price) continue;
-    const quantity = roundHours(bucket.totalMinutes, roundingMode);
-    if (quantity <= 0) continue;
-    bucket.quantity = quantity;
-    const lineItem = buildLineItem({
-      code: price.code,
-      label: String(bucket.label || bucket.code || "Overtime").trim(),
-      quantity,
-      unit: bucket.unit || "hour",
-      unitAmountSen: price.unitAmountSen,
-      taxable: false,
-      notes: [`${bucket.totalMinutes} min overtime`],
-      policyKey: `${resolvedPolicy.overtime.policyKey}.${bucket.code}`,
-    });
-    items.push(lineItem);
-    totalSen += moneySen(lineItem.amountSen);
-    if (bucket.managementReviewThresholdDays > 0 && bucket.activeDayCount > bucket.managementReviewThresholdDays) {
-      managementReviewRecommended = true;
+  const breakdown = [];
+  let weekdayBlocks = 0;
+  let saturdayBlocks = 0;
+  let totalSen = 0;
+
+  for (const row of rows) {
+    const charge = calculateOvertimeForAttendance(row, resolvedPolicy);
+    if (!charge.applies) continue;
+    breakdown.push(charge);
+    totalSen += moneySen(charge.totalSen);
+    if (charge.dayType === "SATURDAY") {
+      saturdayBlocks += Number(charge.blocks || 0);
+    } else {
+      weekdayBlocks += Number(charge.blocks || 0);
     }
   }
+
+  const items = totalSen > 0
+    ? [buildLineItem({
+      code: "overtime_charge",
+      label: "Overtime Charge",
+      description: "Overtime Charge",
+      quantity: 1,
+      unit: "invoice",
+      unitAmountSen: totalSen,
+      taxable: false,
+      notes: dedupeNotes([
+        weekdayBlocks > 0 ? `Weekday overtime: ${weekdayBlocks} x 30 min` : "",
+        saturdayBlocks > 0 ? `Saturday overtime: ${saturdayBlocks} x 30 min` : "",
+      ]),
+      policyKey: `${resolvedPolicy.activeBillingModel}.overtime_charge`,
+    })]
+    : [];
 
   return {
     items,
     totalSen: moneySen(totalSen),
-    breakdown: aggregated,
-    managementReviewRecommended,
+    breakdown,
+    weekdayBlocks,
+    saturdayBlocks,
+    managementReviewRecommended: false,
   };
+}
+
+function calculateOvertimeForCycle({ attendanceRows, cycleStart, cycleEnd, policy = DEFAULT_FEE_POLICY }) {
+  const start = asDate(cycleStart);
+  const end = asDate(cycleEnd);
+  const filteredRows = (attendanceRows || []).filter((row) => {
+    const anchor = attendanceAnchorDate(row);
+    if (!anchor || !start || !end) return false;
+    return anchor.getTime() >= start.getTime() && anchor.getTime() <= end.getTime();
+  });
+  return calculateOvertimeCharge({ attendanceRows: filteredRows, policy });
 }
 
 function generateInvoiceLineItems({
@@ -702,199 +899,164 @@ function generateInvoiceLineItems({
   table,
   policy,
   careMode,
-  baseCode,
   ageMonths,
   isRegistrationMonth,
-  transportUsed,
-  transitUsage,
-  attendanceRows,
+  registrationDate,
+  yearlyFeeCoveredYear,
   overtimeChargeOverride,
+  attendanceRows,
   manualOvertime,
-  absenceAdjustment,
 }) {
   const resolvedPolicy = resolveFeePolicy(policy);
-  const normalizedPayerType = normalizePayerType(payerType);
-  const ageBand = determineAgeBand(ageMonths, resolvedPolicy);
-  const normalizedCareMode = normalizeCareMode(careMode || baseCode);
-  const resolvedBaseCode = String(baseCode || baseCodeForCareMode({ careMode: normalizedCareMode, ageBand })).trim();
+  const normalizedCareMode = normalizeCareMode(careMode);
   const items = [];
   const policyNotes = [];
+  const effectivePeriodDate = resolveDateInput(periodDate, periodDateFromKey(periodKey));
+  const effectiveRegistrationDate = resolveDateInput(registrationDate, effectivePeriodDate);
 
-  const baseItem = buildBaseFeeItem({
-    baseCode: resolvedBaseCode,
-    payerType: normalizedPayerType,
-    table,
-    transitUsage,
-  });
-  if (baseItem) {
-    items.push(baseItem);
+  if (normalizedCareMode.startsWith("CASUAL_TRANSIT_")) {
+    return {
+      items: [],
+      subTotalSen: 0,
+      totalSen: 0,
+      ageBand: determineAgeBand(ageMonths, resolvedPolicy),
+      overtime: { items: [], totalSen: 0, breakdown: [], weekdayBlocks: 0, saturdayBlocks: 0, managementReviewRecommended: false },
+      policyNotes: ["Casual transit is billed separately from registered-child monthly billing."],
+      managementReviewRecommended: false,
+      yearlyFeeCoveredYear: Number.isFinite(Number(yearlyFeeCoveredYear)) ? Number(yearlyFeeCoveredYear) : null,
+      feePolicyVersion: resolvedPolicy.policyVersion,
+      activeBillingModel: resolvedPolicy.activeBillingModel,
+    };
   }
 
-  const registrationType = inferRegistrationType({ baseCode: resolvedBaseCode, careMode: normalizedCareMode });
-  const registrationConfig = resolvedPolicy.registration && resolvedPolicy.registration[registrationType]
-    ? resolvedPolicy.registration[registrationType]
-    : null;
-  if (registrationConfig && isRegistrationMonth) {
-    const registrationPrice = lookupPrice({
-      table,
-      codeCandidates: registrationConfig.codeCandidates,
-      payerType: normalizedPayerType,
-    });
-    if (registrationPrice) {
-      items.push(buildLineItem({
-        code: registrationPrice.code,
-        label: registrationConfig.label,
-        quantity: 1,
-        unit: registrationConfig.unit,
-        unitAmountSen: registrationPrice.unitAmountSen,
-        taxable: false,
-        policyKey: registrationConfig.policyKey,
-      }));
-    }
-
-    const bookPrice = lookupPrice({
-      table,
-      codeCandidates: resolvedPolicy.communicationBook && resolvedPolicy.communicationBook.codeCandidates,
-      payerType: normalizedPayerType,
-    });
-    if (bookPrice && isRegisteredCareMode(normalizedCareMode)) {
-      items.push(buildLineItem({
-        code: bookPrice.code,
-        label: resolvedPolicy.communicationBook.label,
-        quantity: 1,
-        unit: resolvedPolicy.communicationBook.unit,
-        unitAmountSen: bookPrice.unitAmountSen,
-        taxable: false,
-        policyKey: resolvedPolicy.communicationBook.policyKey,
-      }));
-    }
-
-    if (isInsuranceApplicable({
-      ageMonths,
-      careMode: normalizedCareMode,
-      isRegistrationMonth,
-      policy: resolvedPolicy,
-    })) {
-      const insurancePrice = lookupPrice({
-        table,
-        codeCandidates: resolvedPolicy.insurance && resolvedPolicy.insurance.codeCandidates,
-        payerType: normalizedPayerType,
-      });
-      if (insurancePrice) {
-        items.push(buildLineItem({
-          code: insurancePrice.code,
-          label: resolvedPolicy.insurance.label,
-          quantity: 1,
-          unit: resolvedPolicy.insurance.unit,
-          unitAmountSen: insurancePrice.unitAmountSen,
-          taxable: false,
-          policyKey: resolvedPolicy.insurance.policyKey,
-        }));
-      }
-    }
-  }
-
-  if (isRegisteredCareMode(normalizedCareMode) && isJanuaryInvoice({ periodKey, periodDate, policy: resolvedPolicy })) {
-    const annualFeePrice = lookupPrice({
-      table,
-      codeCandidates: resolvedPolicy.annualFee && resolvedPolicy.annualFee.codeCandidates,
-      payerType: normalizedPayerType,
-    });
-    if (annualFeePrice) {
-      items.push(buildLineItem({
-        code: annualFeePrice.code,
-        label: resolvedPolicy.annualFee.label,
-        quantity: 1,
-        unit: resolvedPolicy.annualFee.unit,
-        unitAmountSen: annualFeePrice.unitAmountSen,
-        taxable: false,
-        policyKey: resolvedPolicy.annualFee.policyKey,
-      }));
-    }
-  }
-
-  if (transportUsed && isTransportEligible({ careMode: normalizedCareMode, policy: resolvedPolicy })) {
-    const transportPrice = lookupPrice({
-      table,
-      codeCandidates: resolvedPolicy.transport && resolvedPolicy.transport.codeCandidates,
-      payerType: normalizedPayerType,
-    });
-    if (transportPrice) {
-      items.push(buildLineItem({
-        code: transportPrice.code,
-        label: resolvedPolicy.transport.label,
-        quantity: 1,
-        unit: resolvedPolicy.transport.unit,
-        unitAmountSen: transportPrice.unitAmountSen,
-        taxable: false,
-        policyKey: resolvedPolicy.transport.policyKey,
-      }));
-    }
-  }
-
-  const intervals = (attendanceRows || []).map((row) => ({
-    start: asDate(row && (row.checkInAt || row.check_in_time || row.checkInTime || row.checkinTime)),
-    end: asDate(row && (row.checkOutAt || row.check_out_time || row.checkOutTime || row.checkoutTime)),
+  const monthlyFee = calculateMonthlyFee({ ageMonths, payerType, table, policy: resolvedPolicy });
+  items.push(registeredMonthlyFeeItem({
+    ageBand: monthlyFee.ageBand,
+    monthlyFeeSen: monthlyFee.monthlyFeeSen,
+    policy: resolvedPolicy,
   }));
+
+  if (monthlyFee.ageBand.ageOutOfPolicy) {
+    policyNotes.push("Child age is outside the supported Taska Zurah range. Review before finalizing billing.");
+  }
+
+  let resolvedCoveredYear = Number.isFinite(Number(yearlyFeeCoveredYear))
+    ? Number(yearlyFeeCoveredYear)
+    : determineYearlyFeeCoveredYear(effectiveRegistrationDate, resolvedPolicy);
+
+  if (isRegistrationMonth) {
+    const registrationAmount = configuredAmount({
+      table,
+      payerType,
+      code: resolvedPolicy.registration.code,
+      fallbackSen: resolvedPolicy.registration.amountSen,
+    });
+    items.push(buildLineItem({
+      code: resolvedPolicy.registration.code,
+      label: resolvedPolicy.registration.label,
+      description: resolvedPolicy.registration.label,
+      quantity: 1,
+      unit: resolvedPolicy.registration.unit,
+      unitAmountSen: registrationAmount.unitAmountSen,
+      taxable: false,
+      policyKey: resolvedPolicy.registration.policyKey,
+    }));
+
+    if (isInsuranceApplicable({ isRegistrationMonth: true })) {
+      const insuranceAmount = configuredAmount({
+        table,
+        payerType,
+        code: resolvedPolicy.insurance.code,
+        fallbackSen: resolvedPolicy.insurance.amountSen,
+      });
+      items.push(buildLineItem({
+        code: resolvedPolicy.insurance.code,
+        label: resolvedPolicy.insurance.label,
+        description: resolvedPolicy.insurance.label,
+        quantity: 1,
+        unit: resolvedPolicy.insurance.unit,
+        unitAmountSen: insuranceAmount.unitAmountSen,
+        taxable: false,
+        policyKey: resolvedPolicy.insurance.policyKey,
+      }));
+    }
+
+    const yearlyAmount = configuredAmount({
+      table,
+      payerType,
+      code: resolvedPolicy.yearlyMaintenance.code,
+      fallbackSen: resolvedPolicy.yearlyMaintenance.amountSen,
+    });
+    items.push(buildLineItem({
+      code: resolvedPolicy.yearlyMaintenance.code,
+      label: resolvedPolicy.yearlyMaintenance.label,
+      description: resolvedPolicy.yearlyMaintenance.label,
+      quantity: 1,
+      unit: resolvedPolicy.yearlyMaintenance.unit,
+      unitAmountSen: yearlyAmount.unitAmountSen,
+      taxable: false,
+      policyKey: resolvedPolicy.yearlyMaintenance.policyKey,
+    }));
+
+    resolvedCoveredYear = determineYearlyFeeCoveredYear(effectiveRegistrationDate, resolvedPolicy);
+    if (Number.isFinite(Number(resolvedCoveredYear))) {
+      policyNotes.push(`Yearly maintenance covers ${resolvedCoveredYear}.`);
+    }
+  } else if (shouldChargeYearlyMaintenance({
+    invoiceMonth: effectivePeriodDate,
+    registrationDate: effectiveRegistrationDate,
+    yearlyFeeCoveredYear: resolvedCoveredYear,
+    policy: resolvedPolicy,
+  })) {
+    const yearlyAmount = configuredAmount({
+      table,
+      payerType,
+      code: resolvedPolicy.yearlyMaintenance.code,
+      fallbackSen: resolvedPolicy.yearlyMaintenance.amountSen,
+    });
+    items.push(buildLineItem({
+      code: resolvedPolicy.yearlyMaintenance.code,
+      label: resolvedPolicy.yearlyMaintenance.label,
+      description: resolvedPolicy.yearlyMaintenance.label,
+      quantity: 1,
+      unit: resolvedPolicy.yearlyMaintenance.unit,
+      unitAmountSen: yearlyAmount.unitAmountSen,
+      taxable: false,
+      policyKey: resolvedPolicy.yearlyMaintenance.policyKey,
+    }));
+    if (effectivePeriodDate) {
+      resolvedCoveredYear = malaysiaDateParts(effectivePeriodDate).year;
+    }
+  }
+
   const overtime = overtimeChargeOverride && typeof overtimeChargeOverride === "object"
     ? {
       items: Array.isArray(overtimeChargeOverride.items) ? overtimeChargeOverride.items : [],
       totalSen: moneySen(overtimeChargeOverride.totalSen),
       breakdown: Array.isArray(overtimeChargeOverride.breakdown) ? overtimeChargeOverride.breakdown : [],
+      weekdayBlocks: Number(overtimeChargeOverride.weekdayBlocks || 0),
+      saturdayBlocks: Number(overtimeChargeOverride.saturdayBlocks || 0),
       managementReviewRecommended: Boolean(overtimeChargeOverride.managementReviewRecommended),
     }
     : calculateOvertimeCharge({
-      intervals,
+      attendanceRows,
       manualOvertime,
-      payerType: normalizedPayerType,
-      table,
       policy: resolvedPolicy,
     });
   items.push(...overtime.items);
 
-  const absenceDaysWithLetter = Number(absenceAdjustment && absenceAdjustment.absenceDaysWithLetter ? absenceAdjustment.absenceDaysWithLetter : 0);
-  const hasAbsenceLetter = Boolean(absenceAdjustment && absenceAdjustment.hasAbsenceLetter);
-  if (hasAbsenceLetter && absenceDaysWithLetter > Number(resolvedPolicy.absenceDiscountMinDaysWithLetter || 14)) {
-    const discountSource = items.find((item) => item && String(item.code || "").trim() === resolvedBaseCode);
-    if (discountSource && moneySen(discountSource.amountSen) > 0) {
-      const discountSen = moneySen(discountSource.amountSen * (Number(resolvedPolicy.absenceDiscountPercent || 10) / 100));
-      if (discountSen > 0) {
-        items.push(buildLineItem({
-          code: "discount_absence_14days",
-          label: `Potongan ${Number(resolvedPolicy.absenceDiscountPercent || 10)}% (Tidak Hadir >14 Hari + Surat)`,
-          quantity: 1,
-          unit: "discount",
-          unitAmountSen: -discountSen,
-          taxable: false,
-          policyKey: "absence.discount_with_letter",
-        }));
-      }
-    }
-  }
-
-  if (isRegistrationMonth) {
-    policyNotes.push("Yuran pendaftaran dikenakan sekali sahaja pada bulan pendaftaran.");
-  }
-  if (hasAbsenceLetter && absenceDaysWithLetter > Number(resolvedPolicy.absenceDiscountMinDaysWithLetter || 14)) {
-    policyNotes.push("Potongan 10% telah digunakan kerana tidak hadir melebihi 14 hari dengan surat.");
-  }
-  if (overtime.managementReviewRecommended) {
-    policyNotes.push("Rekod lebih masa melebihi ambang semakan pengurusan.");
-  }
-  if (ageBand.ageOutOfPolicy) {
-    policyNotes.push("Umur kanak-kanak berada di luar julat polisi standard dan wajar disemak secara manual.");
-  }
-
-  const subTotalSen = items.reduce((sum, item) => sum + moneySen(item.amountSen), 0);
+  const totalSen = items.reduce((sum, item) => sum + moneySen(item.amountSen), 0);
   return {
     items,
-    subTotalSen: moneySen(subTotalSen),
-    totalSen: moneySen(subTotalSen),
-    baseCode: resolvedBaseCode,
-    ageBand,
+    subTotalSen: moneySen(totalSen),
+    totalSen: moneySen(totalSen),
+    ageBand: monthlyFee.ageBand,
     overtime,
     policyNotes: dedupeNotes(policyNotes),
-    managementReviewRecommended: Boolean(overtime.managementReviewRecommended || ageBand.ageOutOfPolicy),
+    managementReviewRecommended: Boolean(monthlyFee.ageBand.ageOutOfPolicy || overtime.managementReviewRecommended),
+    yearlyFeeCoveredYear: Number.isFinite(Number(resolvedCoveredYear)) ? Number(resolvedCoveredYear) : null,
+    feePolicyVersion: resolvedPolicy.policyVersion,
+    activeBillingModel: resolvedPolicy.activeBillingModel,
   };
 }
 
@@ -913,14 +1075,38 @@ function calculateMonthlyInvoice(input) {
 }
 
 function calculateJanuaryInvoice(input) {
-  const periodDate = input && input.periodDate instanceof Date
-    ? input.periodDate
-    : new Date(Number(input && input.year ? input.year : new Date().getFullYear()), 0, 1);
+  const periodDate = resolveDateInput(input && input.periodDate, input && input.year
+    ? malaysiaLocalDate(Number(input.year), 0, 1, 0, 0, 0, 0)
+    : null);
   return generateInvoiceLineItems({
     ...input,
     periodDate,
-    periodKey: input && input.periodKey ? input.periodKey : `${periodDate.getFullYear()}-01`,
+    periodKey: input && input.periodKey ? input.periodKey : (periodDate ? `${malaysiaDateParts(periodDate).year}-01` : ""),
+    isRegistrationMonth: false,
   });
+}
+
+function baseCodeForCareMode({ careMode }) {
+  const normalized = normalizeCareMode(careMode);
+  if (normalized === "CASUAL_TRANSIT_1_HOUR") return "transit_1hour";
+  if (normalized === "CASUAL_TRANSIT_1_DAY") return "transit_1day";
+  if (normalized === "CASUAL_TRANSIT_1_WEEK") return "transit_1week";
+  return "monthly_fee";
+}
+
+function casualTransitBaseAmount({ payerType, transitType, table, policy = DEFAULT_FEE_POLICY }) {
+  const resolvedPolicy = resolveFeePolicy(policy);
+  const normalizedCareMode = normalizeCareMode(transitType);
+  const baseCode = baseCodeForCareMode({ careMode: normalizedCareMode });
+  const defaultRow = resolvedPolicy.casualTransit && resolvedPolicy.casualTransit.table
+    ? resolvedPolicy.casualTransit.table[baseCode]
+    : null;
+  const amount = lookupPrice({ table, codeCandidates: [baseCode], payerType })
+    || (defaultRow ? { code: baseCode, unitAmountSen: moneySen(defaultRow[normalizePayerType(payerType)]) } : null);
+  if (!amount) {
+    return { baseCode, unitAmountSen: 0 };
+  }
+  return { baseCode, unitAmountSen: moneySen(amount.unitAmountSen) };
 }
 
 function calculateCasualTransitCharge({
@@ -936,52 +1122,104 @@ function calculateCasualTransitCharge({
   const normalizedPayerType = normalizePayerType(payerType);
   const normalizedCareMode = normalizeCareMode(transitType);
   const ageBand = determineAgeBand(ageMonths, resolvedPolicy);
-  const baseCode = baseCodeForCareMode({ careMode: normalizedCareMode, ageBand });
-  const basePrice = lookupPrice({ table, codeCandidates: [baseCode], payerType: normalizedPayerType });
-  const items = [];
+  const baseAmount = casualTransitBaseAmount({
+    payerType: normalizedPayerType,
+    transitType: normalizedCareMode,
+    table,
+    policy: resolvedPolicy,
+  });
 
-  if (basePrice) {
-    items.push(buildLineItem({
-      code: basePrice.code,
-      label: registeredBaseLabel(baseCode),
+  const unit = normalizedCareMode === "CASUAL_TRANSIT_1_HOUR"
+    ? "hour"
+    : (normalizedCareMode === "CASUAL_TRANSIT_1_WEEK" ? "week" : "day");
+
+  const items = baseAmount.unitAmountSen > 0
+    ? [buildLineItem({
+      code: baseAmount.baseCode,
+      label: normalizedCareMode === "CASUAL_TRANSIT_1_HOUR"
+        ? "Casual Transit 1 Hour"
+        : (normalizedCareMode === "CASUAL_TRANSIT_1_WEEK" ? "Casual Transit 1 Week" : "Casual Transit 1 Day"),
+      description: normalizedCareMode === "CASUAL_TRANSIT_1_HOUR"
+        ? "Casual Transit 1 Hour"
+        : (normalizedCareMode === "CASUAL_TRANSIT_1_WEEK" ? "Casual Transit 1 Week" : "Casual Transit 1 Day"),
       quantity: 1,
-      unit: normalizedCareMode === "CASUAL_TRANSIT_1_HOUR"
-        ? "hour"
-        : (normalizedCareMode === "CASUAL_TRANSIT_1_WEEK" ? "week" : "day"),
-      unitAmountSen: basePrice.unitAmountSen,
+      unit,
+      unitAmountSen: baseAmount.unitAmountSen,
       taxable: false,
-      policyKey: `casual.${baseCode}`,
-    }));
-  }
+      policyKey: `${resolvedPolicy.casualTransit.policyKey}.${baseAmount.baseCode}`,
+    })]
+    : [];
 
   const overtime = calculateOvertimeCharge({
-    intervals: [{
-      start: checkInAt instanceof Date ? checkInAt : null,
-      end: actualCheckOutAt instanceof Date ? actualCheckOutAt : null,
+    attendanceRows: [{
+      checkInAt,
+      checkOutAt: actualCheckOutAt,
+      date: checkInAt || actualCheckOutAt,
     }],
-    payerType: normalizedPayerType,
-    table,
     policy: resolvedPolicy,
   });
   items.push(...overtime.items);
 
-  const baseAmountSen = items.length > 0 ? moneySen(items[0].amountSen) : 0;
-  const overtimeAmountSen = overtime.items.reduce((sum, item) => sum + moneySen(item.amountSen), 0);
   const totalAmountSen = items.reduce((sum, item) => sum + moneySen(item.amountSen), 0);
+  const overtimeAmountSen = overtime.items.reduce((sum, item) => sum + moneySen(item.amountSen), 0);
 
   return {
     items,
-    baseAmountSen: moneySen(baseAmountSen),
+    baseAmountSen: baseAmount.unitAmountSen,
     overtimeAmountSen: moneySen(overtimeAmountSen),
     totalAmountSen: moneySen(totalAmountSen),
     ageBand,
     transitType: normalizedCareMode,
     staffType: normalizedPayerType === "staff" ? "STAFF" : "NON_STAFF",
-    overtimeStrategySnapshot: String(resolvedPolicy.overtime && resolvedPolicy.overtime.roundingMode
-      ? resolvedPolicy.overtime.roundingMode
-      : DEFAULT_FEE_POLICY.overtime.roundingMode),
+    overtimeStrategySnapshot: "TASKA_ZURAH_HALF_HOUR_BLOCKS",
     overtimeBreakdown: overtime.breakdown,
-    managementReviewRecommended: Boolean(overtime.managementReviewRecommended || ageBand.ageOutOfPolicy),
+    managementReviewRecommended: Boolean(ageBand.ageOutOfPolicy),
+  };
+}
+
+function buildDefaultCatalog(policy = DEFAULT_FEE_POLICY) {
+  const resolvedPolicy = resolveFeePolicy(policy);
+  const table = {};
+
+  for (const band of Object.values(resolvedPolicy.ageBands || {})) {
+    table[String(band.monthlyFeeCode)] = {
+      staff: moneySen(band.monthlyFeeSen),
+      nonstaff: moneySen(band.monthlyFeeSen),
+    };
+  }
+
+  table[resolvedPolicy.registration.code] = {
+    staff: moneySen(resolvedPolicy.registration.amountSen),
+    nonstaff: moneySen(resolvedPolicy.registration.amountSen),
+  };
+  table[resolvedPolicy.insurance.code] = {
+    staff: moneySen(resolvedPolicy.insurance.amountSen),
+    nonstaff: moneySen(resolvedPolicy.insurance.amountSen),
+  };
+  table[resolvedPolicy.yearlyMaintenance.code] = {
+    staff: moneySen(resolvedPolicy.yearlyMaintenance.amountSen),
+    nonstaff: moneySen(resolvedPolicy.yearlyMaintenance.amountSen),
+  };
+  table[resolvedPolicy.operatingHours.weekday.overtimeHalfHourRateCode] = {
+    staff: moneySen(resolvedPolicy.operatingHours.weekday.overtimeHalfHourRateSen),
+    nonstaff: moneySen(resolvedPolicy.operatingHours.weekday.overtimeHalfHourRateSen),
+  };
+  table[resolvedPolicy.operatingHours.saturday.overtimeHalfHourRateCode] = {
+    staff: moneySen(resolvedPolicy.operatingHours.saturday.overtimeHalfHourRateSen),
+    nonstaff: moneySen(resolvedPolicy.operatingHours.saturday.overtimeHalfHourRateSen),
+  };
+
+  for (const [code, row] of Object.entries(resolvedPolicy.casualTransit && resolvedPolicy.casualTransit.table ? resolvedPolicy.casualTransit.table : {})) {
+    table[code] = {
+      staff: moneySen(row.staff),
+      nonstaff: moneySen(row.nonstaff),
+    };
+  }
+
+  return {
+    version: String(resolvedPolicy.policyVersion || "TASKA_ZURAH_2026").toLowerCase(),
+    table,
+    policy: resolvedPolicy,
   };
 }
 
@@ -989,8 +1227,19 @@ module.exports = {
   DEFAULT_FEE_POLICY,
   resolveFeePolicy,
   determineAgeBand,
+  determineYearlyFeeCoveredYear,
+  shouldChargeYearlyMaintenance,
+  calculateMonthlyFee,
   isInsuranceApplicable,
   isJanuaryInvoice,
+  getOperatingHoursForDate,
+  isWorkingDay,
+  isWithinCheckInWindow,
+  canCheckIn,
+  canCheckOut,
+  determineOvertimeCycleForInvoice,
+  calculateOvertimeForAttendance,
+  calculateOvertimeForCycle,
   calculateRegistrationInvoice,
   calculateMonthlyInvoice,
   calculateJanuaryInvoice,
@@ -1000,4 +1249,9 @@ module.exports = {
   baseCodeForCareMode,
   normalizeCareMode,
   lookupPrice,
+  buildDefaultCatalog,
+  malaysiaDateKey,
+  malaysiaLocalDate,
+  malaysiaSameDayAt,
+  shiftPeriodKey,
 };

@@ -13,170 +13,260 @@ function assertAmount(items, code, amountSen, message) {
   assertTrue(Number(item.amountSen || 0) === amountSen, `${message}: expected ${amountSen} for ${code}, got ${item.amountSen}`);
 }
 
-const table = {
-  version: "unit-test",
-  table: {
-    monthly_fulltime_3m_2y: { staff: 35000, nonstaff: 40000 },
-    monthly_fulltime_2y_4y: { staff: 30000, nonstaff: 35000 },
-    transit_halfday_month: { staff: 15000, nonstaff: 25000 },
-    transit_2h_month: { staff: 10000, nonstaff: 18000 },
-    transit_schoolholiday_month: { staff: 25000, nonstaff: 30000 },
-    transit_1day: { staff: 1500, nonstaff: 2000 },
-    transit_1week: { staff: 7000, nonstaff: 10000 },
-    transit_1hour: { staff: 350, nonstaff: 400 },
-    overtime_after_530: { staff: 500, nonstaff: 600 },
-    overtime_8pm_12am: { staff: 1000, nonstaff: 1300 },
-    transport_tadika_month: { staff: 15000, nonstaff: 15000 },
-    registration_fulltime_oneoff: { staff: 10000, nonstaff: 10000 },
-    registration_transit_oneoff: { staff: 5000, nonstaff: 5000 },
-    annual_fee_yearly: { staff: 10000, nonstaff: 10000 },
-    comms_book_oneoff: { staff: 1500, nonstaff: 1500 },
-    insurance_oneoff_age2plus: { staff: 2000, nonstaff: 2000 },
-  },
-};
+function myDate(year, month, day, hour = 0, minute = 0) {
+  return new Date(Date.UTC(year, month - 1, day, hour - 8, minute, 0, 0));
+}
+
+function withLocalTime(anchorDate, hour, minute = 0) {
+  const shifted = new Date(anchorDate.getTime() + (8 * 60 * 60 * 1000));
+  return myDate(shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, shifted.getUTCDate(), hour, minute);
+}
+
+function findDateByWeekday(year, month, weekday) {
+  for (let day = 1; day <= 31; day += 1) {
+    const candidate = myDate(year, month, day, 12, 0);
+    if (candidate.getUTCMonth() !== (month - 1)) {
+      break;
+    }
+    const schedule = feeEngine.getOperatingHoursForDate(candidate);
+    if (schedule.dayOfWeek === weekday) {
+      return candidate;
+    }
+  }
+  throw new Error(`No weekday ${weekday} found for ${year}-${month}`);
+}
+
+const catalog = feeEngine.buildDefaultCatalog();
 
 function runAgeBandChecks() {
+  const newborn = feeEngine.determineAgeBand(0);
   const age23 = feeEngine.determineAgeBand(23);
   const age24 = feeEngine.determineAgeBand(24);
-  const age47 = feeEngine.determineAgeBand(47);
   const age48 = feeEngine.determineAgeBand(48);
+  const age60 = feeEngine.determineAgeBand(60);
 
-  assertTrue(age23.codeSuffix === "3m_2y" && age23.ageOutOfPolicy === false, "23 months should stay in 3m_2y band");
-  assertTrue(age24.codeSuffix === "2y_4y" && age24.ageOutOfPolicy === false, "24 months should move to 2y_4y band");
-  assertTrue(age47.codeSuffix === "2y_4y" && age47.ageOutOfPolicy === false, "47 months should stay in 2y_4y band");
-  assertTrue(age48.ageOutOfPolicy === true && age48.agePolicyReason === "age_4y_or_above", "48 months should require review");
+  assertTrue(newborn.codeSuffix === "BABY_TO_2" && newborn.ageOutOfPolicy === false, "newborn should stay in BABY_TO_2 band");
+  assertTrue(age23.codeSuffix === "BABY_TO_2" && age23.ageOutOfPolicy === false, "23 months should stay in BABY_TO_2 band");
+  assertTrue(age24.codeSuffix === "AGE_2_TO_3" && age24.ageOutOfPolicy === false, "24 months should move to AGE_2_TO_3 band");
+  assertTrue(age48.codeSuffix === "AGE_4" && age48.ageOutOfPolicy === false, "48 months should move to AGE_4 band");
+  assertTrue(age60.codeSuffix === "AGE_4" && age60.ageOutOfPolicy === true && age60.agePolicyReason === "age_5_or_above", "60 months should require review");
   console.log("PASS age-band edges");
 }
 
 function runRegistrationChecks() {
-  const registrationInvoice = feeEngine.calculateRegistrationInvoice({
-    periodKey: "2026-03",
-    periodDate: new Date(2026, 2, 1),
+  const babyRegistration = feeEngine.calculateRegistrationInvoice({
+    periodKey: "2026-04",
+    periodDate: myDate(2026, 4, 1),
+    registrationDate: myDate(2026, 4, 5),
     payerType: "nonstaff",
-    table,
+    table: catalog,
     careMode: "fulltime",
     ageMonths: 12,
-    baseCode: "monthly_fulltime_3m_2y",
-    isRegistrationMonth: true,
-    transportUsed: true,
-    transitUsage: {},
-    attendanceRows: [],
-    absenceAdjustment: { hasAbsenceLetter: false, absenceDaysWithLetter: 0 },
   });
 
-  assertAmount(registrationInvoice.items, "monthly_fulltime_3m_2y", 40000, "registration invoice should include full-time base");
-  assertAmount(registrationInvoice.items, "registration_fulltime_oneoff", 10000, "registration invoice should add registration fee");
-  assertAmount(registrationInvoice.items, "comms_book_oneoff", 1500, "registration invoice should add communication book once");
-  assertAmount(registrationInvoice.items, "transport_tadika_month", 15000, "registration invoice should add transport when enabled");
-  assertTrue(!registrationInvoice.items.some((item) => item.code === "insurance_oneoff_age2plus"), "registration invoice should not add insurance below age 2");
-  console.log("PASS registration stacking + transport");
+  assertAmount(babyRegistration.items, "monthly_fee", 75000, "baby registration should include monthly fee");
+  assertAmount(babyRegistration.items, "registration_fee", 10000, "baby registration should include registration fee");
+  assertAmount(babyRegistration.items, "insurance_takaful", 1500, "baby registration should include insurance/takaful");
+  assertAmount(babyRegistration.items, "yearly_maintenance_fee", 40000, "baby registration should include yearly maintenance fee");
+  assertTrue(Number(babyRegistration.totalSen) === 126500, `baby registration total should be 126500, got ${babyRegistration.totalSen}`);
+  assertTrue(babyRegistration.items.every((item) => !["comms_book_oneoff", "transport_tadika_month", "twinkling_apps"].includes(item.code)), "registration should exclude old TPPM extras and Twinkling Apps");
+  assertTrue(babyRegistration.yearlyFeeCoveredYear === 2026, `April registration should cover 2026, got ${babyRegistration.yearlyFeeCoveredYear}`);
 
-  const olderRegistration = feeEngine.calculateRegistrationInvoice({
-    periodKey: "2026-03",
-    periodDate: new Date(2026, 2, 1),
-    payerType: "nonstaff",
-    table,
-    careMode: "fulltime",
-    ageMonths: 30,
-    baseCode: "monthly_fulltime_2y_4y",
-    isRegistrationMonth: true,
-    transportUsed: false,
-    transitUsage: {},
-    attendanceRows: [],
-    absenceAdjustment: { hasAbsenceLetter: false, absenceDaysWithLetter: 0 },
-  });
-  assertAmount(olderRegistration.items, "insurance_oneoff_age2plus", 2000, "registration invoice should add insurance once at age 2+");
-  console.log("PASS registration insurance threshold");
-}
-
-function runJanuaryChecks() {
-  const januaryInvoice = feeEngine.calculateJanuaryInvoice({
-    year: 2026,
-    payerType: "nonstaff",
-    table,
-    careMode: "fulltime",
-    ageMonths: 30,
-    baseCode: "monthly_fulltime_2y_4y",
-    transportUsed: false,
-    transitUsage: {},
-    attendanceRows: [],
-    absenceAdjustment: { hasAbsenceLetter: false, absenceDaysWithLetter: 0 },
-  });
-
-  assertAmount(januaryInvoice.items, "monthly_fulltime_2y_4y", 35000, "January invoice should include monthly base");
-  assertAmount(januaryInvoice.items, "annual_fee_yearly", 10000, "January invoice should include annual fee");
-  assertTrue(!januaryInvoice.items.some((item) => item.code === "comms_book_oneoff"), "January invoice should not repeat communication book");
-  assertTrue(!januaryInvoice.items.some((item) => item.code === "insurance_oneoff_age2plus"), "January invoice should not repeat insurance");
-  console.log("PASS January rules");
-}
-
-function runAbsenceDiscountChecks() {
-  const discountedInvoice = feeEngine.calculateMonthlyInvoice({
+  const age2To3Registration = feeEngine.calculateRegistrationInvoice({
     periodKey: "2026-04",
-    periodDate: new Date(2026, 3, 1),
+    periodDate: myDate(2026, 4, 1),
+    registrationDate: myDate(2026, 4, 5),
     payerType: "nonstaff",
-    table,
+    table: catalog,
     careMode: "fulltime",
-    ageMonths: 20,
-    baseCode: "monthly_fulltime_3m_2y",
-    transportUsed: false,
-    transitUsage: {},
-    attendanceRows: [],
-    absenceAdjustment: { hasAbsenceLetter: true, absenceDaysWithLetter: 15 },
+    ageMonths: 30,
   });
+  assertTrue(Number(age2To3Registration.totalSen) === 121500, `age 2 to 3 registration total should be 121500, got ${age2To3Registration.totalSen}`);
 
-  assertAmount(discountedInvoice.items, "discount_absence_14days", -4000, "absence discount should reduce 10 percent of the base");
-  console.log("PASS absence discount");
+  const age4Registration = feeEngine.calculateRegistrationInvoice({
+    periodKey: "2026-04",
+    periodDate: myDate(2026, 4, 1),
+    registrationDate: myDate(2026, 4, 5),
+    payerType: "nonstaff",
+    table: catalog,
+    careMode: "fulltime",
+    ageMonths: 50,
+  });
+  assertTrue(Number(age4Registration.totalSen) === 116500, `age 4 registration total should be 116500, got ${age4Registration.totalSen}`);
+  console.log("PASS registration totals");
+}
+
+function runStaffNeutralChecks() {
+  const staffInvoice = feeEngine.calculateRegistrationInvoice({
+    periodKey: "2026-04",
+    periodDate: myDate(2026, 4, 1),
+    registrationDate: myDate(2026, 4, 5),
+    payerType: "staff",
+    table: catalog,
+    careMode: "fulltime",
+    ageMonths: 30,
+  });
+  const nonStaffInvoice = feeEngine.calculateRegistrationInvoice({
+    periodKey: "2026-04",
+    periodDate: myDate(2026, 4, 1),
+    registrationDate: myDate(2026, 4, 5),
+    payerType: "nonstaff",
+    table: catalog,
+    careMode: "fulltime",
+    ageMonths: 30,
+  });
+  assertTrue(staffInvoice.totalSen === nonStaffInvoice.totalSen, "registered-child billing should ignore staff/non-staff pricing");
+  console.log("PASS staff-neutral registered billing");
+}
+
+function runYearlyMaintenanceChecks() {
+  const january2027 = feeEngine.calculateMonthlyInvoice({
+    periodKey: "2027-01",
+    periodDate: myDate(2027, 1, 1),
+    registrationDate: myDate(2026, 4, 5),
+    yearlyFeeCoveredYear: 2026,
+    payerType: "nonstaff",
+    table: catalog,
+    careMode: "fulltime",
+    ageMonths: 15,
+  });
+  assertAmount(january2027.items, "yearly_maintenance_fee", 40000, "January after a normal registration should include yearly maintenance");
+
+  const novemberRegistrationCoveredYear = feeEngine.determineYearlyFeeCoveredYear(myDate(2026, 11, 15));
+  assertTrue(novemberRegistrationCoveredYear === 2027, `November registration should cover 2027, got ${novemberRegistrationCoveredYear}`);
+
+  const januaryAfterNovember = feeEngine.calculateMonthlyInvoice({
+    periodKey: "2027-01",
+    periodDate: myDate(2027, 1, 1),
+    registrationDate: myDate(2026, 11, 15),
+    yearlyFeeCoveredYear: novemberRegistrationCoveredYear,
+    payerType: "nonstaff",
+    table: catalog,
+    careMode: "fulltime",
+    ageMonths: 14,
+  });
+  assertTrue(!januaryAfterNovember.items.some((item) => item.code === "yearly_maintenance_fee"), "November registration should skip the coming January yearly maintenance");
+
+  const january2028AfterNovember = feeEngine.calculateMonthlyInvoice({
+    periodKey: "2028-01",
+    periodDate: myDate(2028, 1, 1),
+    registrationDate: myDate(2026, 11, 15),
+    yearlyFeeCoveredYear: novemberRegistrationCoveredYear,
+    payerType: "nonstaff",
+    table: catalog,
+    careMode: "fulltime",
+    ageMonths: 26,
+  });
+  assertAmount(january2028AfterNovember.items, "yearly_maintenance_fee", 40000, "The January after the carry-forward year should charge yearly maintenance again");
+  console.log("PASS yearly maintenance carry-forward rules");
+}
+
+function runInvoiceScheduleChecks() {
+  const cycle = feeEngine.determineOvertimeCycleForInvoice({
+    invoiceMonth: myDate(2026, 5, 1),
+    registrationDate: myDate(2026, 4, 1),
+  });
+  assertTrue(cycle.applies === true, "May invoice should have an overtime cycle for an April 1 registration");
+  assertTrue(cycle.cycleStartDateKey === "2026-04-01", `First overtime cycle should start on registration date, got ${cycle.cycleStartDateKey}`);
+  assertTrue(cycle.cycleEndDateKey === "2026-04-20", `First overtime cycle should end on 2026-04-20, got ${cycle.cycleEndDateKey}`);
+
+  const missedCutoffCycle = feeEngine.determineOvertimeCycleForInvoice({
+    invoiceMonth: myDate(2026, 5, 1),
+    registrationDate: myDate(2026, 4, 22),
+  });
+  assertTrue(missedCutoffCycle.applies === false, "May invoice should not include overtime when registration is after the April 20 cycle end");
+  console.log("PASS invoice schedule cycle edges");
+}
+
+function runOperatingHoursChecks() {
+  const monday = findDateByWeekday(2026, 5, 1);
+  const saturday = findDateByWeekday(2026, 5, 6);
+  const sunday = findDateByWeekday(2026, 5, 0);
+
+  const mondayCheckIn = feeEngine.canCheckIn(withLocalTime(monday, 7, 0));
+  const mondayTooEarly = feeEngine.canCheckIn(withLocalTime(monday, 6, 59));
+  const saturdayCheckIn = feeEngine.canCheckIn(withLocalTime(saturday, 7, 0));
+  const sundayCheckIn = feeEngine.canCheckIn(withLocalTime(sunday, 10, 0));
+  const lateCheckout = feeEngine.canCheckOut(withLocalTime(saturday, 16, 0));
+
+  assertTrue(mondayCheckIn.ok === true, "Monday 7:00 AM should allow check-in");
+  assertTrue(mondayTooEarly.ok === false && mondayTooEarly.reason === "outside-working-hours", "Monday before 7:00 AM should be outside working hours");
+  assertTrue(saturdayCheckIn.ok === true, "Saturday 7:00 AM should allow check-in");
+  assertTrue(sundayCheckIn.ok === false && sundayCheckIn.reason === "taska-closed", "Sunday check-in should be blocked");
+  assertTrue(lateCheckout.ok === true, "Checkout after closing time should still be allowed");
+  console.log("PASS operating hours check-in and checkout rules");
 }
 
 function runOvertimeChecks() {
-  const overtimeInvoice = feeEngine.calculateMonthlyInvoice({
-    periodKey: "2026-04",
-    periodDate: new Date(2026, 3, 1),
-    payerType: "nonstaff",
-    table,
-    careMode: "transit_2h_month",
-    ageMonths: 30,
-    baseCode: "transit_2h_month",
-    transportUsed: false,
-    transitUsage: {},
-    attendanceRows: [
-      {
-        checkInAt: new Date(2026, 3, 10, 17, 0, 0),
-        checkOutAt: new Date(2026, 3, 10, 21, 10, 0),
-      },
-    ],
-    absenceAdjustment: { hasAbsenceLetter: false, absenceDaysWithLetter: 0 },
+  const monday = findDateByWeekday(2026, 5, 1);
+  const saturday = findDateByWeekday(2026, 5, 6);
+
+  const mondayTenPast = feeEngine.calculateOvertimeForAttendance({
+    date: monday,
+    checkOutAt: withLocalTime(monday, 19, 10),
   });
+  assertTrue(mondayTenPast.totalSen === 500, `Monday 7:10 PM should charge RM5, got ${mondayTenPast.totalSen}`);
 
-  assertAmount(overtimeInvoice.items, "overtime_after_530", 1800, "after-5:30 overtime should round 2.5 hours to 3 hours");
-  assertAmount(overtimeInvoice.items, "overtime_8pm_12am", 2600, "8pm-12am overtime should round 70 minutes to 2 hours");
+  const mondayEightOhFive = feeEngine.calculateOvertimeForAttendance({
+    date: monday,
+    checkOutAt: withLocalTime(monday, 20, 5),
+  });
+  assertTrue(mondayEightOhFive.totalSen === 1500, `Monday 8:05 PM should charge RM15, got ${mondayEightOhFive.totalSen}`);
 
-  console.log("PASS overtime windows and rounding");
+  const saturdayThreePm = feeEngine.calculateOvertimeForAttendance({
+    date: saturday,
+    checkOutAt: withLocalTime(saturday, 15, 0),
+  });
+  assertTrue(saturdayThreePm.totalSen === 600, `Saturday 3:00 PM should charge RM6, got ${saturdayThreePm.totalSen}`);
+
+  const saturdayFourTen = feeEngine.calculateOvertimeForAttendance({
+    date: saturday,
+    checkOutAt: withLocalTime(saturday, 16, 10),
+  });
+  assertTrue(saturdayFourTen.totalSen === 2400, `Saturday 4:10 PM should charge RM24, got ${saturdayFourTen.totalSen}`);
+
+  const overtimeInvoice = feeEngine.calculateMonthlyInvoice({
+    periodKey: "2026-06",
+    periodDate: myDate(2026, 6, 1),
+    registrationDate: myDate(2026, 4, 1),
+    yearlyFeeCoveredYear: 2026,
+    payerType: "nonstaff",
+    table: catalog,
+    careMode: "fulltime",
+    ageMonths: 16,
+    attendanceRows: [
+      { date: monday, checkOutAt: withLocalTime(monday, 19, 10) },
+      { date: saturday, checkOutAt: withLocalTime(saturday, 15, 0) },
+    ],
+  });
+  assertAmount(overtimeInvoice.items, "overtime_charge", 1100, "Overtime should appear as a separate invoice line item");
+  console.log("PASS overtime rates and separate line item");
 }
 
 function runCasualTransitChecks() {
+  const monday = findDateByWeekday(2026, 5, 1);
   const casualCharge = feeEngine.calculateCasualTransitCharge({
     payerType: "nonstaff",
     transitType: "1 Day",
     ageMonths: 36,
-    checkInAt: new Date(2026, 3, 10, 14, 0, 0),
-    actualCheckOutAt: new Date(2026, 3, 10, 19, 0, 0),
-    table,
+    checkInAt: withLocalTime(monday, 14, 0),
+    actualCheckOutAt: withLocalTime(monday, 19, 10),
+    table: catalog,
   });
 
-  assertTrue(casualCharge.transitType === "CASUAL_TRANSIT_1_DAY", "casual transit type should normalize to 1 day");
-  assertTrue(casualCharge.baseAmountSen === 2000, `casual transit base should be 2000, got ${casualCharge.baseAmountSen}`);
-  assertTrue(casualCharge.overtimeAmountSen === 1200, `casual transit overtime should be 1200, got ${casualCharge.overtimeAmountSen}`);
-  assertTrue(casualCharge.totalAmountSen === 3200, `casual transit total should be 3200, got ${casualCharge.totalAmountSen}`);
-  console.log("PASS casual transit totals");
+  assertTrue(casualCharge.transitType === "CASUAL_TRANSIT_1_DAY", "Casual transit type should normalize to 1 day");
+  assertTrue(casualCharge.baseAmountSen === 2000, `Casual transit base should stay 2000, got ${casualCharge.baseAmountSen}`);
+  assertTrue(casualCharge.overtimeAmountSen === 500, `Casual transit overtime should use new overtime rules, got ${casualCharge.overtimeAmountSen}`);
+  console.log("PASS casual transit remains separate");
 }
 
 function run() {
   runAgeBandChecks();
   runRegistrationChecks();
-  runJanuaryChecks();
-  runAbsenceDiscountChecks();
+  runStaffNeutralChecks();
+  runYearlyMaintenanceChecks();
+  runInvoiceScheduleChecks();
+  runOperatingHoursChecks();
   runOvertimeChecks();
   runCasualTransitChecks();
   console.log("All fee engine checks passed.");

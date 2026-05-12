@@ -36,11 +36,38 @@ function adminReq(data) {
   };
 }
 
+async function withMockDate(fixedDate, fn) {
+  const RealDate = Date;
+  const fixed = new RealDate(fixedDate);
+
+  function MockDate(...args) {
+    if (new.target) {
+      if (!args.length) return new RealDate(fixed);
+      return new RealDate(...args);
+    }
+    if (!args.length) return new RealDate(fixed).toString();
+    return RealDate(...args);
+  }
+
+  MockDate.UTC = RealDate.UTC;
+  MockDate.parse = RealDate.parse;
+  MockDate.now = () => new RealDate(fixed).getTime();
+  MockDate.prototype = RealDate.prototype;
+
+  global.Date = MockDate;
+  try {
+    return await fn();
+  } finally {
+    global.Date = RealDate;
+  }
+}
+
 async function run() {
   const suffix = Date.now().toString(36).toUpperCase();
   const parentId = `e2e-att-parent-${suffix}`;
   const childId = `e2e-att-child-${suffix}`;
   const token = `PICKUP${suffix}`;
+  const weekdayInHoursIso = "2026-05-12T01:30:00.000Z";
 
   await db.collection("parents").doc(parentId).set({
     parentName: "E2E Parent",
@@ -59,6 +86,66 @@ async function run() {
     nfc_uid: "A1B2C3D4",
   }, { merge: true });
 
+  const closedDayChildId = `e2e-att-closed-${suffix}`;
+  await db.collection("children").doc(closedDayChildId).set({
+    name: "E2E Closed Day Child",
+    parentName: "E2E Parent",
+    parentContact: "01122233344",
+    nfc_uid: `SUNDAY${suffix}`,
+  }, { merge: true });
+
+  const closedDayCheckIn = await withMockDate("2026-05-17T01:00:00.000Z", async () => fns.attendanceNfcCheckIn.run(teacherReq({
+    childId: closedDayChildId,
+    nfcUid: `SUNDAY${suffix}`,
+    teacherName: "E2E Teacher",
+  })));
+  assertTrue(!closedDayCheckIn.ok && closedDayCheckIn.reason === "taska-closed-today", "Sunday NFC check-in should be blocked");
+
+  const earlyChildId = `e2e-att-early-${suffix}`;
+  const earlyAttendanceDate = "2026-05-13";
+  const earlyCheckInAtIso = "2026-05-12T22:30:00.000Z";
+  const earlyAttendanceId = `${earlyAttendanceDate}_${earlyChildId}`;
+  await db.collection("children").doc(earlyChildId).set({
+    name: "E2E Early Child",
+    parentName: "E2E Parent",
+    parentContact: "01122233344",
+    nfc_uid: `EARLY${suffix}`,
+  }, { merge: true });
+
+  const earlyWithoutReason = await fns.attendanceAdminOverride.run(adminReq({
+    action: "MANUAL_CHECK_IN",
+    childId: earlyChildId,
+    attendanceDate: earlyAttendanceDate,
+    checkInAt: earlyCheckInAtIso,
+    adminName: "E2E Admin",
+  }));
+  assertTrue(!earlyWithoutReason.ok && earlyWithoutReason.reason === "manual-check-in-requires-reason", "Outside-hours manual check-in should require a reason");
+
+  const earlyWithReason = await fns.attendanceAdminOverride.run(adminReq({
+    action: "MANUAL_CHECK_IN",
+    childId: earlyChildId,
+    attendanceDate: earlyAttendanceDate,
+    checkInAt: earlyCheckInAtIso,
+    reason: "Emergency early drop-off",
+    notes: "Parent shift starts before opening hours",
+    adminName: "E2E Admin",
+  }));
+  assertTrue(earlyWithReason && earlyWithReason.ok, `outside-hours manual check-in failed: ${JSON.stringify(earlyWithReason)}`);
+
+  const earlyAttendanceSnap = await db.collection("attendance").doc(earlyAttendanceId).get();
+  const earlyAttendance = earlyAttendanceSnap.data() || {};
+  assertTrue(earlyAttendanceSnap.exists, "outside-hours manual check-in record missing");
+  assertTrue(String(earlyAttendance.status || "") === "CHECKED_IN", "outside-hours manual check-in should create a CHECKED_IN record");
+
+  const earlyAuditSnap = await db.collection("attendanceAudit")
+    .where("attendanceId", "==", earlyAttendanceId)
+    .where("action", "==", "MANUAL_CHECK_IN")
+    .limit(1)
+    .get();
+  assertTrue(!earlyAuditSnap.empty, "outside-hours manual check-in audit entry missing");
+  const earlyAudit = earlyAuditSnap.docs[0].data() || {};
+  assertTrue(String(earlyAudit.details && earlyAudit.details.operatingHoursDecision || "") === "outside-working-hours", "outside-hours audit decision missing");
+
   await db.collection("parents").doc(parentId).collection("tokens").doc(token).set({
     parentId,
     childId,
@@ -69,11 +156,11 @@ async function run() {
     representativeRole: "Mother",
   }, { merge: true });
 
-  const checkIn = await fns.attendanceNfcCheckIn.run(teacherReq({
+  const checkIn = await withMockDate(weekdayInHoursIso, async () => fns.attendanceNfcCheckIn.run(teacherReq({
     childId,
     nfcUid: "A1B2C3D4",
     teacherName: "E2E Teacher",
-  }));
+  })));
   assertTrue(checkIn && checkIn.ok, `check-in failed: ${JSON.stringify(checkIn)}`);
 
   const attendanceId = `${checkIn.dateKey}_${childId}`;
@@ -85,11 +172,11 @@ async function run() {
   assertTrue(Boolean(attendance.checkInAt), "checkInAt missing after check-in");
   assertTrue(!attendance.check_out_time, "check_out_time should be empty after check-in");
 
-  const duplicateCheckIn = await fns.attendanceNfcCheckIn.run(teacherReq({
+  const duplicateCheckIn = await withMockDate(weekdayInHoursIso, async () => fns.attendanceNfcCheckIn.run(teacherReq({
     childId,
     nfcUid: "A1B2C3D4",
     teacherName: "E2E Teacher",
-  }));
+  })));
   assertTrue(!duplicateCheckIn.ok && duplicateCheckIn.reason === "attendance-already-open", "duplicate check-in should be rejected");
 
   const checkOut = await fns.attendanceCheckoutWithParentQr.run(teacherReq({
@@ -266,7 +353,7 @@ async function run() {
   const duplicateCanonicalAttendanceSnap = await db.collection("attendance").doc(`${checkIn.dateKey}_${esp32ChildId}`).get();
   assertTrue(!duplicateCanonicalAttendanceSnap.exists, "Admin override should not create a duplicate canonical attendance document for ESP32-style records");
 
-  console.log("PASS attendance E2E: NFC check-in + QR checkout + ESP32 QR checkout + admin override audit");
+  console.log("PASS attendance E2E: operating-hours policy + NFC check-in + QR checkout + ESP32 QR checkout + admin override audit");
 }
 
 run().catch((err) => {

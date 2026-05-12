@@ -260,7 +260,7 @@ async function run() {
   const uid = "e2e-parent-1";
   const currentPeriod = monthKey(new Date());
 
-  // Case 1: Registration month should add registration fee on top of the monthly base and use due day 5
+  // Case 1: Registration month should add registration fee, insurance/takaful, yearly maintenance, and monthly fee with due day 7
   const parent1 = "e2e-parent-reg";
   const child1 = "e2e-child-reg";
   await createParent({ parentId: parent1, phoneE164: phone });
@@ -283,17 +283,21 @@ async function run() {
   const inv1 = await fetchInvoiceByPeriod({ parentId: parent1, period: currentPeriod });
   assertTrue(inv1, "Case1: invoice missing");
   const items1 = Array.isArray(inv1.data.items) ? inv1.data.items : [];
-  const hasReg = items1.some((i) => i.code === "registration_fulltime_oneoff");
-  const hasMonthlyBase = items1.some((i) => String(i.code || "").startsWith("monthly_"));
+  const hasReg = items1.some((i) => i.code === "registration_fee");
+  const hasInsurance = items1.some((i) => i.code === "insurance_takaful");
+  const hasYearlyMaintenance = items1.some((i) => i.code === "yearly_maintenance_fee");
+  const hasMonthlyBase = items1.some((i) => i.code === "monthly_fee");
   assertTrue(hasReg, "Case1: registration fee item missing");
+  assertTrue(hasInsurance, "Case1: insurance/takaful item missing");
+  assertTrue(hasYearlyMaintenance, "Case1: yearly maintenance item missing");
   assertTrue(hasMonthlyBase, "Case1: monthly base should still be present in registration month");
   const notes1 = Array.isArray(inv1.data.billingMeta && inv1.data.billingMeta.policyNotes)
     ? inv1.data.billingMeta.policyNotes
     : [];
-  assertTrue(notes1.some((note) => String(note).includes('tidak akan dikembalikan')), "Case1: registration policy note missing");
+  assertTrue(notes1.some((note) => String(note).includes("Registration billing includes")), "Case1: registration policy note missing");
   const due1 = inv1.data.dueDate && inv1.data.dueDate.toDate ? inv1.data.dueDate.toDate() : null;
-  assertTrue(due1 && due1.getDate() === 5, "Case1: due day expected 5");
-  console.log("PASS Case1 registration-month + due day 5");
+  assertTrue(due1 && due1.getDate() === 7, "Case1: due day expected 7");
+  console.log("PASS Case1 registration-month Taska Zurah charges + due day 7");
 
   const regRefreshRes = await fns.billingCreateDemoInvoiceForCurrentMonth.run(mkReq({
     uid,
@@ -306,12 +310,14 @@ async function run() {
   const inv1Refreshed = await fetchInvoiceByPeriod({ parentId: parent1, period: currentPeriod });
   assertTrue(inv1Refreshed, "Case1a: refreshed invoice missing");
   const refreshedItems1 = Array.isArray(inv1Refreshed.data.items) ? inv1Refreshed.data.items : [];
-  assertTrue(refreshedItems1.some((item) => item.code === "registration_fulltime_oneoff"),
+  assertTrue(refreshedItems1.some((item) => item.code === "registration_fee"),
     "Case1a: registration fee must survive same-period refresh");
-  assertTrue(refreshedItems1.some((item) => item.code === "monthly_fulltime_3m_2y"),
+  assertTrue(refreshedItems1.some((item) => item.code === "monthly_fee"),
     "Case1a: monthly fee must survive same-period refresh");
-  assertTrue(refreshedItems1.some((item) => item.code === "comms_book_oneoff" || item.code === "comms_book_4months"),
-    "Case1a: communication book fee must survive same-period refresh");
+  assertTrue(refreshedItems1.some((item) => item.code === "insurance_takaful"),
+    "Case1a: insurance/takaful fee must survive same-period refresh");
+  assertTrue(refreshedItems1.some((item) => item.code === "yearly_maintenance_fee"),
+    "Case1a: yearly maintenance fee must survive same-period refresh");
   assertTrue(Number(inv1Refreshed.data.totalSen || 0) === Number(inv1.data.totalSen || 0),
     "Case1a: same-period refresh should keep the original total");
   console.log("PASS Case1a same-parent refresh keeps registration-month charges");
