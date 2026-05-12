@@ -243,6 +243,40 @@ function runOvertimeChecks() {
   console.log("PASS overtime rates and separate line item");
 }
 
+function runOvertimeCycleLabelChecks() {
+  const cycle = feeEngine.determineOvertimeCycleForInvoice({
+    invoiceMonth: myDate(2026, 5, 1),
+    registrationDate: myDate(2026, 1, 1),
+    policy: catalog.policy,
+  });
+  assertTrue(feeEngine.malaysiaDateKey(cycle.cycleStart) === "2026-03-21", `May invoice overtime should start on 2026-03-21, got ${feeEngine.malaysiaDateKey(cycle.cycleStart)}`);
+  assertTrue(feeEngine.malaysiaDateKey(cycle.cycleEnd) === "2026-04-20", `May invoice overtime should end on 2026-04-20, got ${feeEngine.malaysiaDateKey(cycle.cycleEnd)}`);
+
+  const marchOnlyDay = myDate(2026, 3, 25);
+  const marchOnlyCharge = feeEngine.calculateOvertimeForCycle({
+    attendanceRows: [
+      { date: marchOnlyDay, checkOutAt: withLocalTime(marchOnlyDay, 19, 10) },
+    ],
+    cycleStart: cycle.cycleStart,
+    cycleEnd: cycle.cycleEnd,
+    policy: catalog.policy,
+  });
+  assertTrue(marchOnlyCharge.totalSen === 500, `March-only overtime in the closed cycle should still bill RM5, got ${marchOnlyCharge.totalSen}`);
+
+  const lineDescription = feeEngine.formatOvertimeLineDescription({
+    label: "Overtime Charge",
+    cycleStart: cycle.cycleStart,
+    cycleEnd: cycle.cycleEnd,
+    breakdown: marchOnlyCharge.breakdown,
+    weekdayBlocks: marchOnlyCharge.weekdayBlocks,
+    saturdayBlocks: marchOnlyCharge.saturdayBlocks,
+    policy: catalog.policy,
+  });
+  assertTrue(lineDescription.includes("2026-03-21 to 2026-04-20"), `Overtime line should show the full 21st-to-20th range, got ${lineDescription}`);
+  assertTrue(lineDescription.includes("Weekday RM5.00/30 min"), `Overtime line should show the weekday rate even for March-only overtime, got ${lineDescription}`);
+  console.log("PASS overtime cycle label and rate summary");
+}
+
 function runCasualTransitChecks() {
   const monday = findDateByWeekday(2026, 5, 1);
   const casualCharge = feeEngine.calculateCasualTransitCharge({
@@ -268,6 +302,7 @@ function run() {
   runInvoiceScheduleChecks();
   runOperatingHoursChecks();
   runOvertimeChecks();
+  runOvertimeCycleLabelChecks();
   runCasualTransitChecks();
   console.log("All fee engine checks passed.");
 }

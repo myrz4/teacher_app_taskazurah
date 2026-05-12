@@ -5665,31 +5665,49 @@ async function buildClosedOvertimeChargeForInvoice({ child, childId, invoicePeri
     });
   const sourcePeriod = cycle.cycleEnd ? monthKey(cycle.cycleEnd) : "";
   const sourcePeriodLabel = cycle.cycleStart && cycle.cycleEnd
-    ? `${attendanceDateKey(cycle.cycleStart)} to ${attendanceDateKey(cycle.cycleEnd)}`
+    ? `${feeEngine.malaysiaDateKey(cycle.cycleStart)} to ${feeEngine.malaysiaDateKey(cycle.cycleEnd)}`
     : "";
+  const overtimeWeekdayBlocks = Number(rawOvertime.weekdayBlocks || 0);
+  const overtimeSaturdayBlocks = Number(rawOvertime.saturdayBlocks || 0);
 
   return {
     applied: true,
     overtime: {
       items: (Array.isArray(rawOvertime.items) ? rawOvertime.items : []).map((item) => ({
         ...item,
-        label: `${String(item.label || item.description || item.code || "Lebih Masa").trim()} (${sourcePeriodLabel})`,
-        description: `${String(item.description || item.label || item.code || "Lebih Masa").trim()} (${sourcePeriodLabel})`,
-        notes: [
+        label: feeEngine.formatOvertimeLineDescription({
+          label: String(item.label || item.description || item.code || "Lebih Masa").trim(),
+          cycleStart: cycle.cycleStart,
+          cycleEnd: cycle.cycleEnd,
+          breakdown: rawOvertime.breakdown,
+          weekdayBlocks: overtimeWeekdayBlocks,
+          saturdayBlocks: overtimeSaturdayBlocks,
+          policy: feePolicy,
+        }),
+        description: feeEngine.formatOvertimeLineDescription({
+          label: String(item.description || item.label || item.code || "Lebih Masa").trim(),
+          cycleStart: cycle.cycleStart,
+          cycleEnd: cycle.cycleEnd,
+          breakdown: rawOvertime.breakdown,
+          weekdayBlocks: overtimeWeekdayBlocks,
+          saturdayBlocks: overtimeSaturdayBlocks,
+          policy: feePolicy,
+        }),
+        notes: dedupePolicyNotes([
           ...(Array.isArray(item.notes) ? item.notes : []),
           sourcePeriod ? `Closed overtime cycle ${sourcePeriod}` : "",
-          cycle.partialRegistrationMonth && cycle.cycleStart ? `Cycle started on registration date ${attendanceDateKey(cycle.cycleStart)}` : "",
-        ].filter(Boolean),
+          cycle.partialRegistrationMonth && cycle.cycleStart ? `Cycle started on registration date ${feeEngine.malaysiaDateKey(cycle.cycleStart)}` : "",
+        ].filter(Boolean)),
         sourcePeriod,
         sourcePeriodLabel,
-        cycleStartDate: cycle.cycleStart ? attendanceDateKey(cycle.cycleStart) : "",
-        cycleEndDate: cycle.cycleEnd ? attendanceDateKey(cycle.cycleEnd) : "",
+        cycleStartDate: cycle.cycleStart ? feeEngine.malaysiaDateKey(cycle.cycleStart) : "",
+        cycleEndDate: cycle.cycleEnd ? feeEngine.malaysiaDateKey(cycle.cycleEnd) : "",
         cycleType: "21-to-20-overtime-cycle",
       })),
       totalSen: moneySen(rawOvertime.totalSen),
       breakdown: Array.isArray(rawOvertime.breakdown) ? rawOvertime.breakdown : [],
-      weekdayBlocks: Number(rawOvertime.weekdayBlocks || 0),
-      saturdayBlocks: Number(rawOvertime.saturdayBlocks || 0),
+      weekdayBlocks: overtimeWeekdayBlocks,
+      saturdayBlocks: overtimeSaturdayBlocks,
       managementReviewRecommended: Boolean(rawOvertime.managementReviewRecommended),
     },
     sourcePeriod,

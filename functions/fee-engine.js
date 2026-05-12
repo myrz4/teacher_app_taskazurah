@@ -892,6 +892,75 @@ function calculateOvertimeForCycle({ attendanceRows, cycleStart, cycleEnd, polic
   return calculateOvertimeCharge({ attendanceRows: filteredRows, policy });
 }
 
+function overtimeRateDisplayParts({
+  breakdown,
+  weekdayBlocks = 0,
+  saturdayBlocks = 0,
+  policy = DEFAULT_FEE_POLICY,
+}) {
+  const resolvedPolicy = resolveFeePolicy(policy);
+  let weekdayRateSen = 0;
+  let saturdayRateSen = 0;
+
+  for (const charge of Array.isArray(breakdown) ? breakdown : []) {
+    const rateSen = moneySen(charge && charge.rateSen);
+    if (rateSen <= 0) continue;
+    const dayType = String(charge && charge.dayType ? charge.dayType : "").trim().toUpperCase();
+    if (dayType === "SATURDAY") {
+      if (saturdayRateSen <= 0) {
+        saturdayRateSen = rateSen;
+      }
+      continue;
+    }
+    if (weekdayRateSen <= 0) {
+      weekdayRateSen = rateSen;
+    }
+  }
+
+  if (weekdayBlocks > 0 && weekdayRateSen <= 0) {
+    weekdayRateSen = moneySen(resolvedPolicy.operatingHours.weekday.overtimeHalfHourRateSen);
+  }
+  if (saturdayBlocks > 0 && saturdayRateSen <= 0) {
+    saturdayRateSen = moneySen(resolvedPolicy.operatingHours.saturday.overtimeHalfHourRateSen);
+  }
+
+  const parts = [];
+  if (weekdayBlocks > 0 && weekdayRateSen > 0) {
+    parts.push(`Weekday RM${(weekdayRateSen / 100).toFixed(2)}/30 min`);
+  }
+  if (saturdayBlocks > 0 && saturdayRateSen > 0) {
+    parts.push(`Saturday RM${(saturdayRateSen / 100).toFixed(2)}/30 min`);
+  }
+  return parts;
+}
+
+function formatOvertimeLineDescription({
+  label = "Overtime Charge",
+  cycleStart,
+  cycleEnd,
+  breakdown,
+  weekdayBlocks = 0,
+  saturdayBlocks = 0,
+  policy = DEFAULT_FEE_POLICY,
+}) {
+  const safeLabel = String(label || "Overtime Charge").trim() || "Overtime Charge";
+  const details = [];
+  const start = asDate(cycleStart);
+  const end = asDate(cycleEnd);
+
+  if (start && end) {
+    details.push(`${malaysiaDateKey(start)} to ${malaysiaDateKey(end)}`);
+  }
+  details.push(...overtimeRateDisplayParts({
+    breakdown,
+    weekdayBlocks,
+    saturdayBlocks,
+    policy,
+  }));
+
+  return details.length ? `${safeLabel} (${details.join("; ")})` : safeLabel;
+}
+
 function generateInvoiceLineItems({
   periodKey,
   periodDate,
@@ -1245,6 +1314,8 @@ module.exports = {
   calculateJanuaryInvoice,
   calculateCasualTransitCharge,
   calculateOvertimeCharge,
+  overtimeRateDisplayParts,
+  formatOvertimeLineDescription,
   generateInvoiceLineItems,
   baseCodeForCareMode,
   normalizeCareMode,
