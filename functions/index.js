@@ -19,6 +19,20 @@ const feeEngine = require("./fee-engine");
 
 const BILLPLZ_API_KEY_SECRET = defineSecret("BILLPLZ_API_KEY");
 const BILLPLZ_X_SIGNATURE_KEY_SECRET = defineSecret("BILLPLZ_X_SIGNATURE_KEY");
+const STRIPE_SECRET_KEY_SECRET = defineSecret("STRIPE_SECRET_KEY");
+
+const STRIPE_DEMO_PROVIDER = "stripe";
+const STRIPE_DEMO_PROVIDER_LABEL = "Stripe Test Mode";
+const STRIPE_DEMO_MODE = "payment_sheet";
+const STRIPE_DEMO_METHOD = "Stripe Demo";
+const STRIPE_DEMO_PROVIDER_MODE = "test";
+const STRIPE_DEMO_CURRENCY = "myr";
+const STRIPE_DEMO_SESSION_SCAN_LIMIT = 12;
+const stripeDemoMockPaymentIntents = new Map();
+let stripeDemoClientCache = {
+  secretKey: "",
+  client: null,
+};
 
 // 🔧 Initialize Firebase Admin SDK
 admin.initializeApp();
@@ -4749,6 +4763,10 @@ function paymentGatewaySecret(name) {
     const secretValue = BILLPLZ_X_SIGNATURE_KEY_SECRET.value();
     if (secretValue) return String(secretValue).trim();
   }
+  if (normalized === "STRIPE_SECRET_KEY") {
+    const secretValue = STRIPE_SECRET_KEY_SECRET.value();
+    if (secretValue) return String(secretValue).trim();
+  }
   return "";
 }
 
@@ -4980,7 +4998,451 @@ async function createRedirectCheckoutSessionSkeleton({ gatewayConfig }) {
   };
 }
 
-async function finalizeSuccessfulProviderPayment({ req, invoiceRef, sessionRef, provider, method, bank, externalPaymentId, externalReceiptNo, providerPayload, completedAt }) {
+function stripeDemoShouldUseMock() {
+  return String(process.env.STRIPE_DEMO_USE_MOCK || "").trim().toLowerCase() === "true";
+}
+
+function stripeDemoGatewayConfig() {
+  return {
+    provider: STRIPE_DEMO_PROVIDER,
+    mode: STRIPE_DEMO_MODE,
+    enabled: true,
+    isSandbox: true,
+    allowRealProvider: true,
+  };
+}
+
+function stripeDemoConfigError() {
+  const secretKey = paymentGatewaySecret("STRIPE_SECRET_KEY");
+  if (!secretKey) {
+    return {
+      ok: false,
+      reason: "stripe-demo-not-configured",
+      message: "Stripe demo is not configured. Set STRIPE_SECRET_KEY to a Stripe test secret key.",
+    };
+  }
+  if (!stripeDemoShouldUseMock() && !secretKey.startsWith("sk_test_")) {
+    return {
+      ok: false,
+      reason: "stripe-demo-test-key-required",
+      message: "Stripe demo only accepts Stripe test secret keys (sk_test_...).",
+    };
+  }
+  return null;
+}
+
+function stripeDemoInvoiceScope(invoiceData) {
+  const billingMeta = invoiceData && typeof invoiceData.billingMeta === "object"
+    ? invoiceData.billingMeta
+    : null;
+  const rawScope = String(billingMeta && billingMeta.invoiceScope ? billingMeta.invoiceScope : "")
+    .trim()
+    .toLowerCase();
+  if (rawScope) return rawScope;
+  return invoiceChildIds(invoiceData).length > 1 ? "family" : "single";
+}
+
+function stripeDemoFamilyId(parentData, invoiceData) {
+  const candidates = [
+    parentData && parentData.familyId,
+    parentData && parentData.familyKey,
+    parentData && parentData.householdId,
+    invoiceData && invoiceData.familyId,
+    invoiceData && invoiceData.familyKey,
+  ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate || "").trim();
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function stripeDemoPaymentIntentMetadata({ parentId, parentData, invoiceId, invoiceData }) {
+  const metadata = {
+    parentId: String(parentId || "").trim(),
+    invoiceId: String(invoiceId || "").trim(),
+    invoiceScope: stripeDemoInvoiceScope(invoiceData),
+  };
+  const familyId = stripeDemoFamilyId(parentData, invoiceData);
+  if (familyId) metadata.familyId = familyId;
+  return metadata;
+}
+
+function stripeDemoSessionStateFromIntentStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (!normalized) return "pending";
+  if (normalized === "succeeded") return "succeeded";
+  if (normalized === "processing" || normalized === "requires_capture") return "processing";
+  if (normalized === "canceled") return "cancelled";
+  return "pending";
+}
+
+function stripeDemoCloneIntent(intent) {
+  return JSON.parse(JSON.stringify(intent || {}));
+}
+
+function stripeDemoCardDetails(intent) {
+  const latestCharge = intent && intent.latest_charge && typeof intent.latest_charge === "object"
+    ? intent.latest_charge
+    : null;
+  const latestChargeCard = latestCharge
+    && latestCharge.payment_method_details
+    && latestCharge.payment_method_details.card
+    && typeof latestCharge.payment_method_details.card === "object"
+    ? latestCharge.payment_method_details.card
+    : null;
+  const paymentMethod = intent && intent.payment_method && typeof intent.payment_method === "object"
+    ? intent.payment_method
+    : null;
+  const paymentMethodCard = paymentMethod && paymentMethod.card && typeof paymentMethod.card === "object"
+    ? paymentMethod.card
+    : null;
+  const brand = String(
+    (paymentMethodCard && paymentMethodCard.brand)
+      || (latestChargeCard && latestChargeCard.brand)
+      || "",
+  ).trim();
+  const last4 = String(
+    (paymentMethodCard && paymentMethodCard.last4)
+      || (latestChargeCard && latestChargeCard.last4)
+      || "",
+  ).trim();
+  return { brand, last4 };
+}
+
+function stripeDemoProviderPayload(intent, extra = {}) {
+  const payload = {
+    providerMode: STRIPE_DEMO_PROVIDER_MODE,
+    sessionState: stripeDemoSessionStateFromIntentStatus(intent && intent.status),
+    paymentIntentId: String(intent && intent.id ? intent.id : "").trim(),
+    paymentIntentStatus: String(intent && intent.status ? intent.status : "").trim(),
+    invoiceScope: String(extra.invoiceScope || "").trim(),
+  };
+  const metadata = intent && intent.metadata && typeof intent.metadata === "object"
+    ? intent.metadata
+    : null;
+  if (metadata && Object.keys(metadata).length) {
+    payload.metadata = metadata;
+  }
+  const { brand, last4 } = stripeDemoCardDetails(intent);
+  if (brand) payload.cardBrand = brand;
+  if (last4) payload.cardLast4 = last4;
+  return {
+    ...payload,
+    ...(extra.patch && typeof extra.patch === "object" ? extra.patch : {}),
+  };
+}
+
+function stripeDemoResponsePayload({ invoiceData, sessionId, intent, paymentId = "", receiptNo = "", paid = false, already = false }) {
+  const { brand, last4 } = stripeDemoCardDetails(intent);
+  const currency = String((invoiceData && invoiceData.currency) || (intent && intent.currency) || "MYR")
+    .trim()
+    .toUpperCase();
+  const amountSen = moneySen((invoiceData && invoiceData.totalSen) || (intent && intent.amount) || 0);
+  return {
+    ok: true,
+    already,
+    paid,
+    sessionId: String(sessionId || "").trim(),
+    paymentIntentId: String(intent && intent.id ? intent.id : "").trim(),
+    clientSecret: String(intent && intent.client_secret ? intent.client_secret : "").trim(),
+    amountSen,
+    currency,
+    provider: STRIPE_DEMO_PROVIDER,
+    providerLabel: STRIPE_DEMO_PROVIDER_LABEL,
+    providerMode: STRIPE_DEMO_PROVIDER_MODE,
+    mode: STRIPE_DEMO_MODE,
+    method: STRIPE_DEMO_METHOD,
+    status: stripeDemoSessionStateFromIntentStatus(intent && intent.status),
+    invoiceScope: stripeDemoInvoiceScope(invoiceData),
+    paymentId: String(paymentId || "").trim(),
+    receiptNo: String(receiptNo || "").trim(),
+    cardBrand: brand,
+    cardLast4: last4,
+  };
+}
+
+function stripeDemoMockIntentId(prefix) {
+  return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
+}
+
+function stripeDemoMockCardPayload() {
+  return {
+    brand: "visa",
+    last4: "4242",
+  };
+}
+
+async function stripeDemoCreatePaymentIntent({ amountSen, currency, description, metadata }) {
+  if (stripeDemoShouldUseMock()) {
+    const intentId = stripeDemoMockIntentId("pi_mock");
+    const mockIntent = {
+      id: intentId,
+      amount: moneySen(amountSen),
+      currency: String(currency || STRIPE_DEMO_CURRENCY).trim().toLowerCase(),
+      client_secret: `${intentId}_secret_mock`,
+      status: "requires_payment_method",
+      description: String(description || "").trim(),
+      metadata: metadata || {},
+      payment_method_types: ["card"],
+      created: Math.floor(Date.now() / 1000),
+    };
+    stripeDemoMockPaymentIntents.set(intentId, mockIntent);
+    return stripeDemoCloneIntent(mockIntent);
+  }
+
+  const configError = stripeDemoConfigError();
+  if (configError) {
+    throw new Error(configError.message || configError.reason || "stripe-demo-not-configured");
+  }
+
+  const secretKey = paymentGatewaySecret("STRIPE_SECRET_KEY");
+  if (!stripeDemoClientCache.client || stripeDemoClientCache.secretKey !== secretKey) {
+    let Stripe = null;
+    try {
+      Stripe = require("stripe");
+    } catch (err) {
+      throw new Error("Stripe SDK is not installed in functions/package.json.");
+    }
+    stripeDemoClientCache = {
+      secretKey,
+      client: new Stripe(secretKey),
+    };
+  }
+
+  return stripeDemoClientCache.client.paymentIntents.create({
+    amount: moneySen(amountSen),
+    currency: String(currency || STRIPE_DEMO_CURRENCY).trim().toLowerCase() || STRIPE_DEMO_CURRENCY,
+    description: String(description || "").trim(),
+    payment_method_types: ["card"],
+    metadata: metadata || {},
+  });
+}
+
+async function stripeDemoRetrievePaymentIntent(paymentIntentId, options = {}) {
+  const normalizedId = String(paymentIntentId || "").trim();
+  if (!normalizedId) {
+    throw new Error("Missing Stripe PaymentIntent id.");
+  }
+
+  if (stripeDemoShouldUseMock()) {
+    const existing = stripeDemoMockPaymentIntents.get(normalizedId);
+    if (!existing) {
+      throw new Error("Stripe demo PaymentIntent was not found.");
+    }
+    if (options.autoSucceed === true && existing.status !== "succeeded") {
+      const card = stripeDemoMockCardPayload();
+      existing.status = "succeeded";
+      existing.payment_method = {
+        id: stripeDemoMockIntentId("pm_mock"),
+        type: "card",
+        card,
+      };
+      existing.latest_charge = {
+        id: stripeDemoMockIntentId("ch_mock"),
+        payment_method_details: {
+          card,
+        },
+      };
+    }
+    return stripeDemoCloneIntent(existing);
+  }
+
+  const configError = stripeDemoConfigError();
+  if (configError) {
+    throw new Error(configError.message || configError.reason || "stripe-demo-not-configured");
+  }
+
+  const secretKey = paymentGatewaySecret("STRIPE_SECRET_KEY");
+  if (!stripeDemoClientCache.client || stripeDemoClientCache.secretKey !== secretKey) {
+    let Stripe = null;
+    try {
+      Stripe = require("stripe");
+    } catch (err) {
+      throw new Error("Stripe SDK is not installed in functions/package.json.");
+    }
+    stripeDemoClientCache = {
+      secretKey,
+      client: new Stripe(secretKey),
+    };
+  }
+
+  return stripeDemoClientCache.client.paymentIntents.retrieve(normalizedId, {
+    expand: ["latest_charge", "payment_method"],
+  });
+}
+
+async function loadRecentBillingSessions(invoiceRef, limit = STRIPE_DEMO_SESSION_SCAN_LIMIT) {
+  try {
+    const snap = await invoiceRef.collection("sessions")
+      .orderBy("createdAt", "desc")
+      .limit(limit)
+      .get();
+    return snap.docs;
+  } catch (err) {
+    logger.warn("billing-sessions-fallback-read", {
+      invoicePath: invoiceRef.path,
+      error: String(err && err.message ? err.message : err),
+    });
+    const snap = await invoiceRef.collection("sessions").get();
+    return snap.docs.sort((left, right) => {
+      const leftMillis = Number(timestampMillis((left.data() || {}).createdAt) || "0");
+      const rightMillis = Number(timestampMillis((right.data() || {}).createdAt) || "0");
+      return rightMillis - leftMillis;
+    }).slice(0, limit);
+  }
+}
+
+async function stripeDemoResolveInvoiceContext(req) {
+  requireAuth(req);
+  const parentId = (req.data && req.data.parentId) ? String(req.data.parentId).trim() : "";
+  const invoiceId = (req.data && req.data.invoiceId) ? String(req.data.invoiceId).trim() : "";
+  if (!parentId || !invoiceId) return { ok: false, reason: "missing-args" };
+
+  const owner = await assertParentOwnerByPhone({ parentId, authToken: req.auth.token });
+  const invoiceRef = admin.firestore().collection("parents").doc(parentId).collection("invoices").doc(invoiceId);
+  const invoiceSnap = await invoiceRef.get();
+  if (!invoiceSnap.exists) return { ok: false, reason: "invoice-not-found" };
+
+  let invoiceData = invoiceSnap.data() || {};
+  const repaired = await repairInvoiceFromEquivalentPaidCopy({ invoiceRef, invoiceData });
+  invoiceData = repaired.invoiceData || invoiceData;
+
+  return {
+    ok: true,
+    parentId,
+    invoiceId,
+    owner,
+    parentData: owner.parentData || {},
+    invoiceRef,
+    invoiceData,
+  };
+}
+
+async function stripeDemoResolveSession({ invoiceRef, sessionId, paymentIntentId }) {
+  const normalizedSessionId = String(sessionId || "").trim();
+  const normalizedPaymentIntentId = String(paymentIntentId || "").trim();
+
+  if (normalizedSessionId) {
+    const sessionRef = invoiceRef.collection("sessions").doc(normalizedSessionId);
+    const sessionSnap = await sessionRef.get();
+    if (sessionSnap.exists) {
+      return { sessionRef, sessionData: sessionSnap.data() || {} };
+    }
+  }
+
+  if (normalizedPaymentIntentId) {
+    let sessionRef = await resolveSessionRefFromLookup("providerSessionId", normalizedPaymentIntentId);
+    if (!sessionRef) {
+      sessionRef = await resolveSessionRefFromLookup("providerReference", normalizedPaymentIntentId);
+    }
+    if (sessionRef && sessionRef.path.startsWith(`${invoiceRef.path}/sessions/`)) {
+      const sessionSnap = await sessionRef.get();
+      if (sessionSnap.exists) {
+        return { sessionRef, sessionData: sessionSnap.data() || {} };
+      }
+    }
+  }
+
+  const recentDocs = await loadRecentBillingSessions(invoiceRef);
+  for (const doc of recentDocs) {
+    const sessionData = doc.data() || {};
+    if (String(sessionData.provider || "").trim() !== STRIPE_DEMO_PROVIDER) continue;
+    const providerSessionId = String(sessionData.providerSessionId || sessionData.providerReference || "").trim();
+    if (!normalizedPaymentIntentId || providerSessionId === normalizedPaymentIntentId) {
+      return { sessionRef: doc.ref, sessionData };
+    }
+  }
+
+  return { sessionRef: null, sessionData: null };
+}
+
+async function stripeDemoUpdateSession({ sessionRef, sessionData, invoiceData, req, intent, statusOverride = "", extra = {} }) {
+  const patch = {
+    provider: STRIPE_DEMO_PROVIDER,
+    mode: STRIPE_DEMO_MODE,
+    providerMode: STRIPE_DEMO_PROVIDER_MODE,
+    paymentMethod: STRIPE_DEMO_METHOD,
+    status: String(statusOverride || stripeDemoSessionStateFromIntentStatus(intent && intent.status)).trim() || "pending",
+    currency: String((invoiceData && invoiceData.currency) || (intent && intent.currency) || "MYR").trim().toUpperCase(),
+    amountSen: moneySen((invoiceData && invoiceData.totalSen) || (intent && intent.amount) || 0),
+    providerSessionId: String(intent && intent.id ? intent.id : (sessionData && sessionData.providerSessionId) || "").trim(),
+    providerReference: String(intent && intent.id ? intent.id : (sessionData && sessionData.providerReference) || "").trim(),
+    gatewaySummary: paymentGatewaySummary(stripeDemoGatewayConfig()),
+    providerPayload: stripeDemoProviderPayload(intent, {
+      invoiceScope: stripeDemoInvoiceScope(invoiceData),
+      patch: extra.providerPayload,
+    }),
+    lastSyncedAt: admin.firestore.FieldValue.serverTimestamp(),
+    ...extra.fields,
+  };
+  if (!sessionData || !sessionData.createdAt) {
+    patch.createdAt = admin.firestore.FieldValue.serverTimestamp();
+    patch.createdByUid = (req && req.auth && req.auth.uid) ? req.auth.uid : "system";
+  }
+  await sessionRef.set(patch, { merge: true });
+  const updatedSnap = await sessionRef.get();
+  if (updatedSnap.exists) {
+    await upsertSessionLookupDocs({ sessionRef, sessionData: updatedSnap.data() || {} });
+    return updatedSnap.data() || {};
+  }
+  return patch;
+}
+
+async function stripeDemoFinalizeSuccessfulPayment({ req, parentId, parentData, invoiceRef, invoiceData, sessionRef, intent }) {
+  const card = stripeDemoCardDetails(intent);
+  const invoiceScope = stripeDemoInvoiceScope(invoiceData);
+  const familyId = stripeDemoFamilyId(parentData, invoiceData);
+  const finalized = await finalizeSuccessfulProviderPayment({
+    req,
+    invoiceRef,
+    sessionRef,
+    provider: STRIPE_DEMO_PROVIDER,
+    method: STRIPE_DEMO_METHOD,
+    bank: null,
+    externalPaymentId: String(intent && intent.id ? intent.id : "").trim(),
+    externalReceiptNo: "",
+    providerPayload: stripeDemoProviderPayload(intent, {
+      invoiceScope,
+      patch: {
+        settlementState: "paid",
+      },
+    }),
+    completedAt: admin.firestore.FieldValue.serverTimestamp(),
+    paymentPatch: {
+      status: "paid",
+      paymentStatus: "paid",
+      parentId,
+      providerMode: STRIPE_DEMO_PROVIDER_MODE,
+      stripePaymentIntentId: String(intent && intent.id ? intent.id : "").trim(),
+      stripePaymentStatus: String(intent && intent.status ? intent.status : "").trim(),
+      ...(familyId ? { familyId } : {}),
+      ...(card.brand ? { cardBrand: card.brand } : {}),
+      ...(card.last4 ? { cardLast4: card.last4 } : {}),
+    },
+    invoicePatch: {
+      paymentStatus: "paid",
+      paymentMethod: STRIPE_DEMO_METHOD,
+      paidProviderMode: STRIPE_DEMO_PROVIDER_MODE,
+      stripePaymentIntentId: String(intent && intent.id ? intent.id : "").trim(),
+      stripePaymentStatus: String(intent && intent.status ? intent.status : "").trim(),
+      ...(card.brand ? { paidCardBrand: card.brand } : {}),
+      ...(card.last4 ? { paidCardLast4: card.last4 } : {}),
+    },
+    sessionPatch: {
+      providerMode: STRIPE_DEMO_PROVIDER_MODE,
+      paymentMethod: STRIPE_DEMO_METHOD,
+      stripePaymentIntentId: String(intent && intent.id ? intent.id : "").trim(),
+      stripePaymentStatus: String(intent && intent.status ? intent.status : "").trim(),
+      lastSyncedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...(card.brand ? { cardBrand: card.brand } : {}),
+      ...(card.last4 ? { cardLast4: card.last4 } : {}),
+    },
+  });
+  return finalized;
+}
+
+async function finalizeSuccessfulProviderPayment({ req, invoiceRef, sessionRef, provider, method, bank, externalPaymentId, externalReceiptNo, providerPayload, completedAt, paymentPatch = {}, invoicePatch = {}, sessionPatch = {} }) {
   const paymentsCol = invoiceRef.parent.parent.collection("payments");
   const actorUid = (req && req.auth && req.auth.uid) ? req.auth.uid : "system";
 
@@ -4991,13 +5453,15 @@ async function finalizeSuccessfulProviderPayment({ req, invoiceRef, sessionRef, 
 
     const inv = invSnap.data() || {};
     const sess = sessSnap.data() || {};
-    if (String(sess.status || "").toLowerCase() === "succeeded" || String(inv.status || "").toLowerCase() === "paid") {
+    const existingPaymentId = String(inv.paidPaymentId || sess.paymentId || "").trim();
+    if (String(inv.status || "").toLowerCase() === "paid"
+      || (String(sess.status || "").toLowerCase() === "succeeded" && existingPaymentId)) {
       return {
         ok: true,
         already: true,
         provider,
         mode: String(sess.mode || "redirect"),
-        paymentId: String(inv.paidPaymentId || sess.paymentId || ""),
+        paymentId: existingPaymentId,
         receiptNo: String(inv.paidReceiptNo || sess.providerReceiptNo || externalReceiptNo || ""),
       };
     }
@@ -5005,6 +5469,7 @@ async function finalizeSuccessfulProviderPayment({ req, invoiceRef, sessionRef, 
     const totalSen = moneySen(inv.totalSen);
     const payRef = paymentsCol.doc();
     const receiptNo = String(externalReceiptNo || buildReceiptNo(payRef));
+    const completedAtValue = completedAt || admin.firestore.FieldValue.serverTimestamp();
 
     tx.set(payRef, {
       provider,
@@ -5020,11 +5485,12 @@ async function finalizeSuccessfulProviderPayment({ req, invoiceRef, sessionRef, 
       providerPayload: providerPayload || {},
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       createdByUid: actorUid,
+      ...paymentPatch,
     });
 
     tx.update(invoiceRef, {
       status: "paid",
-      paidAt: completedAt || admin.firestore.FieldValue.serverTimestamp(),
+      paidAt: completedAtValue,
       paidMethod: method,
       paidBank: bank || null,
       paidAmountSen: totalSen,
@@ -5032,17 +5498,19 @@ async function finalizeSuccessfulProviderPayment({ req, invoiceRef, sessionRef, 
       paidPaymentId: payRef.id,
       paidProvider: provider,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...invoicePatch,
     });
 
     tx.update(sessionRef, {
       status: "succeeded",
-      completedAt: completedAt || admin.firestore.FieldValue.serverTimestamp(),
+      completedAt: completedAtValue,
       method,
       bank: bank || null,
       paymentId: payRef.id,
       providerReceiptNo: receiptNo,
       externalPaymentId: externalPaymentId || null,
       providerPayload: providerPayload || {},
+      ...sessionPatch,
     });
 
     return {
@@ -6112,6 +6580,342 @@ async function billingSyncCheckoutSessionImpl(req) {
   return adapter.syncSession({ req, parentId, invoiceId, sessionId, invoiceRef, sessionRef });
 }
 
+async function createStripeDemoPaymentIntentImpl(req) {
+  const context = await stripeDemoResolveInvoiceContext(req);
+  if (!context.ok) return context;
+
+  const configError = stripeDemoConfigError();
+  if (configError) return configError;
+
+  const { parentId, invoiceId, parentData, invoiceRef } = context;
+  let invoiceData = context.invoiceData || {};
+  if (String(invoiceData.status || "").toLowerCase() === "paid") {
+    return {
+      ok: false,
+      reason: "already-paid",
+      message: "This invoice is already marked as paid.",
+      invoiceId,
+      parentId,
+      paymentId: String(invoiceData.paidPaymentId || "").trim(),
+      receiptNo: String(invoiceData.paidReceiptNo || "").trim(),
+    };
+  }
+
+  const amountSen = moneySen(invoiceData.totalSen);
+  if (amountSen <= 0) {
+    return {
+      ok: false,
+      reason: "invalid-amount",
+      message: "Stripe demo only supports invoices with a positive amount.",
+    };
+  }
+
+  const recentDocs = await loadRecentBillingSessions(invoiceRef);
+  for (const doc of recentDocs) {
+    const sessionData = doc.data() || {};
+    if (String(sessionData.provider || "").trim() !== STRIPE_DEMO_PROVIDER) continue;
+    const paymentIntentId = String(sessionData.providerSessionId || sessionData.providerReference || "").trim();
+    if (!paymentIntentId) continue;
+    try {
+      const intent = await stripeDemoRetrievePaymentIntent(paymentIntentId);
+      const sessionState = stripeDemoSessionStateFromIntentStatus(intent && intent.status);
+      await stripeDemoUpdateSession({
+        sessionRef: doc.ref,
+        sessionData,
+        invoiceData,
+        req,
+        intent,
+        statusOverride: sessionState,
+      });
+      if (sessionState === "succeeded") {
+        const finalized = await stripeDemoFinalizeSuccessfulPayment({
+          req,
+          parentId,
+          parentData,
+          invoiceRef,
+          invoiceData,
+          sessionRef: doc.ref,
+          intent,
+        });
+        const refreshedInvoiceSnap = await invoiceRef.get();
+        invoiceData = refreshedInvoiceSnap.exists ? refreshedInvoiceSnap.data() || invoiceData : invoiceData;
+        return {
+          ...stripeDemoResponsePayload({
+            invoiceData,
+            sessionId: doc.id,
+            intent,
+            paymentId: finalized.paymentId,
+            receiptNo: finalized.receiptNo,
+            paid: true,
+            already: Boolean(finalized.already),
+          }),
+          message: "This invoice has already been settled.",
+        };
+      }
+      if (sessionState === "pending" || sessionState === "processing") {
+        return stripeDemoResponsePayload({
+          invoiceData,
+          sessionId: doc.id,
+          intent,
+        });
+      }
+    } catch (err) {
+      logger.warn("stripe-demo-reuse-session-failed", {
+        invoiceId,
+        sessionId: doc.id,
+        paymentIntentId,
+        error: String(err && err.message ? err.message : err),
+      });
+    }
+  }
+
+  try {
+    const intent = await stripeDemoCreatePaymentIntent({
+      amountSen,
+      currency: String(invoiceData.currency || "MYR"),
+      description: `Taska Zurah invoice ${invoiceId}`,
+      metadata: stripeDemoPaymentIntentMetadata({ parentId, parentData, invoiceId, invoiceData }),
+    });
+    const sessionRef = invoiceRef.collection("sessions").doc();
+    await stripeDemoUpdateSession({
+      sessionRef,
+      sessionData: null,
+      invoiceData,
+      req,
+      intent,
+    });
+    return stripeDemoResponsePayload({
+      invoiceData,
+      sessionId: sessionRef.id,
+      intent,
+    });
+  } catch (err) {
+    logger.error("stripe-demo-create-payment-intent-failed", {
+      parentId,
+      invoiceId,
+      error: String(err && err.message ? err.message : err),
+    });
+    return {
+      ok: false,
+      reason: "stripe-demo-create-failed",
+      message: String(err && err.message ? err.message : err),
+    };
+  }
+}
+
+async function completeStripeDemoPaymentImpl(req) {
+  const context = await stripeDemoResolveInvoiceContext(req);
+  if (!context.ok) return context;
+
+  const configError = stripeDemoConfigError();
+  if (configError) return configError;
+
+  const { parentId, parentData, invoiceRef } = context;
+  let invoiceData = context.invoiceData || {};
+  const sessionId = (req.data && req.data.sessionId) ? String(req.data.sessionId).trim() : "";
+  let paymentIntentId = (req.data && req.data.paymentIntentId) ? String(req.data.paymentIntentId).trim() : "";
+
+  const resolved = await stripeDemoResolveSession({ invoiceRef, sessionId, paymentIntentId });
+  if (!resolved.sessionRef || !resolved.sessionData) {
+    return { ok: false, reason: "session-not-found" };
+  }
+  const sessionRef = resolved.sessionRef;
+  const sessionData = resolved.sessionData;
+  paymentIntentId = paymentIntentId || String(sessionData.providerSessionId || sessionData.providerReference || "").trim();
+  if (!paymentIntentId) {
+    return { ok: false, reason: "payment-intent-id-missing" };
+  }
+
+  if (String(invoiceData.status || "").toLowerCase() === "paid") {
+    return {
+      ok: true,
+      already: true,
+      paid: true,
+      sessionId: sessionRef.id,
+      paymentIntentId,
+      paymentId: String(invoiceData.paidPaymentId || sessionData.paymentId || "").trim(),
+      receiptNo: String(invoiceData.paidReceiptNo || sessionData.providerReceiptNo || "").trim(),
+      provider: STRIPE_DEMO_PROVIDER,
+      providerLabel: STRIPE_DEMO_PROVIDER_LABEL,
+      providerMode: STRIPE_DEMO_PROVIDER_MODE,
+      method: STRIPE_DEMO_METHOD,
+      status: "succeeded",
+      invoiceScope: stripeDemoInvoiceScope(invoiceData),
+    };
+  }
+
+  try {
+    const intent = await stripeDemoRetrievePaymentIntent(paymentIntentId, { autoSucceed: stripeDemoShouldUseMock() });
+    const metadata = intent && intent.metadata && typeof intent.metadata === "object" ? intent.metadata : {};
+    if (String(metadata.invoiceId || "").trim() && String(metadata.invoiceId || "").trim() !== context.invoiceId) {
+      return { ok: false, reason: "payment-intent-invoice-mismatch" };
+    }
+    if (String(metadata.parentId || "").trim() && String(metadata.parentId || "").trim() !== parentId) {
+      return { ok: false, reason: "payment-intent-parent-mismatch" };
+    }
+
+    const sessionState = stripeDemoSessionStateFromIntentStatus(intent && intent.status);
+    await stripeDemoUpdateSession({
+      sessionRef,
+      sessionData,
+      invoiceData,
+      req,
+      intent,
+      statusOverride: sessionState,
+    });
+    if (sessionState !== "succeeded") {
+      return {
+        ok: false,
+        reason: "payment-not-settled",
+        sessionId: sessionRef.id,
+        paymentIntentId,
+        provider: STRIPE_DEMO_PROVIDER,
+        status: String(intent && intent.status ? intent.status : "").trim() || sessionState,
+        message: "Stripe demo payment is not settled yet.",
+      };
+    }
+
+    const finalized = await stripeDemoFinalizeSuccessfulPayment({
+      req,
+      parentId,
+      parentData,
+      invoiceRef,
+      invoiceData,
+      sessionRef,
+      intent,
+    });
+    const refreshedInvoiceSnap = await invoiceRef.get();
+    invoiceData = refreshedInvoiceSnap.exists ? refreshedInvoiceSnap.data() || invoiceData : invoiceData;
+    return {
+      ...stripeDemoResponsePayload({
+        invoiceData,
+        sessionId: sessionRef.id,
+        intent,
+        paymentId: finalized.paymentId,
+        receiptNo: finalized.receiptNo,
+        paid: true,
+        already: Boolean(finalized.already),
+      }),
+      message: "Stripe demo payment completed.",
+    };
+  } catch (err) {
+    logger.error("stripe-demo-complete-payment-failed", {
+      parentId,
+      invoiceId: context.invoiceId,
+      paymentIntentId,
+      error: String(err && err.message ? err.message : err),
+    });
+    return {
+      ok: false,
+      reason: "stripe-demo-complete-failed",
+      message: String(err && err.message ? err.message : err),
+    };
+  }
+}
+
+async function syncStripeDemoPaymentImpl(req) {
+  const context = await stripeDemoResolveInvoiceContext(req);
+  if (!context.ok) return context;
+
+  const configError = stripeDemoConfigError();
+  if (configError) return configError;
+
+  const { parentId, parentData, invoiceRef } = context;
+  let invoiceData = context.invoiceData || {};
+  const sessionId = (req.data && req.data.sessionId) ? String(req.data.sessionId).trim() : "";
+  let paymentIntentId = (req.data && req.data.paymentIntentId) ? String(req.data.paymentIntentId).trim() : "";
+  const resolved = await stripeDemoResolveSession({ invoiceRef, sessionId, paymentIntentId });
+  if (!resolved.sessionRef || !resolved.sessionData) {
+    return { ok: false, reason: "session-not-found" };
+  }
+  const sessionRef = resolved.sessionRef;
+  const sessionData = resolved.sessionData;
+  paymentIntentId = paymentIntentId || String(sessionData.providerSessionId || sessionData.providerReference || "").trim();
+  if (!paymentIntentId) {
+    return { ok: false, reason: "payment-intent-id-missing" };
+  }
+
+  if (String(invoiceData.status || "").toLowerCase() === "paid") {
+    return {
+      ok: true,
+      already: true,
+      paid: true,
+      sessionId: sessionRef.id,
+      paymentIntentId,
+      paymentId: String(invoiceData.paidPaymentId || sessionData.paymentId || "").trim(),
+      receiptNo: String(invoiceData.paidReceiptNo || sessionData.providerReceiptNo || "").trim(),
+      provider: STRIPE_DEMO_PROVIDER,
+      providerLabel: STRIPE_DEMO_PROVIDER_LABEL,
+      providerMode: STRIPE_DEMO_PROVIDER_MODE,
+      method: STRIPE_DEMO_METHOD,
+      status: "succeeded",
+      invoiceScope: stripeDemoInvoiceScope(invoiceData),
+    };
+  }
+
+  try {
+    const intent = await stripeDemoRetrievePaymentIntent(paymentIntentId);
+    const sessionState = stripeDemoSessionStateFromIntentStatus(intent && intent.status);
+    await stripeDemoUpdateSession({
+      sessionRef,
+      sessionData,
+      invoiceData,
+      req,
+      intent,
+      statusOverride: sessionState,
+    });
+    if (sessionState === "succeeded") {
+      const finalized = await stripeDemoFinalizeSuccessfulPayment({
+        req,
+        parentId,
+        parentData,
+        invoiceRef,
+        invoiceData,
+        sessionRef,
+        intent,
+      });
+      const refreshedInvoiceSnap = await invoiceRef.get();
+      invoiceData = refreshedInvoiceSnap.exists ? refreshedInvoiceSnap.data() || invoiceData : invoiceData;
+      return {
+        ...stripeDemoResponsePayload({
+          invoiceData,
+          sessionId: sessionRef.id,
+          intent,
+          paymentId: finalized.paymentId,
+          receiptNo: finalized.receiptNo,
+          paid: true,
+          already: Boolean(finalized.already),
+        }),
+        message: "Stripe demo payment completed.",
+      };
+    }
+    return {
+      ...stripeDemoResponsePayload({
+        invoiceData,
+        sessionId: sessionRef.id,
+        intent,
+      }),
+      ok: true,
+      paid: false,
+      message: sessionState === "cancelled"
+        ? "Stripe demo payment was cancelled."
+        : "Stripe demo payment is still pending.",
+    };
+  } catch (err) {
+    logger.error("stripe-demo-sync-payment-failed", {
+      parentId,
+      invoiceId: context.invoiceId,
+      paymentIntentId,
+      error: String(err && err.message ? err.message : err),
+    });
+    return {
+      ok: false,
+      reason: "stripe-demo-sync-failed",
+      message: String(err && err.message ? err.message : err),
+    };
+  }
+}
+
 exports.billingCreateCheckoutSession = onCall({
   region: "asia-southeast1",
   secrets: [BILLPLZ_API_KEY_SECRET],
@@ -6160,6 +6964,27 @@ exports.billingSyncCheckoutSession = onCall({
   secrets: [BILLPLZ_API_KEY_SECRET],
 }, async (req) => {
   return billingSyncCheckoutSessionImpl(req);
+});
+
+exports.createStripeDemoPaymentIntent = onCall({
+  region: "asia-southeast1",
+  secrets: [STRIPE_SECRET_KEY_SECRET],
+}, async (req) => {
+  return createStripeDemoPaymentIntentImpl(req);
+});
+
+exports.completeStripeDemoPayment = onCall({
+  region: "asia-southeast1",
+  secrets: [STRIPE_SECRET_KEY_SECRET],
+}, async (req) => {
+  return completeStripeDemoPaymentImpl(req);
+});
+
+exports.syncStripeDemoPayment = onCall({
+  region: "asia-southeast1",
+  secrets: [STRIPE_SECRET_KEY_SECRET],
+}, async (req) => {
+  return syncStripeDemoPaymentImpl(req);
 });
 
 exports.billingBillplzCallback = onRequest({

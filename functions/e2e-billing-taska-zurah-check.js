@@ -1,5 +1,9 @@
 /* eslint-disable no-console */
 const admin = require("firebase-admin");
+
+process.env.STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "sk_test_mock_demo_123";
+process.env.STRIPE_DEMO_USE_MOCK = process.env.STRIPE_DEMO_USE_MOCK || "true";
+
 const fns = require("./index");
 
 const db = admin.firestore();
@@ -83,6 +87,11 @@ async function fetchInvoiceByPeriod({ parentId, period }) {
     .get();
   if (snap.empty) return null;
   return { id: snap.docs[0].id, data: snap.docs[0].data() || {} };
+}
+
+async function listPayments(parentId) {
+  const snap = await db.collection("parents").doc(parentId).collection("payments").get();
+  return snap.docs.map((doc) => ({ id: doc.id, data: doc.data() || {} }));
 }
 
 async function clearInvoicesByPeriod(parentId, period) {
@@ -400,6 +409,118 @@ async function run() {
   assertTrue(Boolean(secondPage.hasMore) === false, "Case6: second page should finish the paged scan");
   assertTrue(String(secondPage.nextStartAfterId || "") === "", "Case6: second page should not return a follow-up cursor");
   console.log("PASS Case6 admin backfill paging returns a resume cursor and completes on the next batch");
+
+  // Case 7: Stripe demo PaymentIntent flow reuses pending checkout, finalizes payment, and keeps billing writes compatible.
+  const parentStripe = "e2e-taska-zurah-parent-stripe";
+  const parentStripeForbidden = "e2e-taska-zurah-parent-stripe-forbidden";
+  const childStripe = "e2e-taska-zurah-child-stripe";
+  const stripeRegisteredAt = new Date();
+  stripeRegisteredAt.setMonth(stripeRegisteredAt.getMonth() - 2, 8);
+  await createParent({ parentId: parentStripe, phoneE164: phone });
+  await createParent({ parentId: parentStripeForbidden, phoneE164: "+60199888777" });
+  await clearInvoicesByPeriod(parentStripe, currentPeriod);
+  await createChild({
+    childId: childStripe,
+    name: "E2E Stripe Demo Child",
+    birthDate: "2023-03-12",
+    registeredAt: timestampFromDate(stripeRegisteredAt),
+    registrationFeeAppliedPeriod: monthKey(stripeRegisteredAt),
+  });
+
+  const stripeInvoiceCreate = await fns.billingCreateDemoInvoiceForCurrentMonth.run(reqForParent({
+    uid,
+    phone,
+    data: { parentId: parentStripe, childId: childStripe },
+  }));
+  assertTrue(stripeInvoiceCreate && stripeInvoiceCreate.ok, "Case7: stripe demo invoice creation failed");
+
+  const stripeInvoice = await fetchInvoiceByPeriod({ parentId: parentStripe, period: currentPeriod });
+  assertTrue(stripeInvoice, "Case7: stripe demo invoice missing");
+
+  const stripeCreate = await fns.createStripeDemoPaymentIntent.run(reqForParent({
+    uid,
+    phone,
+    data: { parentId: parentStripe, invoiceId: stripeInvoice.id },
+  }));
+  assertTrue(stripeCreate && stripeCreate.ok, "Case7: createStripeDemoPaymentIntent failed");
+  assertTrue(String(stripeCreate.provider || "") === "stripe", "Case7: provider should be stripe");
+  assertTrue(String(stripeCreate.providerMode || "") === "test", "Case7: providerMode should stay test");
+  assertTrue(String(stripeCreate.method || "") === "Stripe Demo", "Case7: method should be Stripe Demo");
+  assertTrue(Boolean(stripeCreate.sessionId), "Case7: sessionId missing");
+  assertTrue(Boolean(stripeCreate.paymentIntentId), "Case7: paymentIntentId missing");
+  assertTrue(Boolean(stripeCreate.clientSecret), "Case7: clientSecret missing");
+
+  const pendingInvoiceSnap = await db.collection("parents").doc(parentStripe).collection("invoices").doc(stripeInvoice.id).get();
+  assertTrue(String((pendingInvoiceSnap.data() || {}).status || "") === "unpaid", "Case7: create should not mark invoice paid");
+
+  const stripeCreateAgain = await fns.createStripeDemoPaymentIntent.run(reqForParent({
+    uid,
+    phone,
+    data: { parentId: parentStripe, invoiceId: stripeInvoice.id },
+  }));
+  assertTrue(stripeCreateAgain && stripeCreateAgain.ok, "Case7: second createStripeDemoPaymentIntent failed");
+  assertTrue(String(stripeCreateAgain.sessionId || "") === String(stripeCreate.sessionId || ""), "Case7: pending Stripe session should be reused");
+  assertTrue(String(stripeCreateAgain.paymentIntentId || "") === String(stripeCreate.paymentIntentId || ""), "Case7: pending PaymentIntent should be reused");
+
+  const stripeComplete = await fns.completeStripeDemoPayment.run(reqForParent({
+    uid,
+    phone,
+    data: {
+      parentId: parentStripe,
+      invoiceId: stripeInvoice.id,
+      sessionId: stripeCreate.sessionId,
+      paymentIntentId: stripeCreate.paymentIntentId,
+    },
+  }));
+  assertTrue(stripeComplete && stripeComplete.ok, "Case7: completeStripeDemoPayment failed");
+  assertTrue(Boolean(stripeComplete.paid) === true, "Case7: Stripe complete should settle the invoice");
+  assertTrue(String(stripeComplete.status || "") === "succeeded", "Case7: complete should return succeeded status");
+  assertTrue(String(stripeComplete.providerLabel || "") === "Stripe Test Mode", "Case7: provider label should reflect Stripe test mode");
+  assertTrue(Boolean(stripeComplete.paymentId), "Case7: paymentId missing after completion");
+  assertTrue(Boolean(stripeComplete.receiptNo), "Case7: receiptNo missing after completion");
+  assertTrue(String(stripeComplete.cardLast4 || "") === "4242", "Case7: mock card last4 should be exposed");
+
+  const paidInvoiceSnap = await db.collection("parents").doc(parentStripe).collection("invoices").doc(stripeInvoice.id).get();
+  const paidInvoiceData = paidInvoiceSnap.data() || {};
+  assertTrue(String(paidInvoiceData.status || "") === "paid", "Case7: invoice should be marked paid");
+  assertTrue(String(paidInvoiceData.paidProvider || "") === "stripe", "Case7: invoice should record stripe provider");
+  assertTrue(String(paidInvoiceData.paidMethod || "") === "Stripe Demo", "Case7: invoice should record Stripe Demo method");
+  assertTrue(String(paidInvoiceData.paymentMethod || "") === "Stripe Demo", "Case7: invoice paymentMethod should be updated");
+  assertTrue(String(paidInvoiceData.paidProviderMode || "") === "test", "Case7: invoice provider mode should stay test");
+  assertTrue(String(paidInvoiceData.stripePaymentIntentId || "") === String(stripeCreate.paymentIntentId || ""), "Case7: invoice should record PaymentIntent id");
+  assertTrue(String(paidInvoiceData.paidCardLast4 || "") === "4242", "Case7: invoice should record safe card metadata");
+
+  const stripePayments = await listPayments(parentStripe);
+  assertTrue(stripePayments.length === 1, "Case7: expected a single Stripe payment record");
+  assertTrue(String(stripePayments[0].data.provider || "") === "stripe", "Case7: payment record should use stripe provider");
+  assertTrue(String(stripePayments[0].data.status || "") === "paid", "Case7: payment record should be marked paid");
+  assertTrue(String(stripePayments[0].data.invoiceId || "") === stripeInvoice.id, "Case7: payment record should link to invoice");
+  assertTrue(String(stripePayments[0].data.parentId || "") === parentStripe, "Case7: payment record should store parentId");
+  assertTrue(String(stripePayments[0].data.providerMode || "") === "test", "Case7: payment record should stay in test mode");
+  assertTrue(String(stripePayments[0].data.stripePaymentIntentId || "") === String(stripeCreate.paymentIntentId || ""), "Case7: payment record should store PaymentIntent id");
+  assertTrue(String(stripePayments[0].data.cardBrand || "") === "visa", "Case7: payment record should store card brand");
+  assertTrue(String(stripePayments[0].data.cardLast4 || "") === "4242", "Case7: payment record should store card last4");
+
+  const stripeCreateAfterPaid = await fns.createStripeDemoPaymentIntent.run(reqForParent({
+    uid,
+    phone,
+    data: { parentId: parentStripe, invoiceId: stripeInvoice.id },
+  }));
+  assertTrue(Boolean(stripeCreateAfterPaid && stripeCreateAfterPaid.ok) === false, "Case7: paid invoice should not create a fresh Stripe intent");
+  assertTrue(String(stripeCreateAfterPaid.reason || "") === "already-paid", "Case7: paid invoice should return already-paid");
+
+  let wrongParentBlocked = false;
+  try {
+    await fns.createStripeDemoPaymentIntent.run(reqForParent({
+      uid,
+      phone,
+      data: { parentId: parentStripeForbidden, invoiceId: stripeInvoice.id },
+    }));
+  } catch (err) {
+    wrongParentBlocked = String(err && err.code ? err.code : "") === "permission-denied";
+  }
+  assertTrue(wrongParentBlocked, "Case7: mismatched parent ownership should be rejected");
+  console.log("PASS Case7 Stripe demo checkout reuses pending intents and finalizes billing records safely");
 
   console.log("\nTaska Zurah billing integration checks passed.");
 }
