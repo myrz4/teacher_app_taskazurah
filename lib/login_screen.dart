@@ -668,8 +668,12 @@ class _LoginScreenState extends State<LoginScreen> {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              const Icon(Icons.school, size: 100, color: Color(0xFF2E7D32)),
-              const SizedBox(height: 20),
+              Image.asset(
+                'assets/images/app_logo.png',
+                height: 170,
+                fit: BoxFit.contain,
+              ),
+              const SizedBox(height: 24),
               const Text(
                 "Taska Zurah Teacher",
                 style: TextStyle(

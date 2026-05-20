@@ -7,14 +7,14 @@
 // ✅ Push Notification integrated for chat (FCM + local popup)
 
 import 'package:flutter/material.dart';
-import 'package:fluttertoast/fluttertoast.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'qr_scanner_screen.dart'
-  if (dart.library.html) 'qr_scanner_screen_web.dart';
+    if (dart.library.html) 'qr_scanner_screen_web.dart';
 import 'attendance_list_screen.dart';
 import 'salary_tips_screen.dart';
 import 'profile_screen.dart';
@@ -50,7 +50,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
 
   bool _isLoading = true;
   double _baseSalary = 0.0;
-  double _bonus = 0.0;
+  double _overtimePay = 0.0;
   String? _profileImageUrl;
 
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -58,7 +58,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
   // 🔁 LIVE attendance listeners
   StreamSubscription<QuerySnapshot>? _childrenSub;
   final List<StreamSubscription<QuerySnapshot>> _attendanceSubs = [];
-  final Map<String, Map<String, QueryDocumentSnapshot>> _attendanceDocsBySource = {};
+  final Map<String, Map<String, QueryDocumentSnapshot>>
+      _attendanceDocsBySource = {};
   Timer? _midnightTimer;
 
   List<QueryDocumentSnapshot> _childrenDocs = [];
@@ -179,7 +180,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
 
     final childPath = normalized.substring(markerIndex + marker.length);
     final slashIndex = childPath.indexOf('/');
-    return (slashIndex >= 0 ? childPath.substring(0, slashIndex) : childPath).trim();
+    return (slashIndex >= 0 ? childPath.substring(0, slashIndex) : childPath)
+        .trim();
   }
 
   bool _isAttendanceDocForToday({
@@ -213,10 +215,10 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
         data['checkInAt'] != null ||
         data['checkInTime'] != null ||
         data['check_in'] != null ||
-      data['isPresent'] == true ||
-      data['is_present'] == true ||
-      status == 'CHECKED_IN' ||
-      status == 'CHECKED_OUT';
+        data['isPresent'] == true ||
+        data['is_present'] == true ||
+        status == 'CHECKED_IN' ||
+        status == 'CHECKED_OUT';
   }
 
   bool _attendanceHasCheckOut(Map<String, dynamic> data) {
@@ -257,7 +259,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     return '';
   }
 
-  void _replaceAttendanceDocsForSource(String source, List<QueryDocumentSnapshot> docs) {
+  void _replaceAttendanceDocsForSource(
+      String source, List<QueryDocumentSnapshot> docs) {
     final sourceDocs = <String, QueryDocumentSnapshot>{};
     for (final doc in docs) {
       sourceDocs[doc.id] = doc;
@@ -309,8 +312,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
       _firestore
           .collection('attendance')
           .orderBy(FieldPath.documentId)
-          .startAt([prefix])
-          .endAt(["$prefix\uf8ff"]),
+          .startAt([prefix]).endAt(["$prefix\uf8ff"]),
     );
     listen(
       'dateKey',
@@ -344,7 +346,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
 
     _startLiveAttendanceListeners();
     _scheduleMidnightRolloverRefresh();
-    _loadSalaryData();
+    _loadPayrollPreview();
     _loadTeacherProfile();
   }
 
@@ -352,7 +354,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     _midnightTimer?.cancel();
 
     final now = DateTime.now();
-    final nextMidnight = DateTime(now.year, now.month, now.day).add(const Duration(days: 1));
+    final nextMidnight =
+        DateTime(now.year, now.month, now.day).add(const Duration(days: 1));
     final delay = nextMidnight.difference(now) + const Duration(seconds: 2);
 
     _midnightTimer = Timer(delay, () {
@@ -398,8 +401,11 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
 
     for (final childDoc in _childrenDocs) {
       final data = childDoc.data() as Map<String, dynamic>;
-      final migratedToChildId = (data['migratedToChildId'] ?? '').toString().trim();
-      final canonicalId = (migratedToChildId.isNotEmpty ? migratedToChildId : childDoc.id).trim();
+      final migratedToChildId =
+          (data['migratedToChildId'] ?? '').toString().trim();
+      final canonicalId =
+          (migratedToChildId.isNotEmpty ? migratedToChildId : childDoc.id)
+              .trim();
       if (canonicalId.isEmpty) continue;
 
       canonicalChildIds.add(canonicalId);
@@ -411,7 +417,9 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
       registerChildAlias(data['nfc_uid'], canonicalId);
       registerChildAlias(data['nfcUid'], canonicalId);
       registerChildAlias(data['migratedToChildId'], canonicalId);
-      registerChildAlias(_extractChildIdFromRef(data['childRef'] ?? data['child_ref']), canonicalId);
+      registerChildAlias(
+          _extractChildIdFromRef(data['childRef'] ?? data['child_ref']),
+          canonicalId);
     }
 
     final total = canonicalChildIds.length;
@@ -442,7 +450,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
         nextDocId: doc.id,
         nextData: data,
         currentDocId: current?.id,
-        currentData: current == null ? null : (current.data() as Map<String, dynamic>),
+        currentData:
+            current == null ? null : (current.data() as Map<String, dynamic>),
       )) {
         effectiveDocsByChild[childId] = doc;
       }
@@ -531,25 +540,51 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     });
   }
 
-  /// ✅ Load latest salary + bonus
-  Future<void> _loadSalaryData() async {
+  Future<void> _loadPayrollPreview() async {
     try {
-      final snapshot = await _firestore
-          .collection('salary')
-          .where('teacher_username', isEqualTo: widget.username)
-          .get();
-
-      if (snapshot.docs.isNotEmpty) {
-        final latest = snapshot.docs.first.data();
+      final callable = FirebaseFunctions.instanceFor(region: 'asia-southeast1')
+          .httpsCallable('getTeacherPayrollForTeacher');
+      final response = await callable.call(<String, dynamic>{});
+      final payload = Map<String, dynamic>.from(
+        (response.data as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{},
+      );
+      if (payload['ok'] != true) {
         setState(() {
-          _baseSalary =
-              double.tryParse(latest['base_salary'].toString()) ?? 0.0;
-          _bonus = double.tryParse(latest['bonus'].toString()) ?? 0.0;
+          _baseSalary = 0.0;
+          _overtimePay = 0.0;
         });
+        return;
       }
+
+      final payroll = payload['payroll'];
+      if (payroll is Map) {
+        final payrollMap =
+            Map<String, dynamic>.from(payroll.cast<String, dynamic>());
+        setState(() {
+          _baseSalary = _moneyFromSen(payrollMap['baseSalarySen']);
+          _overtimePay = _moneyFromSen(payrollMap['overtimeTotalSen']);
+        });
+        return;
+      }
+
+      setState(() {
+        _baseSalary = 0.0;
+        _overtimePay = 0.0;
+      });
     } catch (e) {
-      Fluttertoast.showToast(msg: "Failed to load salary data: $e");
+      debugPrint('⚠ Failed to load payroll preview: $e');
     }
+  }
+
+  double _moneyFromSen(dynamic value) {
+    if (value == null) return 0.0;
+    if (value is int) return value / 100.0;
+    if (value is double) return value / 100.0;
+    if (value is String) {
+      final parsed = double.tryParse(value);
+      return parsed == null ? 0.0 : parsed / 100.0;
+    }
+    return 0.0;
   }
 
   /// ✅ Load teacher profile (photo)
@@ -558,7 +593,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
       Map<String, dynamic>? data;
       final teacherDocId = widget.teacherDocId.trim();
       if (teacherDocId.isNotEmpty) {
-        final snap = await _firestore.collection('teachers').doc(teacherDocId).get();
+        final snap =
+            await _firestore.collection('teachers').doc(teacherDocId).get();
         data = snap.data();
       }
 
@@ -669,8 +705,9 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                   Navigator.push(
                     context,
                     MaterialPageRoute(
-                      builder: (context) =>
-                          ProfileScreen(teacherUsername: widget.username, teacherDocId: widget.teacherDocId),
+                      builder: (context) => ProfileScreen(
+                          teacherUsername: widget.username,
+                          teacherDocId: widget.teacherDocId),
                     ),
                   );
                 },
@@ -774,8 +811,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text("Welcome back,",
-                        style: TextStyle(fontSize: 14)),
+                    const Text("Welcome back,", style: TextStyle(fontSize: 14)),
                     Text(
                       widget.name,
                       style: TextStyle(
@@ -785,15 +821,14 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                       ),
                     ),
                     Text("Date: $formattedDate",
-                        style: TextStyle(
-                            fontSize: 13, color: mutedTextColor)),
+                        style: TextStyle(fontSize: 13, color: mutedTextColor)),
                   ],
                 ),
               ],
             ),
             const SizedBox(height: 30),
 
-            // 💰 Salary & Bonus
+            // 💰 Salary & Overtime
             Row(
               children: [
                 Expanded(
@@ -809,8 +844,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                 Expanded(
                   child: _summaryCard(
                     context,
-                    "Bonus",
-                    "RM${_bonus.toStringAsFixed(2)}",
+                    "Overtime",
+                    "RM${_overtimePay.toStringAsFixed(2)}",
                     Icons.star_rate,
                     Colors.orange.shade700,
                   ),
@@ -849,7 +884,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text("Attendance Overview",
-                      style: TextStyle(fontWeight: FontWeight.bold)),
+                        style: TextStyle(fontWeight: FontWeight.bold)),
                     const SizedBox(height: 8),
                     LinearProgressIndicator(
                       value: totalStudentCount == 0
@@ -899,8 +934,9 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                   Navigator.push(
                     context,
                     MaterialPageRoute(
-                      builder: (context) =>
-                          QRScannerScreen(teacherUsername: widget.username, teacherName: widget.name),
+                      builder: (context) => QRScannerScreen(
+                          teacherUsername: widget.username,
+                          teacherName: widget.name),
                     ),
                   );
                 }),
@@ -925,7 +961,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
                     ),
                   );
                 }),
-                _menuCard(context, "Salary & Tips", Icons.payments,
+                _menuCard(context, "Salary & Overtime", Icons.payments,
                     Colors.orange.shade700, () {
                   Navigator.push(
                     context,
@@ -954,9 +990,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
     Color color,
   ) {
     final theme = Theme.of(context);
-    final mutedColor = theme.brightness == Brightness.dark
-        ? Colors.white70
-        : Colors.black54;
+    final mutedColor =
+        theme.brightness == Brightness.dark ? Colors.white70 : Colors.black54;
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 8),
       padding: const EdgeInsets.all(15),
@@ -981,8 +1016,8 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(title,
-                  style: TextStyle(
-                    color: mutedColor,
+                    style: TextStyle(
+                        color: mutedColor,
                         fontWeight: FontWeight.w500,
                         fontSize: 13)),
                 const SizedBox(height: 4),
@@ -1018,7 +1053,7 @@ class _TeacherDashboardState extends State<TeacherDashboard> {
           borderRadius: BorderRadius.circular(20),
           boxShadow: [
             BoxShadow(
-                color: color.withValues(alpha: 0.2),
+              color: color.withValues(alpha: 0.2),
               blurRadius: 8,
               offset: const Offset(0, 4),
             ),

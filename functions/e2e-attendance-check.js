@@ -14,6 +14,7 @@ function teacherReq(data) {
       uid: "e2e-teacher-1",
       token: {
         role: "teacher",
+        name: "E2E Teacher",
         email: "teacher-e2e@example.com",
         phone_number: "+601122233344",
       },
@@ -28,6 +29,7 @@ function adminReq(data) {
       uid: "e2e-admin-1",
       token: {
         role: "admin",
+        name: "E2E Admin",
         email: "admin-e2e@example.com",
         phone_number: "+601199988877",
       },
@@ -68,6 +70,18 @@ async function run() {
   const childId = `e2e-att-child-${suffix}`;
   const token = `PICKUP${suffix}`;
   const weekdayInHoursIso = "2026-05-12T01:30:00.000Z";
+  const manualCheckoutTeacherId = `e2e-att-teacher-${suffix}`;
+
+  await db.collection("teachers").doc(manualCheckoutTeacherId).set({
+    name: "E2E Manual Teacher",
+    email: "manual-teacher@example.com",
+    phone: "01122233346",
+    phoneTail: "1122233346",
+    phoneE164: "+601122233346",
+    salaryBaseSen: 200000,
+    salaryCurrency: "MYR",
+    salaryActive: true,
+  }, { merge: true });
 
   await db.collection("parents").doc(parentId).set({
     parentName: "E2E Parent",
@@ -101,6 +115,46 @@ async function run() {
   })));
   assertTrue(!closedDayCheckIn.ok && closedDayCheckIn.reason === "taska-closed-today", "Sunday NFC check-in should be blocked");
 
+  const customClosedDate = "2026-05-14";
+  const customClosedChildId = `e2e-att-custom-closed-${suffix}`;
+  await db.collection("children").doc(customClosedChildId).set({
+    name: "E2E Custom Closed Child",
+    parentName: "E2E Parent",
+    parentContact: "01122233344",
+    nfc_uid: `HOLIDAY${suffix}`,
+  }, { merge: true });
+
+  const customClosedStatus = await fns.attendanceAdminSetDayClosure.run(adminReq({
+    attendanceDate: customClosedDate,
+    closed: true,
+    adminName: "E2E Admin",
+  }));
+  assertTrue(customClosedStatus && customClosedStatus.ok, `custom closed day setup failed: ${JSON.stringify(customClosedStatus)}`);
+  assertTrue(customClosedStatus.closed === true && customClosedStatus.customClosed === true, "custom closed day should report as closed");
+
+  const customClosedCheckIn = await withMockDate("2026-05-14T01:00:00.000Z", async () => fns.attendanceNfcCheckIn.run(teacherReq({
+    childId: customClosedChildId,
+    nfcUid: `HOLIDAY${suffix}`,
+    teacherName: "E2E Teacher",
+  })));
+  assertTrue(!customClosedCheckIn.ok && customClosedCheckIn.reason === "taska-closed-today", "Custom closed day NFC check-in should be blocked");
+
+  const customClosedManual = await fns.attendanceAdminOverride.run(adminReq({
+    action: "MANUAL_CHECK_IN",
+    childId: customClosedChildId,
+    attendanceDate: customClosedDate,
+    checkInAt: "2026-05-14T01:00:00.000Z",
+    adminName: "E2E Admin",
+  }));
+  assertTrue(!customClosedManual.ok && customClosedManual.reason === "taska-closed-today", "Custom closed day manual check-in should be blocked");
+
+  const reopenedStatus = await fns.attendanceAdminSetDayClosure.run(adminReq({
+    attendanceDate: customClosedDate,
+    closed: false,
+    adminName: "E2E Admin",
+  }));
+  assertTrue(reopenedStatus && reopenedStatus.ok && reopenedStatus.closed === false, `custom closed day reopen failed: ${JSON.stringify(reopenedStatus)}`);
+
   const earlyChildId = `e2e-att-early-${suffix}`;
   const earlyAttendanceDate = "2026-05-13";
   const earlyCheckInAtIso = "2026-05-12T22:30:00.000Z";
@@ -119,11 +173,26 @@ async function run() {
     checkInAt: earlyCheckInAtIso,
     adminName: "E2E Admin",
   }));
-  assertTrue(!earlyWithoutReason.ok && earlyWithoutReason.reason === "manual-check-in-requires-reason", "Outside-hours manual check-in should require a reason");
+  assertTrue(earlyWithoutReason && earlyWithoutReason.ok, `outside-hours manual check-in without reason failed: ${JSON.stringify(earlyWithoutReason)}`);
+
+  const earlyAttendanceSnap = await db.collection("attendance").doc(earlyAttendanceId).get();
+  const earlyAttendance = earlyAttendanceSnap.data() || {};
+  assertTrue(earlyAttendanceSnap.exists, "outside-hours manual check-in record missing");
+  assertTrue(String(earlyAttendance.status || "") === "CHECKED_IN", "outside-hours manual check-in should create a CHECKED_IN record");
+  assertTrue(String(earlyAttendance.manualEditReason || "") === "", "outside-hours manual check-in should not require a reason");
+
+  const earlyReasonChildId = `e2e-att-early-reason-${suffix}`;
+  const earlyReasonAttendanceId = `${earlyAttendanceDate}_${earlyReasonChildId}`;
+  await db.collection("children").doc(earlyReasonChildId).set({
+    name: "E2E Early Reason Child",
+    parentName: "E2E Parent",
+    parentContact: "01122233344",
+    nfc_uid: `EARLY_REASON${suffix}`,
+  }, { merge: true });
 
   const earlyWithReason = await fns.attendanceAdminOverride.run(adminReq({
     action: "MANUAL_CHECK_IN",
-    childId: earlyChildId,
+    childId: earlyReasonChildId,
     attendanceDate: earlyAttendanceDate,
     checkInAt: earlyCheckInAtIso,
     reason: "Emergency early drop-off",
@@ -132,10 +201,41 @@ async function run() {
   }));
   assertTrue(earlyWithReason && earlyWithReason.ok, `outside-hours manual check-in failed: ${JSON.stringify(earlyWithReason)}`);
 
-  const earlyAttendanceSnap = await db.collection("attendance").doc(earlyAttendanceId).get();
-  const earlyAttendance = earlyAttendanceSnap.data() || {};
-  assertTrue(earlyAttendanceSnap.exists, "outside-hours manual check-in record missing");
-  assertTrue(String(earlyAttendance.status || "") === "CHECKED_IN", "outside-hours manual check-in should create a CHECKED_IN record");
+  const earlyReasonAttendanceSnap = await db.collection("attendance").doc(earlyReasonAttendanceId).get();
+  const earlyReasonAttendance = earlyReasonAttendanceSnap.data() || {};
+  assertTrue(earlyReasonAttendanceSnap.exists, "outside-hours manual check-in record with reason missing");
+  assertTrue(String(earlyReasonAttendance.status || "") === "CHECKED_IN", "outside-hours manual check-in with reason should create a CHECKED_IN record");
+  assertTrue(String(earlyReasonAttendance.manualEditReason || "") === "Emergency early drop-off", "outside-hours manual check-in should still persist an optional reason when provided");
+
+  const missingCheckoutTeacher = await fns.attendanceAdminOverride.run(adminReq({
+    action: "MANUAL_CHECK_OUT",
+    childId: earlyReasonChildId,
+    attendanceDate: earlyAttendanceDate,
+    checkOutAt: "2026-05-13T12:00:00.000Z",
+    reason: "Parent collected child after admin confirmation",
+    adminName: "E2E Admin",
+  }));
+  assertTrue(!missingCheckoutTeacher.ok && missingCheckoutTeacher.reason === "missing-checkout-teacher", "manual checkout should require a selected teacher");
+
+  const manualCheckout = await fns.attendanceAdminOverride.run(adminReq({
+    action: "MANUAL_CHECK_OUT",
+    childId: earlyReasonChildId,
+    attendanceDate: earlyAttendanceDate,
+    checkOutAt: "2026-05-13T12:00:00.000Z",
+    checkedOutByTeacherId: manualCheckoutTeacherId,
+    reason: "Parent collected child after admin confirmation",
+    notes: "Manual checkout recorded by admin",
+    adminName: "E2E Admin",
+  }));
+  assertTrue(manualCheckout && manualCheckout.ok, `manual checkout with selected teacher failed: ${JSON.stringify(manualCheckout)}`);
+
+  const manualCheckoutSnap = await db.collection("attendance").doc(earlyReasonAttendanceId).get();
+  const manualCheckoutAttendance = manualCheckoutSnap.data() || {};
+  assertTrue(String(manualCheckoutAttendance.status || "") === "CHECKED_OUT", "manual checkout should close the attendance record");
+  assertTrue(String(manualCheckoutAttendance.checkedOutByTeacherId || "") === manualCheckoutTeacherId, "manual checkout should persist selected teacher id");
+  assertTrue(String(manualCheckoutAttendance.checkedOutByTeacherName || "") === "E2E Manual Teacher", "manual checkout should persist selected teacher name");
+  assertTrue(String(manualCheckoutAttendance.checkedOutByTeacherEmail || "") === "manual-teacher@example.com", "manual checkout should persist selected teacher email");
+  assertTrue(String(manualCheckoutAttendance.checkedOutByUid || "") === "e2e-admin-1", "manual checkout actor should remain the admin user");
 
   const earlyAuditSnap = await db.collection("attendanceAudit")
     .where("attendanceId", "==", earlyAttendanceId)
@@ -145,6 +245,7 @@ async function run() {
   assertTrue(!earlyAuditSnap.empty, "outside-hours manual check-in audit entry missing");
   const earlyAudit = earlyAuditSnap.docs[0].data() || {};
   assertTrue(String(earlyAudit.details && earlyAudit.details.operatingHoursDecision || "") === "outside-working-hours", "outside-hours audit decision missing");
+  assertTrue(String(earlyAudit.reason || "") === "", "outside-hours audit reason should stay blank when omitted");
 
   await db.collection("parents").doc(parentId).collection("tokens").doc(token).set({
     parentId,
@@ -192,6 +293,9 @@ async function run() {
   assertTrue(Boolean(attendance.checkOutAt), "checkOutAt missing after checkout");
   assertTrue(String(attendance.checkout_method || "") === "PARENT_QR", "legacy checkout_method should be PARENT_QR");
   assertTrue(String(attendance.checkOutMethod || "") === "PARENT_QR", "checkOutMethod should be PARENT_QR");
+  assertTrue(String(attendance.checkedOutByTeacherId || "") === "e2e-teacher-1", "QR checkout should persist checkout teacher id");
+  assertTrue(String(attendance.checkedOutByTeacherName || "") === "E2E Teacher", "QR checkout should persist checkout teacher name");
+  assertTrue(String(attendance.checkedOutByTeacherEmail || "") === "teacher-e2e@example.com", "QR checkout should persist checkout teacher email");
   assertTrue(String(attendance.pickupGuardianNameSnapshot || "") === "E2E Guardian", "pickup guardian snapshot missing");
 
   const tokenSnap = await db.collection("parents").doc(parentId).collection("tokens").doc(token).get();

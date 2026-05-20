@@ -11,6 +11,7 @@
 
 const { onDocumentCreated, onDocumentWritten } = require("firebase-functions/v2/firestore");
 const { onCall, onRequest } = require("firebase-functions/v2/https");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { defineSecret } = require("firebase-functions/params");
 const crypto = require("crypto");
 const logger = require("firebase-functions/logger");
@@ -636,6 +637,71 @@ exports.notifyParentOnAttendanceChange = onDocumentWritten(
   },
 );
 
+exports.attendanceGetDayStatus = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireStaff(req);
+
+    const attendanceDate = String(req.data && req.data.attendanceDate ? req.data.attendanceDate : "").trim();
+    return await attendanceDayStatus(attendanceDate || new Date());
+  } catch (err) {
+    logger.error("attendanceGetDayStatus failed", err);
+    return { ok: false, reason: callableErrorReason(err) };
+  }
+});
+
+exports.attendanceAdminSetDayClosure = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+
+    const attendanceDate = String(req.data && req.data.attendanceDate ? req.data.attendanceDate : "").trim();
+    if (!attendanceDate) {
+      throw callableError("missing-attendance-date", "invalid-argument");
+    }
+
+    const closedValue = req.data && Object.prototype.hasOwnProperty.call(req.data, "closed")
+      ? req.data.closed
+      : true;
+    const closed = Boolean(closedValue === true || String(closedValue || "").trim().toLowerCase() === "true");
+    const actor = attendanceActor(req, req.data && (req.data.adminName || req.data.actorName));
+    const dayInfo = attendanceDayInfoFromDateKey(attendanceDate);
+    const db = admin.firestore();
+    const closureRef = db.collection(ATTENDANCE_CLOSED_DAY_COLLECTION).doc(dayInfo.key);
+
+    if (closed) {
+      const existingAttendance = await db.collection("attendance")
+        .where("dateKey", "==", dayInfo.key)
+        .limit(1)
+        .get();
+      if (!existingAttendance.empty) {
+        throw callableError("attendance-day-has-records", "failed-precondition");
+      }
+
+      const existingClosure = await closureRef.get();
+      await closureRef.set({
+        dateKey: dayInfo.key,
+        closed: true,
+        label: "Public Holiday",
+        reason: "Public Holiday",
+        message: attendanceCustomClosedMessage(dayInfo, { label: "Public Holiday" }),
+        createdAt: existingClosure.exists
+          ? (existingClosure.get("createdAt") || admin.firestore.FieldValue.serverTimestamp())
+          : admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedByUid: actor.uid,
+        updatedByName: actor.displayName,
+        updatedByEmail: actor.email,
+      }, { merge: true });
+    } else {
+      await closureRef.delete();
+    }
+
+    return await attendanceDayStatus(dayInfo.key);
+  } catch (err) {
+    logger.error("attendanceAdminSetDayClosure failed", err);
+    return { ok: false, reason: callableErrorReason(err) };
+  }
+});
+
 exports.attendanceNfcCheckIn = onCall({ region: "asia-southeast1" }, async (req) => {
   try {
     requireStaff(req);
@@ -764,13 +830,18 @@ exports.attendanceCheckoutWithParentQr = onCall({ region: "asia-southeast1" }, a
     const rawToken = String(req.data && (req.data.qrToken || req.data.token) ? (req.data.qrToken || req.data.token) : "").trim();
     const tokenValue = rawToken.replace(/^QR_/, "").trim();
     const expectedChildId = String(req.data && req.data.expectedChildId ? req.data.expectedChildId : "").trim();
-    const actor = attendanceActor(req, req.data && (req.data.actorName || req.data.teacherName || req.data.adminName));
+    const actor = attendanceActor(req);
+    const db = admin.firestore();
+    const checkoutTeacher = await attendanceResolveTeacherSnapshot({
+      db,
+      requestedTeacher: {},
+      actorFallback: actor,
+    });
 
     if (!tokenValue) {
       throw callableError("missing-qr-token", "invalid-argument");
     }
 
-    const db = admin.firestore();
     const parentQuery = await db.collection("parents")
       .where("dailyQrToken", "==", tokenValue)
       .limit(1)
@@ -876,11 +947,16 @@ exports.attendanceCheckoutWithParentQr = onCall({ region: "asia-southeast1" }, a
         checkedOutByUid: actor.uid,
         checkedOutByRole: actor.role,
         checkedOutByName: actor.displayName,
+        checkedOutByEmail: actor.email,
+        checkedOutByTeacherId: checkoutTeacher ? checkoutTeacher.teacherId : "",
+        checkedOutByTeacherName: checkoutTeacher ? checkoutTeacher.teacherName : "",
+        checkedOutByTeacherEmail: checkoutTeacher ? checkoutTeacher.teacherEmail : "",
         pickupGuardianId: parentRef.id,
         pickupGuardianNameSnapshot: representativeName,
         pickupGuardianRoleSnapshot: representativeRole,
         pickupVerifiedByTeacherId: actor.uid,
         pickupVerifiedByTeacherName: actor.displayName,
+        pickupVerifiedByTeacherEmail: actor.email,
         pickupVerificationMethod: "PARENT_QR_TOKEN",
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         lastEditedBy: actor.uid,
@@ -927,6 +1003,9 @@ exports.attendanceCheckoutWithParentQr = onCall({ region: "asia-southeast1" }, a
           representativeName,
           representativeRole,
           tokenValue,
+          checkoutTeacherId: checkoutTeacher ? checkoutTeacher.teacherId : "",
+          checkoutTeacherName: checkoutTeacher ? checkoutTeacher.teacherName : "",
+          checkoutTeacherEmail: checkoutTeacher ? checkoutTeacher.teacherEmail : "",
         },
       }));
 
@@ -1063,6 +1142,8 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
     const reason = String(req.data && req.data.reason ? req.data.reason : "").trim();
     const notes = String(req.data && req.data.notes ? req.data.notes : "").trim();
     const actor = attendanceActor(req, req.data && (req.data.adminName || req.data.actorName));
+    const requestedCheckoutTeacher = attendanceRequestedCheckoutTeacher(req.data);
+    const checkoutTeacherSelectionProvided = attendanceCheckoutTeacherSelectionProvided(requestedCheckoutTeacher);
 
     if (!childId) throw callableError("missing-child-id", "invalid-argument");
     if (!attendanceDate) throw callableError("missing-attendance-date", "invalid-argument");
@@ -1083,8 +1164,8 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
     const operatingDecision = action === "MANUAL_CHECK_IN"
       ? await attendanceCheckInPolicyDecision(checkInAt)
       : null;
-    if (action === "MANUAL_CHECK_IN" && operatingDecision && !operatingDecision.ok && !reason) {
-      throw callableError("manual-check-in-requires-reason", "failed-precondition");
+    if (action === "MANUAL_CHECK_IN" && operatingDecision && operatingDecision.reason === "taska-closed") {
+      throw callableError("taska-closed-today", "failed-precondition");
     }
     const dayInfo = attendanceDayInfoFromDateKey(attendanceDate);
     const canonicalAttendanceId = `${dayInfo.key}_${childId}`;
@@ -1114,6 +1195,7 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
       const existing = attendanceSnap.exists ? (attendanceSnap.data() || {}) : {};
       const existingCheckIn = attendanceHasCheckIn(existing) ? (existing.checkInAt || existing.check_in_time || null) : null;
       const existingCheckOut = attendanceHasCheckOut(existing) ? (existing.checkOutAt || existing.check_out_time || null) : null;
+      const existingCheckoutTeacher = attendanceTeacherSnapshotFromRecord(existing);
       const hadCompletedRecord = Boolean(existingCheckOut);
 
       let nextCheckIn = existingCheckIn;
@@ -1121,6 +1203,7 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
       let nextStatus = attendanceStatusValue(existing);
       let nextCheckInMethod = existing.checkInMethod || existing.checkin_method || null;
       let nextCheckOutMethod = existing.checkOutMethod || existing.checkout_method || null;
+      let nextCheckoutTeacher = existingCheckoutTeacher;
 
       if (action === "MANUAL_CHECK_IN") {
         if (existingCheckIn) {
@@ -1131,6 +1214,7 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
         nextStatus = "CHECKED_IN";
         nextCheckInMethod = "MANUAL";
         nextCheckOutMethod = null;
+        nextCheckoutTeacher = null;
       } else if (action === "MANUAL_CHECK_OUT") {
         if (!existingCheckIn) {
           throw callableError("attendance-not-checked-in", "failed-precondition");
@@ -1145,12 +1229,19 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
         nextCheckOut = admin.firestore.Timestamp.fromDate(resolvedOut);
         nextStatus = "CHECKED_OUT";
         nextCheckOutMethod = "MANUAL";
+        nextCheckoutTeacher = await attendanceResolveTeacherSnapshot({
+          tx,
+          db,
+          requestedTeacher: requestedCheckoutTeacher,
+          required: true,
+        });
       } else if (action === "MARK_ABSENT") {
         nextCheckIn = null;
         nextCheckOut = null;
         nextStatus = "NOT_CHECKED_IN";
         nextCheckInMethod = null;
         nextCheckOutMethod = null;
+        nextCheckoutTeacher = null;
       } else if (action === "REOPEN_RECORD") {
         if (!existingCheckOut) {
           throw callableError("attendance-not-closed", "failed-precondition");
@@ -1158,6 +1249,7 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
         nextCheckOut = null;
         nextStatus = existingCheckIn ? "CHECKED_IN" : "NOT_CHECKED_IN";
         nextCheckOutMethod = null;
+        nextCheckoutTeacher = null;
       } else if (action === "EDIT_RECORD") {
         const editedCheckIn = attendanceTimestampField(req.data && req.data.checkInAt, "check-in-at", false);
         const editedCheckOut = attendanceTimestampField(req.data && req.data.checkOutAt, "check-out-at", false);
@@ -1177,7 +1269,28 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
         nextCheckInMethod = editedCheckIn ? "MANUAL" : null;
         nextCheckOutMethod = editedCheckOut ? "MANUAL" : null;
         nextStatus = editedCheckOut ? "CHECKED_OUT" : (editedCheckIn ? "CHECKED_IN" : "NOT_CHECKED_IN");
+
+        if (nextCheckOut) {
+          if (checkoutTeacherSelectionProvided) {
+            nextCheckoutTeacher = await attendanceResolveTeacherSnapshot({
+              tx,
+              db,
+              requestedTeacher: requestedCheckoutTeacher,
+              required: true,
+            });
+          } else {
+            nextCheckoutTeacher = existingCheckoutTeacher;
+          }
+          if (!nextCheckoutTeacher && (editedCheckOut || hadCompletedRecord)) {
+            throw callableError("missing-checkout-teacher", "invalid-argument");
+          }
+        } else {
+          nextCheckoutTeacher = null;
+        }
       }
+
+      const checkoutTimeChanged = timestampMillis(existingCheckOut) !== timestampMillis(nextCheckOut);
+      const checkoutTeacherChanged = !attendanceTeacherSnapshotEquals(existingCheckoutTeacher, nextCheckoutTeacher);
 
       tx.set(attendanceRef, {
         attendanceId,
@@ -1213,6 +1326,10 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
         checkedOutByUid: nextCheckOut ? actor.uid : null,
         checkedOutByRole: nextCheckOut ? actor.role : null,
         checkedOutByName: nextCheckOut ? actor.displayName : null,
+        checkedOutByEmail: nextCheckOut ? actor.email : null,
+        checkedOutByTeacherId: nextCheckOut && nextCheckoutTeacher ? nextCheckoutTeacher.teacherId : null,
+        checkedOutByTeacherName: nextCheckOut && nextCheckoutTeacher ? nextCheckoutTeacher.teacherName : null,
+        checkedOutByTeacherEmail: nextCheckOut && nextCheckoutTeacher ? nextCheckoutTeacher.teacherEmail : null,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         createdAt: existing.createdAt || admin.firestore.FieldValue.serverTimestamp(),
         lastEditedBy: actor.uid,
@@ -1256,6 +1373,14 @@ exports.attendanceAdminOverride = onCall({ region: "asia-southeast1" }, async (r
           previousCheckOutAt: existingCheckOut,
           nextCheckInAt: nextCheckIn,
           nextCheckOutAt: nextCheckOut,
+          previousCheckoutTeacherId: existingCheckoutTeacher ? existingCheckoutTeacher.teacherId : "",
+          previousCheckoutTeacherName: existingCheckoutTeacher ? existingCheckoutTeacher.teacherName : "",
+          previousCheckoutTeacherEmail: existingCheckoutTeacher ? existingCheckoutTeacher.teacherEmail : "",
+          nextCheckoutTeacherId: nextCheckoutTeacher ? nextCheckoutTeacher.teacherId : "",
+          nextCheckoutTeacherName: nextCheckoutTeacher ? nextCheckoutTeacher.teacherName : "",
+          nextCheckoutTeacherEmail: nextCheckoutTeacher ? nextCheckoutTeacher.teacherEmail : "",
+          checkoutTimeChanged,
+          checkoutTeacherChanged,
           operatingHoursDecision: operatingDecision ? operatingDecision.reason : "in_window",
           notes,
         },
@@ -1625,6 +1750,7 @@ function requireStaff(req) {
 
 const ATTENDANCE_TIME_ZONE = "Asia/Kuala_Lumpur";
 const ATTENDANCE_UTC_OFFSET_HOURS = 8;
+const ATTENDANCE_CLOSED_DAY_COLLECTION = "attendanceClosedDays";
 
 function attendanceActor(req, fallbackDisplayName = "") {
   const token = req && req.auth && req.auth.token ? req.auth.token : {};
@@ -1642,6 +1768,192 @@ function attendanceActor(req, fallbackDisplayName = "") {
     email: String(token.email || "").trim(),
     phoneE164: String(token.phone_number || "").trim(),
     displayName,
+  };
+}
+
+function attendanceRequestedCheckoutTeacher(data) {
+  return {
+    teacherId: String(
+      data && (
+        data.checkedOutByTeacherId
+        || data.checkoutTeacherId
+        || data.teacherId
+      )
+        ? (
+          data.checkedOutByTeacherId
+          || data.checkoutTeacherId
+          || data.teacherId
+        )
+        : "",
+    ).trim(),
+    teacherName: String(
+      data && (
+        data.checkedOutByTeacherName
+        || data.checkoutTeacherName
+        || data.teacherName
+      )
+        ? (
+          data.checkedOutByTeacherName
+          || data.checkoutTeacherName
+          || data.teacherName
+        )
+        : "",
+    ).trim(),
+    teacherEmail: String(
+      data && (
+        data.checkedOutByTeacherEmail
+        || data.checkoutTeacherEmail
+        || data.teacherEmail
+      )
+        ? (
+          data.checkedOutByTeacherEmail
+          || data.checkoutTeacherEmail
+          || data.teacherEmail
+        )
+        : "",
+    ).trim().toLowerCase(),
+  };
+}
+
+function attendanceCheckoutTeacherSelectionProvided(requestedTeacher) {
+  return Boolean(
+    requestedTeacher
+    && (requestedTeacher.teacherId || requestedTeacher.teacherEmail || requestedTeacher.teacherName),
+  );
+}
+
+function attendanceTeacherSnapshotFromActor(actor) {
+  if (!actor) {
+    return null;
+  }
+  const teacherId = String(actor.uid || "").trim();
+  const teacherEmail = String(actor.email || "").trim().toLowerCase();
+  const teacherName = String(actor.displayName || actor.email || actor.phoneE164 || "").trim();
+  if (!teacherId && !teacherEmail && !teacherName) {
+    return null;
+  }
+  return {
+    teacherId,
+    teacherName,
+    teacherEmail,
+  };
+}
+
+function attendanceTeacherSnapshotFromRecord(data) {
+  const teacherId = String(
+    data && (
+      data.checkedOutByTeacherId
+      || data.pickupVerifiedByTeacherId
+      || data.checkedOutByUid
+    )
+      ? (
+        data.checkedOutByTeacherId
+        || data.pickupVerifiedByTeacherId
+        || data.checkedOutByUid
+      )
+      : "",
+  ).trim();
+  const teacherName = String(
+    data && (
+      data.checkedOutByTeacherName
+      || data.pickupVerifiedByTeacherName
+      || data.checkedOutByName
+    )
+      ? (
+        data.checkedOutByTeacherName
+        || data.pickupVerifiedByTeacherName
+        || data.checkedOutByName
+      )
+      : "",
+  ).trim();
+  const teacherEmail = String(
+    data && (
+      data.checkedOutByTeacherEmail
+      || data.pickupVerifiedByTeacherEmail
+      || data.checkedOutByEmail
+    )
+      ? (
+        data.checkedOutByTeacherEmail
+        || data.pickupVerifiedByTeacherEmail
+        || data.checkedOutByEmail
+      )
+      : "",
+  ).trim().toLowerCase();
+  if (!teacherId && !teacherName && !teacherEmail) {
+    return null;
+  }
+  return {
+    teacherId,
+    teacherName,
+    teacherEmail,
+  };
+}
+
+function attendanceTeacherSnapshotEquals(left, right) {
+  const leftId = String(left && left.teacherId ? left.teacherId : "").trim();
+  const leftName = String(left && left.teacherName ? left.teacherName : "").trim();
+  const leftEmail = String(left && left.teacherEmail ? left.teacherEmail : "").trim().toLowerCase();
+  const rightId = String(right && right.teacherId ? right.teacherId : "").trim();
+  const rightName = String(right && right.teacherName ? right.teacherName : "").trim();
+  const rightEmail = String(right && right.teacherEmail ? right.teacherEmail : "").trim().toLowerCase();
+  return leftId === rightId && leftName === rightName && leftEmail === rightEmail;
+}
+
+async function attendanceResolveTeacherSnapshot({ tx, db, requestedTeacher, required = false, actorFallback = null }) {
+  const requested = requestedTeacher && typeof requestedTeacher === "object"
+    ? requestedTeacher
+    : { teacherId: "", teacherName: "", teacherEmail: "" };
+  const teacherId = String(requested.teacherId || "").trim();
+  const teacherEmail = String(requested.teacherEmail || "").trim().toLowerCase();
+  const teacherName = String(requested.teacherName || "").trim();
+
+  if (!teacherId && !teacherEmail) {
+    if (actorFallback) {
+      const teacherDoc = await findTeacherDocForAuth(db || admin.firestore(), {
+        uid: String(actorFallback.uid || "").trim(),
+        token: {
+          email: String(actorFallback.email || "").trim().toLowerCase(),
+          phone_number: String(actorFallback.phoneE164 || "").trim(),
+        },
+      });
+      if (teacherDoc) {
+        const teacherData = teacherDoc.data() || {};
+        return {
+          teacherId: String(teacherDoc.id || "").trim(),
+          teacherName: String(teacherData.name || actorFallback.displayName || teacherData.email || actorFallback.email || actorFallback.uid || "").trim(),
+          teacherEmail: String(teacherData.email || actorFallback.email || "").trim().toLowerCase(),
+        };
+      }
+      return attendanceTeacherSnapshotFromActor(actorFallback);
+    }
+    if (required) {
+      throw callableError("missing-checkout-teacher", "invalid-argument");
+    }
+    return null;
+  }
+
+  let teacherSnap = null;
+  if (teacherId) {
+    teacherSnap = tx
+      ? await tx.get(db.collection("teachers").doc(teacherId))
+      : await db.collection("teachers").doc(teacherId).get();
+    if (!teacherSnap.exists) {
+      throw callableError("teacher-not-found", "not-found");
+    }
+  } else {
+    const teacherQuery = db.collection("teachers").where("email", "==", teacherEmail).limit(1);
+    const teacherQuerySnap = tx ? await tx.get(teacherQuery) : await teacherQuery.get();
+    if (teacherQuerySnap.empty) {
+      throw callableError("teacher-not-found", "not-found");
+    }
+    teacherSnap = teacherQuerySnap.docs[0];
+  }
+
+  const teacherData = teacherSnap.data() || {};
+  return {
+    teacherId: String(teacherSnap.id || teacherId).trim(),
+    teacherName: String(teacherData.name || teacherName || teacherData.email || teacherEmail || teacherId).trim(),
+    teacherEmail: String(teacherData.email || teacherEmail || "").trim().toLowerCase(),
   };
 }
 
@@ -1921,6 +2233,9 @@ function attendanceResolvedPayload(data, docId = "") {
     reason: manualReason,
     checkedInByName: String(attendanceData.checkedInByName || "").trim(),
     checkedOutByName: String(attendanceData.checkedOutByName || "").trim(),
+    checkedOutByTeacherId: String(attendanceData.checkedOutByTeacherId || "").trim(),
+    checkedOutByTeacherName: String(attendanceData.checkedOutByTeacherName || attendanceData.pickupVerifiedByTeacherName || "").trim(),
+    checkedOutByTeacherEmail: String(attendanceData.checkedOutByTeacherEmail || attendanceData.pickupVerifiedByTeacherEmail || "").trim().toLowerCase(),
     auditMetadata: {
       lastAction: String(auditMetadata.lastAction || "").trim(),
       lastActorName: String(auditMetadata.lastActorName || "").trim(),
@@ -3050,9 +3365,92 @@ async function loadActiveFeeCatalog() {
   return fallback;
 }
 
-async function attendanceCheckInPolicyDecision(at) {
+async function attendanceResolvedPolicy() {
   const table = await loadActiveFeeCatalog();
-  const policy = feeEngine.resolveFeePolicy(table.policy || {});
+  return feeEngine.resolveFeePolicy(table.policy || {});
+}
+
+async function loadAttendanceClosedDay(dayInfo) {
+  const normalizedDayInfo = typeof dayInfo === "string"
+    ? attendanceDayInfoFromDateKey(dayInfo)
+    : (dayInfo && typeof dayInfo === "object" && dayInfo.key
+      ? dayInfo
+      : attendanceDayInfo(dayInfo || new Date()));
+  const snap = await admin.firestore()
+    .collection(ATTENDANCE_CLOSED_DAY_COLLECTION)
+    .doc(normalizedDayInfo.key)
+    .get();
+  if (!snap.exists) {
+    return null;
+  }
+
+  const data = snap.data() || {};
+  if (data.closed === false) {
+    return null;
+  }
+
+  return {
+    dateKey: normalizedDayInfo.key,
+    label: String(data.label || data.reason || "Public Holiday").trim(),
+    reason: String(data.reason || data.label || "Public Holiday").trim(),
+    message: String(data.message || "").trim(),
+  };
+}
+
+function attendanceScheduleClosedMessage(dayInfo, schedule) {
+  const label = String(schedule && schedule.label ? schedule.label : "today").trim();
+  return `Taska is closed on ${label}. Attendance is unavailable for ${dayInfo.key}.`;
+}
+
+function attendanceCustomClosedMessage(dayInfo, closure) {
+  const label = String(closure && (closure.label || closure.reason) ? (closure.label || closure.reason) : "").trim();
+  if (label) {
+    return `Taska is closed on ${dayInfo.key} (${label}). Attendance is unavailable for this date.`;
+  }
+  return `Taska is closed on ${dayInfo.key}. Attendance is unavailable for this date.`;
+}
+
+async function attendanceDayStatus(dateInput, resolvedPolicy = null) {
+  const dayInfo = typeof dateInput === "string"
+    ? attendanceDayInfoFromDateKey(dateInput)
+    : attendanceDayInfo(dateInput || new Date());
+  const policy = resolvedPolicy || await attendanceResolvedPolicy();
+  const schedule = feeEngine.getOperatingHoursForDate(dayInfo.startOfDayUtc, policy);
+  const customClosure = await loadAttendanceClosedDay(dayInfo);
+  const scheduleClosed = !schedule.isWorkingDay;
+  const closed = Boolean(customClosure) || scheduleClosed;
+  const message = customClosure
+    ? (customClosure.message || attendanceCustomClosedMessage(dayInfo, customClosure))
+    : (scheduleClosed ? attendanceScheduleClosedMessage(dayInfo, schedule) : "");
+
+  return {
+    ok: true,
+    dateKey: dayInfo.key,
+    closed,
+    customClosed: Boolean(customClosure),
+    scheduleClosed,
+    reason: closed ? "taska-closed" : "",
+    message,
+    scheduleLabel: String(schedule && schedule.label ? schedule.label : "").trim(),
+    closureLabel: customClosure
+      ? String(customClosure.label || customClosure.reason || "Public Holiday").trim()
+      : (scheduleClosed ? String(schedule && schedule.label ? schedule.label : "Closed Day").trim() : ""),
+    closureReason: customClosure
+      ? String(customClosure.reason || customClosure.label || "Public Holiday").trim()
+      : (scheduleClosed ? String(schedule && schedule.label ? schedule.label : "Closed Day").trim() : ""),
+  };
+}
+
+async function attendanceCheckInPolicyDecision(at) {
+  const policy = await attendanceResolvedPolicy();
+  const dayStatus = await attendanceDayStatus(at, policy);
+  if (dayStatus.closed) {
+    return {
+      ok: false,
+      reason: "taska-closed",
+      message: String(dayStatus.message || "Taska is closed today").trim(),
+    };
+  }
   return feeEngine.canCheckIn(at, policy);
 }
 
@@ -3363,26 +3761,16 @@ exports.billingAdminBackfillChildMetadata = onCall({ region: "asia-southeast1" }
 
 exports.salaryGetTeacherConfigForCurrentUser = onCall({ region: "asia-southeast1" }, async (req) => {
   requireAuth(req);
-
-  const phone = (req.auth.token && req.auth.token.phone_number)
-    ? String(req.auth.token.phone_number).trim()
-    : "";
-  if (!phone) return { ok: false, reason: "missing-phone" };
-
-  const tail = myTail(phone);
-  const local = tail ? `0${tail}` : "";
   const db = admin.firestore();
+  const teacherDoc = await findTeacherDocForAuth(db, req.auth);
+  if (!teacherDoc) return { ok: false, reason: "teacher-not-found" };
 
-  let snap = await db.collection("teachers").where("phoneE164", "==", phone).limit(1).get();
-  if (snap.empty && tail) snap = await db.collection("teachers").where("phoneTail", "==", tail).limit(1).get();
-  if (snap.empty && local) snap = await db.collection("teachers").where("phone", "==", local).limit(1).get();
-  if (snap.empty) return { ok: false, reason: "teacher-not-found" };
-
-  const d = snap.docs[0];
-  const t = d.data() || {};
+  const t = teacherDoc.data() || {};
+  const feePolicy = feeEngine.resolveFeePolicy((await loadActiveFeeCatalog()).policy || {});
+  const policySummary = teacherPayrollPolicySummary(feePolicy);
   return {
     ok: true,
-    teacherId: d.id,
+    teacherId: teacherDoc.id,
     salary: {
       currency: String(t.salaryCurrency || "MYR"),
       active: Boolean(t.salaryActive),
@@ -3391,7 +3779,1230 @@ exports.salaryGetTeacherConfigForCurrentUser = onCall({ region: "asia-southeast1
       overtime8to12Sen: moneySen(t.salaryOvertime8to12Sen),
       overtime12to7Sen: moneySen(t.salaryOvertime12to7Sen),
     },
+    payrollPolicy: policySummary,
   };
+});
+
+const TEACHER_OVERTIME_DAILY_COLLECTION = "teacherOvertimeDaily";
+const TEACHER_MONTHLY_PAYROLL_COLLECTION = "teacherMonthlyPayroll";
+
+function payrollCallableFailure(reason, options = {}) {
+  return billingCallableFailure(reason, options);
+}
+
+function payrollCallableFailureFromError(err, options = {}) {
+  return billingCallableFailureFromError(err, options);
+}
+
+async function findTeacherDocForAuth(db, auth) {
+  const authData = auth && typeof auth === "object" ? auth : {};
+  const token = authData.token && typeof authData.token === "object" ? authData.token : {};
+  const uid = String(authData.uid || "").trim();
+  const email = String(token.email || "").trim().toLowerCase();
+  const phone = String(token.phone_number || "").trim();
+  const tail = myTail(phone);
+  const local = tail ? `0${tail}` : "";
+
+  if (uid) {
+    const byId = await db.collection("teachers").doc(uid).get();
+    if (byId.exists) return byId;
+  }
+
+  if (email) {
+    const byEmail = await db.collection("teachers").where("email", "==", email).limit(1).get();
+    if (!byEmail.empty) return byEmail.docs[0];
+  }
+
+  if (phone) {
+    const byE164 = await db.collection("teachers").where("phoneE164", "==", phone).limit(1).get();
+    if (!byE164.empty) return byE164.docs[0];
+  }
+
+  if (tail) {
+    const byTail = await db.collection("teachers").where("phoneTail", "==", tail).limit(1).get();
+    if (!byTail.empty) return byTail.docs[0];
+  }
+
+  if (local) {
+    const byLocal = await db.collection("teachers").where("phone", "==", local).limit(1).get();
+    if (!byLocal.empty) return byLocal.docs[0];
+  }
+
+  return null;
+}
+
+function teacherPayrollDefaultPeriod(now = new Date()) {
+  return shiftPeriodKey(monthKey(now), -1) || monthKey(now);
+}
+
+function teacherPayrollNormalizePeriod(rawPeriod, fallbackPeriod = teacherPayrollDefaultPeriod()) {
+  const normalized = String(rawPeriod || "").trim();
+  if (!normalized) return fallbackPeriod;
+  if (!/^\d{4}-\d{2}$/.test(normalized)) {
+    throw callableError("invalid-period", "invalid-argument");
+  }
+  return normalized;
+}
+
+function teacherPayrollNormalizeDateKey(rawDateKey) {
+  const normalized = String(rawDateKey || "").trim();
+  if (!normalized) return "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    throw callableError("invalid-attendance-date", "invalid-argument");
+  }
+  return normalized;
+}
+
+function teacherPayrollRequestedTeacherIds(data) {
+  const requestData = data && typeof data === "object" ? data : {};
+  const plural = Array.isArray(requestData.teacherIds) ? uniqueSortedIds(requestData.teacherIds) : [];
+  if (plural.length) return plural;
+  const singular = String(requestData.teacherId || "").trim();
+  return singular ? [singular] : [];
+}
+
+function teacherPayrollMinuteLabel(minuteOfDay) {
+  const minutes = Number(minuteOfDay);
+  if (!Number.isFinite(minutes) || minutes < 0) return "";
+  const hour = Math.floor(minutes / 60);
+  const minute = minutes % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function teacherPayrollPolicySummary(policy = feeEngine.resolveFeePolicy({})) {
+  const resolvedPolicy = feeEngine.resolveFeePolicy(policy || {});
+  const weekdayClosingMinute = Number(
+    resolvedPolicy
+      && resolvedPolicy.operatingHours
+      && resolvedPolicy.operatingHours.weekday
+      && resolvedPolicy.operatingHours.weekday.closingMinute,
+  );
+  const saturdayClosingMinute = Number(
+    resolvedPolicy
+      && resolvedPolicy.operatingHours
+      && resolvedPolicy.operatingHours.saturday
+      && resolvedPolicy.operatingHours.saturday.closingMinute,
+  );
+  return {
+    policyVersion: String(resolvedPolicy.policyVersion || "TASKA_ZURAH_2026"),
+    currency: String(resolvedPolicy.currency || "MYR"),
+    weekdayHalfHourRateSen: moneySen(
+      resolvedPolicy
+        && resolvedPolicy.operatingHours
+        && resolvedPolicy.operatingHours.weekday
+        && resolvedPolicy.operatingHours.weekday.overtimeHalfHourRateSen,
+    ),
+    saturdayHalfHourRateSen: moneySen(
+      resolvedPolicy
+        && resolvedPolicy.operatingHours
+        && resolvedPolicy.operatingHours.saturday
+        && resolvedPolicy.operatingHours.saturday.overtimeHalfHourRateSen,
+    ),
+    weekdayClosingMinute: Number.isFinite(weekdayClosingMinute) ? weekdayClosingMinute : null,
+    saturdayClosingMinute: Number.isFinite(saturdayClosingMinute) ? saturdayClosingMinute : null,
+    weekdayClosingTimeLabel: teacherPayrollMinuteLabel(weekdayClosingMinute),
+    saturdayClosingTimeLabel: teacherPayrollMinuteLabel(saturdayClosingMinute),
+  };
+}
+
+function teacherPayrollPeriodBounds(period) {
+  const normalizedPeriod = teacherPayrollNormalizePeriod(period, "");
+  const match = normalizedPeriod.match(/^(\d{4})-(\d{2})$/);
+  if (!match) {
+    throw callableError("invalid-period", "invalid-argument");
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const startDate = feeEngine.malaysiaLocalDate(year, month - 1, 1, 0, 0, 0, 0);
+  const endDate = feeEngine.malaysiaLocalDate(year, month, 0, 23, 59, 59, 999);
+
+  return {
+    scope: "period",
+    period: normalizedPeriod,
+    startDate,
+    endDate,
+    startDateKey: feeEngine.malaysiaDateKey(startDate),
+    endDateKey: feeEngine.malaysiaDateKey(endDate),
+    periodLabel: periodLabel(normalizedPeriod),
+  };
+}
+
+function teacherPayrollSingleDayBounds(dateKey) {
+  const dayInfo = attendanceDayInfoFromDateKey(teacherPayrollNormalizeDateKey(dateKey));
+  const startDate = dayInfo.startOfDayUtc;
+  const endDate = feeEngine.malaysiaLocalDate(dayInfo.year, dayInfo.month - 1, dayInfo.day, 23, 59, 59, 999);
+  return {
+    scope: "day",
+    period: String(dayInfo.key || "").slice(0, 7),
+    dateKey: dayInfo.key,
+    startDate,
+    endDate,
+    startDateKey: dayInfo.key,
+    endDateKey: dayInfo.key,
+    periodLabel: periodLabel(String(dayInfo.key || "").slice(0, 7)),
+  };
+}
+
+function teacherPayrollBoundsFromRequest(data) {
+  const requestData = data && typeof data === "object" ? data : {};
+  const dateKey = teacherPayrollNormalizeDateKey(
+    requestData.dateKey || requestData.attendanceDate || requestData.date,
+  );
+  if (dateKey) {
+    return teacherPayrollSingleDayBounds(dateKey);
+  }
+  return teacherPayrollPeriodBounds(
+    teacherPayrollNormalizePeriod(requestData.period, teacherPayrollDefaultPeriod()),
+  );
+}
+
+function teacherPayrollDocId(period, teacherId) {
+  return `${String(period || "").trim()}_${String(teacherId || "").trim()}`;
+}
+
+function teacherOvertimeDailyDocId(dateKey, teacherId) {
+  return `${String(dateKey || "").trim()}_${String(teacherId || "").trim()}`;
+}
+
+function teacherPayrollStatusFromData(data) {
+  const current = String(data && data.status ? data.status : "").trim().toUpperCase();
+  if (current) return current;
+  if (data && data.paidAt) return "PAID";
+  if (data && data.reviewedAt) return "REVIEWED";
+  return "PENDING_REVIEW";
+}
+
+function teacherPayrollTeacherSnapshotFromAttendance(data) {
+  const teacherId = String(data && (
+    data.checkedOutByTeacherId
+    || data.pickupVerifiedByTeacherId
+  ) ? (
+    data.checkedOutByTeacherId
+    || data.pickupVerifiedByTeacherId
+  ) : "").trim();
+  const teacherName = String(data && (
+    data.checkedOutByTeacherName
+    || data.pickupVerifiedByTeacherName
+  ) ? (
+    data.checkedOutByTeacherName
+    || data.pickupVerifiedByTeacherName
+  ) : "").trim();
+  const teacherEmail = String(data && (
+    data.checkedOutByTeacherEmail
+    || data.pickupVerifiedByTeacherEmail
+  ) ? (
+    data.checkedOutByTeacherEmail
+    || data.pickupVerifiedByTeacherEmail
+  ) : "").trim().toLowerCase();
+  if (!teacherId && !teacherEmail && !teacherName) {
+    return null;
+  }
+  return {
+    teacherId,
+    teacherName,
+    teacherEmail,
+  };
+}
+
+function teacherPayrollTeacherRecordFromDoc(doc) {
+  const data = doc && typeof doc.data === "function" ? (doc.data() || {}) : {};
+  return {
+    teacherId: String(doc && doc.id ? doc.id : "").trim(),
+    teacherName: String(data.name || data.email || (doc && doc.id ? doc.id : "")).trim(),
+    teacherEmail: String(data.email || "").trim().toLowerCase(),
+    salaryActive: Boolean(data.salaryActive),
+    salaryBaseSen: moneySen(data.salaryBaseSen),
+    salaryCurrency: String(data.salaryCurrency || "MYR"),
+    status: String(data.status || (data.salaryActive ? "Active" : "Inactive")).trim(),
+    joinedDate: String(data.joinedDate || "").trim(),
+    createdAt: attendanceIsoString(data.createdAt),
+  };
+}
+
+function teacherPayrollNameKey(rawName) {
+  return String(rawName || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+async function loadTeacherPayrollRegistry({ db, teacherIds = [] } = {}) {
+  const firestore = db || admin.firestore();
+  const normalizedTeacherIds = uniqueSortedIds(teacherIds);
+  let teacherDocs = [];
+
+  if (normalizedTeacherIds.length > 0) {
+    teacherDocs = (await Promise.all(
+      normalizedTeacherIds.map((teacherId) => firestore.collection("teachers").doc(teacherId).get()),
+    )).filter((doc) => doc.exists);
+  } else {
+    const teacherSnap = await firestore.collection("teachers").get();
+    teacherDocs = teacherSnap.docs;
+  }
+
+  const teachers = teacherDocs.map((doc) => teacherPayrollTeacherRecordFromDoc(doc));
+  const byId = new Map();
+  const byEmail = new Map();
+  const byUniqueName = new Map();
+  const duplicateNameKeys = new Set();
+  for (const teacher of teachers) {
+    byId.set(teacher.teacherId, teacher);
+    if (teacher.teacherEmail) {
+      byEmail.set(teacher.teacherEmail, teacher);
+    }
+    const nameKey = teacherPayrollNameKey(teacher.teacherName);
+    if (nameKey) {
+      if (byUniqueName.has(nameKey)) {
+        byUniqueName.delete(nameKey);
+        duplicateNameKeys.add(nameKey);
+      } else if (!duplicateNameKeys.has(nameKey)) {
+        byUniqueName.set(nameKey, teacher);
+      }
+    }
+  }
+
+  const missingRequestedTeacherIds = normalizedTeacherIds.filter((teacherId) => !byId.has(teacherId));
+  return {
+    teachers,
+    byId,
+    byEmail,
+    byUniqueName,
+    missingRequestedTeacherIds,
+  };
+}
+
+function teacherPayrollResolveTeacher(snapshot, registry) {
+  const teacherSnapshot = snapshot && typeof snapshot === "object" ? snapshot : null;
+  if (!teacherSnapshot) return null;
+
+  const sourceTeacherId = String(teacherSnapshot.teacherId || "").trim();
+  const sourceTeacherName = String(teacherSnapshot.teacherName || "").trim();
+  const sourceTeacherEmail = String(teacherSnapshot.teacherEmail || "").trim().toLowerCase();
+  const sourceTeacherNameKey = teacherPayrollNameKey(sourceTeacherName);
+
+  const registryData = registry && typeof registry === "object"
+    ? registry
+    : { byId: new Map(), byEmail: new Map(), byUniqueName: new Map() };
+  let teacher = sourceTeacherId ? registryData.byId.get(sourceTeacherId) : null;
+  if (!teacher && sourceTeacherEmail) {
+    teacher = registryData.byEmail.get(sourceTeacherEmail) || null;
+  }
+  if (!teacher && sourceTeacherNameKey) {
+    teacher = registryData.byUniqueName.get(sourceTeacherNameKey) || null;
+  }
+
+  const teacherId = teacher ? teacher.teacherId : sourceTeacherId;
+  if (!teacherId && !sourceTeacherEmail) {
+    return null;
+  }
+
+  return {
+    teacherId,
+    teacherName: teacher ? teacher.teacherName : (sourceTeacherName || sourceTeacherEmail || sourceTeacherId),
+    teacherEmail: teacher ? teacher.teacherEmail : sourceTeacherEmail,
+    sourceTeacherId,
+    sourceTeacherName,
+    sourceTeacherEmail,
+    teacherFound: Boolean(teacher),
+    teacherRecord: teacher || null,
+  };
+}
+
+function teacherPayrollNormalizeAttendanceRow(doc, registry) {
+  const data = doc && typeof doc.data === "function" ? (doc.data() || {}) : {};
+  if (attendanceStatusValue(data) !== "CHECKED_OUT") {
+    return { ok: false, reason: "not-checked-out" };
+  }
+
+  const checkOutAt = attendanceTimestampToDate(
+    data.checkOutAt
+      || data.check_out_time
+      || data.checkOutTime
+      || data.checkoutTime,
+  );
+  if (!checkOutAt) {
+    return { ok: false, reason: "missing-checkout" };
+  }
+
+  const anchorDate = attendanceTimestampToDate(
+    data.date
+      || data.checkInAt
+      || data.check_in_time
+      || data.checkInTime,
+  ) || checkOutAt;
+  const dateKey = String(data.dateKey || feeEngine.malaysiaDateKey(anchorDate)).trim();
+  if (!dateKey) {
+    return { ok: false, reason: "missing-dateKey" };
+  }
+
+  const teacherSnapshot = teacherPayrollTeacherSnapshotFromAttendance(data);
+  if (!teacherSnapshot) {
+    return { ok: false, reason: "missing-teacher" };
+  }
+
+  const resolvedTeacher = teacherPayrollResolveTeacher(teacherSnapshot, registry);
+  if (!resolvedTeacher) {
+    return { ok: false, reason: "unresolved-teacher" };
+  }
+
+  return {
+    ok: true,
+    attendanceId: String(doc.id || "").trim(),
+    dateKey,
+    period: dateKey.slice(0, 7),
+    anchorDate,
+    checkOutAt,
+    childId: String(data.childId || "").trim(),
+    childName: attendanceChildName(data),
+    manualEditReason: String(data.manualEditReason || data.manual_edit_reason || "").trim(),
+    checkOutMethod: String(data.checkOutMethod || data.checkout_method || "").trim(),
+    ...resolvedTeacher,
+  };
+}
+
+function teacherPayrollDailyEntrySummary(data) {
+  const entry = data && typeof data === "object" ? data : {};
+  return {
+    dailyId: String(entry.dailyId || "").trim(),
+    dateKey: String(entry.dateKey || "").trim(),
+    dayType: String(entry.dayType || "").trim(),
+    blocks: Number(entry.blocks || 0),
+    paidMinutes: Number(entry.paidMinutes || 0),
+    rawMinutes: Number(entry.rawMinutes || 0),
+    totalSen: moneySen(entry.totalSen),
+    rateSen: moneySen(entry.rateSen),
+    latestCheckoutAt: entry.latestCheckoutAt || null,
+    latestAttendanceId: String(entry.latestAttendanceId || "").trim(),
+    latestChildId: String(entry.latestChildId || "").trim(),
+    latestChildName: String(entry.latestChildName || "").trim(),
+    attendanceCount: Number(entry.attendanceCount || 0),
+    childIds: uniqueSortedIds(entry.childIds || []),
+    childNames: Array.from(new Set((Array.isArray(entry.childNames) ? entry.childNames : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean))),
+    closingTimeLabel: String(entry.closingTimeLabel || "").trim(),
+    overtimeHalfHourRateCode: String(entry.overtimeHalfHourRateCode || "").trim(),
+    teacherMissing: Boolean(entry.teacherMissing),
+  };
+}
+
+function teacherPayrollBuildDailyEntry(group, feePolicy, policySummary, actor, generatedByKind) {
+  const rows = Array.isArray(group && group.rows) ? group.rows : [];
+  if (!rows.length) {
+    return null;
+  }
+
+  let latestRow = rows[0];
+  for (const row of rows) {
+    if (row && row.checkOutAt && latestRow && latestRow.checkOutAt && row.checkOutAt.getTime() > latestRow.checkOutAt.getTime()) {
+      latestRow = row;
+    }
+  }
+
+  const overtime = feeEngine.calculateOvertimeForAttendance({
+    date: latestRow.anchorDate,
+    checkOutAt: latestRow.checkOutAt,
+  }, feePolicy);
+  if (!overtime.applies) {
+    return null;
+  }
+
+  const schedule = feeEngine.getOperatingHoursForDate(latestRow.anchorDate, feePolicy);
+  const childIds = uniqueSortedIds(rows.map((row) => row.childId).filter(Boolean));
+  const childNames = Array.from(new Set(rows
+    .map((row) => String(row.childName || "").trim())
+    .filter(Boolean)));
+
+  const dailyId = teacherOvertimeDailyDocId(group.dateKey, group.teacherId);
+  return {
+    docId: dailyId,
+    data: {
+      dailyId,
+      teacherId: group.teacherId,
+      teacherName: group.teacherName,
+      teacherEmail: group.teacherEmail,
+      sourceTeacherId: group.sourceTeacherId,
+      sourceTeacherName: group.sourceTeacherName,
+      sourceTeacherEmail: group.sourceTeacherEmail,
+      teacherMissing: Boolean(group.teacherMissing),
+      teacherStatus: String(group.teacherStatus || "").trim(),
+      salaryActive: Boolean(group.salaryActive),
+      dateKey: group.dateKey,
+      period: group.dateKey.slice(0, 7),
+      dayType: String(overtime.dayType || "").trim(),
+      scheduleLabel: String(schedule && schedule.label ? schedule.label : "").trim(),
+      closingMinute: Number.isFinite(Number(overtime.closingMinute)) ? Number(overtime.closingMinute) : null,
+      closingTimeLabel: String(overtime.closingTimeLabel || "").trim(),
+      blocks: Number(overtime.blocks || 0),
+      paidMinutes: Number(overtime.minutes || 0),
+      rawMinutes: Number(overtime.rawMinutes || 0),
+      totalSen: moneySen(overtime.totalSen),
+      rateSen: moneySen(overtime.rateSen),
+      overtimeHalfHourRateCode: String(overtime.overtimeHalfHourRateCode || "").trim(),
+      latestCheckoutAt: admin.firestore.Timestamp.fromDate(latestRow.checkOutAt),
+      latestAttendanceId: latestRow.attendanceId,
+      latestChildId: latestRow.childId,
+      latestChildName: latestRow.childName,
+      attendanceCount: rows.length,
+      attendanceIds: rows.map((row) => row.attendanceId).filter(Boolean),
+      childIds,
+      childNames,
+      manualAdjustmentPresent: rows.some((row) => Boolean(row.manualEditReason)),
+      policy: policySummary,
+      policyVersion: String(policySummary.policyVersion || "TASKA_ZURAH_2026"),
+      generatedByKind: String(generatedByKind || "manual").trim(),
+      generatedByUid: String(actor && actor.uid ? actor.uid : "").trim(),
+      generatedByName: String(actor && actor.displayName ? actor.displayName : "").trim(),
+      generatedByEmail: String(actor && actor.email ? actor.email : "").trim().toLowerCase(),
+      generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+  };
+}
+
+function teacherPayrollDailyDocResponse(data, docId = "") {
+  const entry = data && typeof data === "object" ? data : {};
+  return {
+    dailyId: String(docId || entry.dailyId || "").trim(),
+    period: String(entry.period || "").trim(),
+    dateKey: String(entry.dateKey || "").trim(),
+    teacherId: String(entry.teacherId || "").trim(),
+    teacherName: String(entry.teacherName || "").trim(),
+    teacherEmail: String(entry.teacherEmail || "").trim().toLowerCase(),
+    sourceTeacherId: String(entry.sourceTeacherId || "").trim(),
+    sourceTeacherName: String(entry.sourceTeacherName || "").trim(),
+    sourceTeacherEmail: String(entry.sourceTeacherEmail || "").trim().toLowerCase(),
+    teacherMissing: Boolean(entry.teacherMissing),
+    teacherStatus: String(entry.teacherStatus || "").trim(),
+    salaryActive: Boolean(entry.salaryActive),
+    dayType: String(entry.dayType || "").trim(),
+    scheduleLabel: String(entry.scheduleLabel || "").trim(),
+    closingMinute: Number.isFinite(Number(entry.closingMinute)) ? Number(entry.closingMinute) : null,
+    closingTimeLabel: String(entry.closingTimeLabel || "").trim(),
+    blocks: Number(entry.blocks || 0),
+    paidMinutes: Number(entry.paidMinutes || 0),
+    rawMinutes: Number(entry.rawMinutes || 0),
+    totalSen: moneySen(entry.totalSen),
+    rateSen: moneySen(entry.rateSen),
+    overtimeHalfHourRateCode: String(entry.overtimeHalfHourRateCode || "").trim(),
+    latestCheckoutAt: attendanceIsoString(entry.latestCheckoutAt),
+    latestAttendanceId: String(entry.latestAttendanceId || "").trim(),
+    latestChildId: String(entry.latestChildId || "").trim(),
+    latestChildName: String(entry.latestChildName || "").trim(),
+    attendanceCount: Number(entry.attendanceCount || 0),
+    attendanceIds: uniqueSortedIds(entry.attendanceIds || []),
+    childIds: uniqueSortedIds(entry.childIds || []),
+    childNames: Array.from(new Set((Array.isArray(entry.childNames) ? entry.childNames : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean))),
+    manualAdjustmentPresent: Boolean(entry.manualAdjustmentPresent),
+    policy: entry.policy && typeof entry.policy === "object" ? entry.policy : {},
+    generatedAt: attendanceIsoString(entry.generatedAt),
+    generatedByKind: String(entry.generatedByKind || "").trim(),
+    generatedByUid: String(entry.generatedByUid || "").trim(),
+    generatedByName: String(entry.generatedByName || "").trim(),
+    generatedByEmail: String(entry.generatedByEmail || "").trim().toLowerCase(),
+    updatedAt: attendanceIsoString(entry.updatedAt),
+    createdAt: attendanceIsoString(entry.createdAt),
+  };
+}
+
+function teacherPayrollDocResponse(data, docId = "") {
+  const payroll = data && typeof data === "object" ? data : {};
+  const overtimeEntries = Array.isArray(payroll.overtimeEntries)
+    ? payroll.overtimeEntries.map((entry) => ({
+      ...teacherPayrollDailyDocResponse(entry, entry && entry.dailyId ? entry.dailyId : ""),
+      dailyId: String(entry && entry.dailyId ? entry.dailyId : "").trim(),
+    }))
+    : [];
+
+  return {
+    payrollId: String(docId || payroll.payrollId || "").trim(),
+    period: String(payroll.period || "").trim(),
+    periodLabel: String(payroll.periodLabel || periodLabel(payroll.period || "")).trim(),
+    teacherId: String(payroll.teacherId || "").trim(),
+    teacherName: String(payroll.teacherName || "").trim(),
+    teacherEmail: String(payroll.teacherEmail || "").trim().toLowerCase(),
+    teacherStatus: String(payroll.teacherStatus || "").trim(),
+    salaryActive: Boolean(payroll.salaryActive),
+    joinedDate: String(payroll.joinedDate || "").trim(),
+    baseSalarySen: moneySen(payroll.baseSalarySen),
+    overtimeTotalSen: moneySen(payroll.overtimeTotalSen),
+    totalPaySen: moneySen(payroll.totalPaySen),
+    currency: String(payroll.currency || "MYR").trim(),
+    overtimeDayCount: Number(payroll.overtimeDayCount || 0),
+    weekdayBlocks: Number(payroll.weekdayBlocks || 0),
+    saturdayBlocks: Number(payroll.saturdayBlocks || 0),
+    totalBlocks: Number(payroll.totalBlocks || 0),
+    status: teacherPayrollStatusFromData(payroll),
+    policy: payroll.policy && typeof payroll.policy === "object" ? payroll.policy : {},
+    overtimeEntries,
+    generatedAt: attendanceIsoString(payroll.generatedAt),
+    generatedByKind: String(payroll.generatedByKind || "").trim(),
+    generatedByUid: String(payroll.generatedByUid || "").trim(),
+    generatedByName: String(payroll.generatedByName || "").trim(),
+    generatedByEmail: String(payroll.generatedByEmail || "").trim().toLowerCase(),
+    reviewedAt: attendanceIsoString(payroll.reviewedAt),
+    reviewedByUid: String(payroll.reviewedByUid || "").trim(),
+    reviewedByName: String(payroll.reviewedByName || "").trim(),
+    reviewedByEmail: String(payroll.reviewedByEmail || "").trim().toLowerCase(),
+    paidAt: attendanceIsoString(payroll.paidAt),
+    paidByUid: String(payroll.paidByUid || "").trim(),
+    paidByName: String(payroll.paidByName || "").trim(),
+    paidByEmail: String(payroll.paidByEmail || "").trim().toLowerCase(),
+    paymentReference: String(payroll.paymentReference || "").trim(),
+    paymentNote: String(payroll.paymentNote || "").trim(),
+    updatedAt: attendanceIsoString(payroll.updatedAt),
+    createdAt: attendanceIsoString(payroll.createdAt),
+  };
+}
+
+function teacherPayrollActor(req, fallbackDisplayName = "") {
+  return attendanceActor(req, fallbackDisplayName);
+}
+
+function teacherPayrollSystemActor(displayName = "Payroll Scheduler") {
+  return {
+    uid: "system-teacher-payroll",
+    role: "system",
+    email: "",
+    phoneE164: "",
+    displayName: String(displayName || "Payroll Scheduler").trim(),
+  };
+}
+
+async function rebuildTeacherOvertimeDaily({ period, dateKey = "", teacherIds = [], actor = null, generatedByKind = "manual" } = {}) {
+  const db = admin.firestore();
+  const bounds = dateKey
+    ? teacherPayrollSingleDayBounds(dateKey)
+    : teacherPayrollPeriodBounds(teacherPayrollNormalizePeriod(period, teacherPayrollDefaultPeriod()));
+  const normalizedTeacherIds = uniqueSortedIds(teacherIds);
+  const selectedTeacherSet = new Set(normalizedTeacherIds);
+  const registry = await loadTeacherPayrollRegistry({ db, teacherIds: normalizedTeacherIds });
+  const activeCatalog = await loadActiveFeeCatalog();
+  const feePolicy = feeEngine.resolveFeePolicy(activeCatalog.policy || {});
+  const policySummary = teacherPayrollPolicySummary(feePolicy);
+
+  const attendanceSnap = await db.collection("attendance")
+    .where("date", ">=", bounds.startDate)
+    .where("date", "<=", bounds.endDate)
+    .get();
+
+  const normalizedRows = [];
+  const skipped = {
+    notCheckedOut: 0,
+    missingCheckout: 0,
+    missingDateKey: 0,
+    missingTeacher: 0,
+    unresolvedTeacher: 0,
+    filteredTeacher: 0,
+  };
+  const unresolvedAttendance = [];
+
+  for (const doc of attendanceSnap.docs) {
+    const row = teacherPayrollNormalizeAttendanceRow(doc, registry);
+    if (!row.ok) {
+      switch (row.reason) {
+        case "not-checked-out":
+          skipped.notCheckedOut += 1;
+          break;
+        case "missing-checkout":
+          skipped.missingCheckout += 1;
+          break;
+        case "missing-dateKey":
+          skipped.missingDateKey += 1;
+          break;
+        case "missing-teacher":
+          skipped.missingTeacher += 1;
+          break;
+        default:
+          skipped.unresolvedTeacher += 1;
+          break;
+      }
+      unresolvedAttendance.push({
+        attendanceId: String(doc.id || "").trim(),
+        reason: String(row.reason || "unknown").trim(),
+      });
+      continue;
+    }
+
+    if (selectedTeacherSet.size > 0 && !selectedTeacherSet.has(row.teacherId)) {
+      skipped.filteredTeacher += 1;
+      continue;
+    }
+    normalizedRows.push(row);
+  }
+
+  const groups = new Map();
+  for (const row of normalizedRows) {
+    const key = teacherOvertimeDailyDocId(row.dateKey, row.teacherId);
+    const current = groups.get(key) || {
+      teacherId: row.teacherId,
+      teacherName: row.teacherName,
+      teacherEmail: row.teacherEmail,
+      sourceTeacherId: row.sourceTeacherId,
+      sourceTeacherName: row.sourceTeacherName,
+      sourceTeacherEmail: row.sourceTeacherEmail,
+      teacherMissing: !row.teacherFound,
+      teacherStatus: row.teacherRecord ? row.teacherRecord.status : "",
+      salaryActive: row.teacherRecord ? row.teacherRecord.salaryActive : false,
+      dateKey: row.dateKey,
+      rows: [],
+    };
+    current.rows.push(row);
+    if (!current.teacherName && row.teacherName) current.teacherName = row.teacherName;
+    if (!current.teacherEmail && row.teacherEmail) current.teacherEmail = row.teacherEmail;
+    groups.set(key, current);
+  }
+
+  const desiredEntries = new Map();
+  let noOvertimeCount = 0;
+  for (const group of groups.values()) {
+    const entry = teacherPayrollBuildDailyEntry(group, feePolicy, policySummary, actor, generatedByKind);
+    if (!entry) {
+      noOvertimeCount += 1;
+      continue;
+    }
+    desiredEntries.set(entry.docId, entry.data);
+  }
+
+  const existingSnap = await db.collection(TEACHER_OVERTIME_DAILY_COLLECTION)
+    .where("period", "==", bounds.period)
+    .get();
+  const existingDocs = existingSnap.docs.filter((doc) => {
+    const data = doc.data() || {};
+    if (bounds.scope === "day" && String(data.dateKey || "").trim() !== bounds.dateKey) {
+      return false;
+    }
+    if (selectedTeacherSet.size > 0 && !selectedTeacherSet.has(String(data.teacherId || "").trim())) {
+      return false;
+    }
+    return true;
+  });
+  const existingById = new Map(existingDocs.map((doc) => [doc.id, doc]));
+
+  const batch = db.batch();
+  let writeCount = 0;
+  let deleteCount = 0;
+
+  for (const [docId, data] of desiredEntries.entries()) {
+    const existingDoc = existingById.get(docId);
+    batch.set(db.collection(TEACHER_OVERTIME_DAILY_COLLECTION).doc(docId), {
+      ...data,
+      createdAt: existingDoc && existingDoc.get("createdAt")
+        ? existingDoc.get("createdAt")
+        : admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    writeCount += 1;
+  }
+
+  for (const doc of existingDocs) {
+    if (!desiredEntries.has(doc.id)) {
+      batch.delete(doc.ref);
+      deleteCount += 1;
+    }
+  }
+
+  if (writeCount > 0 || deleteCount > 0) {
+    await batch.commit();
+  }
+
+  const entries = Array.from(desiredEntries.entries())
+    .map(([docId, data]) => teacherPayrollDailyDocResponse(data, docId))
+    .sort((left, right) => {
+      if (left.dateKey !== right.dateKey) return left.dateKey.localeCompare(right.dateKey);
+      return left.teacherName.localeCompare(right.teacherName);
+    });
+
+  return {
+    ok: true,
+    scope: bounds.scope,
+    period: bounds.period,
+    periodLabel: bounds.periodLabel,
+    dateKey: bounds.scope === "day" ? bounds.dateKey : "",
+    attendanceScannedCount: attendanceSnap.size,
+    attendanceMatchedCount: normalizedRows.length,
+    groupedCount: groups.size,
+    noOvertimeCount,
+    writtenCount: writeCount,
+    deletedCount: deleteCount,
+    skipped,
+    missingRequestedTeacherIds: registry.missingRequestedTeacherIds,
+    unresolvedAttendance: unresolvedAttendance.slice(0, 25),
+    entries: entries.slice(0, 50),
+    policy: policySummary,
+  };
+}
+
+async function generateTeacherMonthlyPayrollInternal({ period, teacherIds = [], actor = null, generatedByKind = "manual" } = {}) {
+  const db = admin.firestore();
+  const normalizedPeriod = teacherPayrollNormalizePeriod(period, teacherPayrollDefaultPeriod());
+  const normalizedTeacherIds = uniqueSortedIds(teacherIds);
+  const selectedTeacherSet = new Set(normalizedTeacherIds);
+
+  const dailyResult = await rebuildTeacherOvertimeDaily({
+    period: normalizedPeriod,
+    teacherIds: normalizedTeacherIds,
+    actor,
+    generatedByKind,
+  });
+
+  const registry = await loadTeacherPayrollRegistry({ db, teacherIds: normalizedTeacherIds });
+  const activeCatalog = await loadActiveFeeCatalog();
+  const feePolicy = feeEngine.resolveFeePolicy(activeCatalog.policy || {});
+  const policySummary = teacherPayrollPolicySummary(feePolicy);
+
+  const dailySnap = await db.collection(TEACHER_OVERTIME_DAILY_COLLECTION)
+    .where("period", "==", normalizedPeriod)
+    .get();
+  const dailyRows = dailySnap.docs
+    .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
+    .filter((row) => {
+      if (selectedTeacherSet.size === 0) return true;
+      return selectedTeacherSet.has(String(row.teacherId || "").trim());
+    });
+
+  const dailyByTeacher = new Map();
+  for (const row of dailyRows) {
+    const teacherId = String(row.teacherId || "").trim();
+    if (!teacherId) continue;
+    const current = dailyByTeacher.get(teacherId) || [];
+    current.push(row);
+    dailyByTeacher.set(teacherId, current);
+  }
+
+  const existingPayrollSnap = await db.collection(TEACHER_MONTHLY_PAYROLL_COLLECTION)
+    .where("period", "==", normalizedPeriod)
+    .get();
+  const existingById = new Map(existingPayrollSnap.docs.map((doc) => [doc.id, doc]));
+
+  const batch = db.batch();
+  let createdCount = 0;
+  let updatedCount = 0;
+  let skippedInactiveCount = 0;
+  let skippedMissingBaseSalaryCount = 0;
+
+  const teachers = registry.teachers.filter((teacher) => {
+    if (selectedTeacherSet.size === 0) return true;
+    return selectedTeacherSet.has(teacher.teacherId);
+  });
+
+  for (const teacher of teachers) {
+    if (!teacher.salaryActive) {
+      skippedInactiveCount += 1;
+      continue;
+    }
+    if (teacher.salaryBaseSen <= 0) {
+      skippedMissingBaseSalaryCount += 1;
+      continue;
+    }
+
+    const payrollId = teacherPayrollDocId(normalizedPeriod, teacher.teacherId);
+    const existingDoc = existingById.get(payrollId);
+    const existingData = existingDoc ? (existingDoc.data() || {}) : {};
+    const overtimeEntries = (dailyByTeacher.get(teacher.teacherId) || [])
+      .map((entry) => teacherPayrollDailyEntrySummary({ ...entry, dailyId: entry.id || entry.dailyId || "" }))
+      .sort((left, right) => left.dateKey.localeCompare(right.dateKey));
+
+    const overtimeTotalSen = moneySen(overtimeEntries.reduce((sum, entry) => sum + moneySen(entry.totalSen), 0));
+    const weekdayBlocks = overtimeEntries
+      .filter((entry) => String(entry.dayType || "").trim().toUpperCase() !== "SATURDAY")
+      .reduce((sum, entry) => sum + Number(entry.blocks || 0), 0);
+    const saturdayBlocks = overtimeEntries
+      .filter((entry) => String(entry.dayType || "").trim().toUpperCase() === "SATURDAY")
+      .reduce((sum, entry) => sum + Number(entry.blocks || 0), 0);
+    const totalBlocks = weekdayBlocks + saturdayBlocks;
+
+    batch.set(db.collection(TEACHER_MONTHLY_PAYROLL_COLLECTION).doc(payrollId), {
+      payrollId,
+      period: normalizedPeriod,
+      periodLabel: periodLabel(normalizedPeriod),
+      teacherId: teacher.teacherId,
+      teacherName: teacher.teacherName,
+      teacherEmail: teacher.teacherEmail,
+      teacherStatus: teacher.status,
+      salaryActive: teacher.salaryActive,
+      joinedDate: teacher.joinedDate,
+      baseSalarySen: teacher.salaryBaseSen,
+      overtimeTotalSen,
+      totalPaySen: moneySen(teacher.salaryBaseSen + overtimeTotalSen),
+      currency: teacher.salaryCurrency || "MYR",
+      overtimeDayCount: overtimeEntries.length,
+      weekdayBlocks,
+      saturdayBlocks,
+      totalBlocks,
+      overtimeEntries,
+      policy: policySummary,
+      generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      generatedByKind: String(generatedByKind || "manual").trim(),
+      generatedByUid: String(actor && actor.uid ? actor.uid : "").trim(),
+      generatedByName: String(actor && actor.displayName ? actor.displayName : "").trim(),
+      generatedByEmail: String(actor && actor.email ? actor.email : "").trim().toLowerCase(),
+      reviewedAt: existingData.reviewedAt || null,
+      reviewedByUid: String(existingData.reviewedByUid || "").trim(),
+      reviewedByName: String(existingData.reviewedByName || "").trim(),
+      reviewedByEmail: String(existingData.reviewedByEmail || "").trim().toLowerCase(),
+      paidAt: existingData.paidAt || null,
+      paidByUid: String(existingData.paidByUid || "").trim(),
+      paidByName: String(existingData.paidByName || "").trim(),
+      paidByEmail: String(existingData.paidByEmail || "").trim().toLowerCase(),
+      paymentReference: String(existingData.paymentReference || "").trim(),
+      paymentNote: String(existingData.paymentNote || "").trim(),
+      status: teacherPayrollStatusFromData(existingData),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: existingData.createdAt || admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    if (existingDoc) {
+      updatedCount += 1;
+    } else {
+      createdCount += 1;
+    }
+  }
+
+  if (createdCount > 0 || updatedCount > 0) {
+    await batch.commit();
+  }
+
+  const payrollSnap = await db.collection(TEACHER_MONTHLY_PAYROLL_COLLECTION)
+    .where("period", "==", normalizedPeriod)
+    .get();
+  const payrolls = payrollSnap.docs
+    .map((doc) => teacherPayrollDocResponse(doc.data() || {}, doc.id))
+    .filter((payroll) => {
+      if (selectedTeacherSet.size === 0) return true;
+      return selectedTeacherSet.has(payroll.teacherId);
+    })
+    .sort((left, right) => left.teacherName.localeCompare(right.teacherName));
+
+  const unresolvedDailyEntries = dailyRows
+    .filter((row) => Boolean(row.teacherMissing))
+    .map((row) => teacherPayrollDailyDocResponse(row, row.id || row.dailyId || ""))
+    .slice(0, 25);
+
+  return {
+    ok: true,
+    period: normalizedPeriod,
+    periodLabel: periodLabel(normalizedPeriod),
+    createdCount,
+    updatedCount,
+    skippedInactiveCount,
+    skippedMissingBaseSalaryCount,
+    payrollCount: payrolls.length,
+    totalBaseSen: moneySen(payrolls.reduce((sum, payroll) => sum + moneySen(payroll.baseSalarySen), 0)),
+    totalOvertimeSen: moneySen(payrolls.reduce((sum, payroll) => sum + moneySen(payroll.overtimeTotalSen), 0)),
+    totalPaySen: moneySen(payrolls.reduce((sum, payroll) => sum + moneySen(payroll.totalPaySen), 0)),
+    payrolls,
+    dailyResult,
+    unresolvedDailyEntries,
+    missingRequestedTeacherIds: registry.missingRequestedTeacherIds,
+    policy: policySummary,
+  };
+}
+
+function teacherPayrollResolveDocRef(db, data) {
+  const requestData = data && typeof data === "object" ? data : {};
+  const payrollId = String(requestData.payrollId || "").trim();
+  if (payrollId) {
+    return db.collection(TEACHER_MONTHLY_PAYROLL_COLLECTION).doc(payrollId);
+  }
+
+  const teacherId = String(requestData.teacherId || "").trim();
+  const period = teacherPayrollNormalizePeriod(requestData.period, "");
+  if (!teacherId || !period) {
+    throw callableError("missing-payroll-target", "invalid-argument");
+  }
+  return db.collection(TEACHER_MONTHLY_PAYROLL_COLLECTION).doc(teacherPayrollDocId(period, teacherId));
+}
+
+exports.calculateTeacherDailyOvertime = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+    const data = req.data && typeof req.data === "object" ? req.data : {};
+    const bounds = teacherPayrollBoundsFromRequest(data);
+    return await rebuildTeacherOvertimeDaily({
+      period: bounds.period,
+      dateKey: bounds.scope === "day" ? bounds.dateKey : "",
+      teacherIds: teacherPayrollRequestedTeacherIds(data),
+      actor: teacherPayrollActor(req, "Payroll Admin"),
+      generatedByKind: "admin-callable",
+    });
+  } catch (err) {
+    logger.error("calculateTeacherDailyOvertime failed", err);
+    return payrollCallableFailureFromError(err);
+  }
+});
+
+exports.generateTeacherMonthlyPayroll = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+    const data = req.data && typeof req.data === "object" ? req.data : {};
+    return await generateTeacherMonthlyPayrollInternal({
+      period: teacherPayrollNormalizePeriod(data.period, teacherPayrollDefaultPeriod()),
+      teacherIds: teacherPayrollRequestedTeacherIds(data),
+      actor: teacherPayrollActor(req, "Payroll Admin"),
+      generatedByKind: "admin-callable",
+    });
+  } catch (err) {
+    logger.error("generateTeacherMonthlyPayroll failed", err);
+    return payrollCallableFailureFromError(err);
+  }
+});
+
+exports.getTeacherPayrollSummary = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+    const data = req.data && typeof req.data === "object" ? req.data : {};
+    const period = teacherPayrollNormalizePeriod(data.period, teacherPayrollDefaultPeriod());
+    const teacherIds = teacherPayrollRequestedTeacherIds(data);
+    const selectedTeacherSet = new Set(teacherIds);
+    const generateIfMissing = Boolean(data.generateIfMissing);
+    const db = admin.firestore();
+
+    let payrollSnap = await db.collection(TEACHER_MONTHLY_PAYROLL_COLLECTION)
+      .where("period", "==", period)
+      .get();
+
+    if (generateIfMissing && payrollSnap.empty) {
+      await generateTeacherMonthlyPayrollInternal({
+        period,
+        teacherIds,
+        actor: teacherPayrollActor(req, "Payroll Admin"),
+        generatedByKind: "admin-callable",
+      });
+      payrollSnap = await db.collection(TEACHER_MONTHLY_PAYROLL_COLLECTION)
+        .where("period", "==", period)
+        .get();
+    }
+
+    const payrolls = payrollSnap.docs
+      .map((doc) => teacherPayrollDocResponse(doc.data() || {}, doc.id))
+      .filter((payroll) => selectedTeacherSet.size === 0 || selectedTeacherSet.has(payroll.teacherId))
+      .sort((left, right) => left.teacherName.localeCompare(right.teacherName));
+
+    const dailySnap = await db.collection(TEACHER_OVERTIME_DAILY_COLLECTION)
+      .where("period", "==", period)
+      .get();
+    const unresolvedDailyCount = dailySnap.docs.filter((doc) => {
+      const row = doc.data() || {};
+      if (selectedTeacherSet.size > 0 && !selectedTeacherSet.has(String(row.teacherId || "").trim())) {
+        return false;
+      }
+      return Boolean(row.teacherMissing);
+    }).length;
+
+    const activeCatalog = await loadActiveFeeCatalog();
+    const policy = teacherPayrollPolicySummary(feeEngine.resolveFeePolicy(activeCatalog.policy || {}));
+
+    return {
+      ok: true,
+      period,
+      periodLabel: periodLabel(period),
+      payrolls,
+      teacherCount: payrolls.length,
+      reviewedCount: payrolls.filter((payroll) => payroll.status === "REVIEWED" || payroll.status === "PAID").length,
+      paidCount: payrolls.filter((payroll) => payroll.status === "PAID").length,
+      unresolvedDailyCount,
+      totalBaseSen: moneySen(payrolls.reduce((sum, payroll) => sum + moneySen(payroll.baseSalarySen), 0)),
+      totalOvertimeSen: moneySen(payrolls.reduce((sum, payroll) => sum + moneySen(payroll.overtimeTotalSen), 0)),
+      totalPaySen: moneySen(payrolls.reduce((sum, payroll) => sum + moneySen(payroll.totalPaySen), 0)),
+      policy,
+    };
+  } catch (err) {
+    logger.error("getTeacherPayrollSummary failed", err);
+    return payrollCallableFailureFromError(err);
+  }
+});
+
+exports.getTeacherPayrollForTeacher = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAuth(req);
+    const data = req.data && typeof req.data === "object" ? req.data : {};
+    const token = req.auth && req.auth.token ? req.auth.token : {};
+    const role = String(token.role || "").trim().toLowerCase();
+    if (role !== "admin" && role !== "teacher") {
+      throw callableError("teacher-or-admin-only", "permission-denied");
+    }
+
+    const db = admin.firestore();
+    let teacherDoc = null;
+    if (role === "admin") {
+      const requestedTeacherId = String(data.teacherId || "").trim();
+      if (!requestedTeacherId) {
+        return payrollCallableFailure("missing-teacherId", {
+          message: "teacherId is required for admin payroll lookups.",
+        });
+      }
+      const snap = await db.collection("teachers").doc(requestedTeacherId).get();
+      if (!snap.exists) {
+        return payrollCallableFailure("teacher-not-found", { code: "not-found" });
+      }
+      teacherDoc = snap;
+    } else {
+      teacherDoc = await findTeacherDocForAuth(db, req.auth);
+      if (!teacherDoc) {
+        return payrollCallableFailure("teacher-not-found", { code: "not-found" });
+      }
+    }
+
+    const requestedPeriodRaw = String(data.period || "").trim();
+    const limitRaw = Number(data.limit || 6);
+    const limit = Math.max(1, Math.min(12, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 6));
+    const activeCatalog = await loadActiveFeeCatalog();
+    const policy = teacherPayrollPolicySummary(feeEngine.resolveFeePolicy(activeCatalog.policy || {}));
+
+    if (requestedPeriodRaw) {
+      const period = teacherPayrollNormalizePeriod(requestedPeriodRaw, "");
+      const payrollRef = db.collection(TEACHER_MONTHLY_PAYROLL_COLLECTION).doc(teacherPayrollDocId(period, teacherDoc.id));
+      const payrollSnap = await payrollRef.get();
+      const payroll = payrollSnap.exists ? teacherPayrollDocResponse(payrollSnap.data() || {}, payrollSnap.id) : null;
+      return {
+        ok: true,
+        teacherId: teacherDoc.id,
+        teacherName: String((teacherDoc.data() || {}).name || "").trim(),
+        period,
+        payroll,
+        payrolls: payroll ? [payroll] : [],
+        policy,
+      };
+    }
+
+    const payrollSnap = await db.collection(TEACHER_MONTHLY_PAYROLL_COLLECTION)
+      .where("teacherId", "==", teacherDoc.id)
+      .get();
+    const payrolls = payrollSnap.docs
+      .map((doc) => teacherPayrollDocResponse(doc.data() || {}, doc.id))
+      .sort((left, right) => right.period.localeCompare(left.period))
+      .slice(0, limit);
+
+    return {
+      ok: true,
+      teacherId: teacherDoc.id,
+      teacherName: String((teacherDoc.data() || {}).name || "").trim(),
+      payroll: payrolls.length ? payrolls[0] : null,
+      payrolls,
+      policy,
+    };
+  } catch (err) {
+    logger.error("getTeacherPayrollForTeacher failed", err);
+    return payrollCallableFailureFromError(err);
+  }
+});
+
+exports.markTeacherPayrollReviewed = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+    const data = req.data && typeof req.data === "object" ? req.data : {};
+    const db = admin.firestore();
+    const payrollRef = teacherPayrollResolveDocRef(db, data);
+    const payrollSnap = await payrollRef.get();
+    if (!payrollSnap.exists) {
+      return payrollCallableFailure("payroll-not-found", { code: "not-found" });
+    }
+
+    const current = payrollSnap.data() || {};
+    if (current.reviewedAt) {
+      return {
+        ok: true,
+        alreadyReviewed: true,
+        payroll: teacherPayrollDocResponse(current, payrollSnap.id),
+      };
+    }
+
+    const actor = teacherPayrollActor(req, "Payroll Admin");
+    const reviewNote = String(data.reviewNote || data.note || "").trim();
+    await payrollRef.set({
+      reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+      reviewedByUid: String(actor.uid || "").trim(),
+      reviewedByName: String(actor.displayName || "").trim(),
+      reviewedByEmail: String(actor.email || "").trim().toLowerCase(),
+      reviewNote,
+      status: current.paidAt ? "PAID" : "REVIEWED",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    const updatedSnap = await payrollRef.get();
+    return {
+      ok: true,
+      payroll: teacherPayrollDocResponse(updatedSnap.data() || {}, updatedSnap.id),
+    };
+  } catch (err) {
+    logger.error("markTeacherPayrollReviewed failed", err);
+    return payrollCallableFailureFromError(err);
+  }
+});
+
+exports.markTeacherPayrollPaid = onCall({ region: "asia-southeast1" }, async (req) => {
+  try {
+    requireAdmin(req);
+    const data = req.data && typeof req.data === "object" ? req.data : {};
+    const db = admin.firestore();
+    const payrollRef = teacherPayrollResolveDocRef(db, data);
+    const payrollSnap = await payrollRef.get();
+    if (!payrollSnap.exists) {
+      return payrollCallableFailure("payroll-not-found", { code: "not-found" });
+    }
+
+    const current = payrollSnap.data() || {};
+    if (current.paidAt) {
+      return {
+        ok: true,
+        alreadyPaid: true,
+        payroll: teacherPayrollDocResponse(current, payrollSnap.id),
+      };
+    }
+
+    const actor = teacherPayrollActor(req, "Payroll Admin");
+    const paidAtRaw = String(data.paidAt || "").trim();
+    const paidAtDate = paidAtRaw ? new Date(paidAtRaw) : null;
+    if (paidAtRaw && Number.isNaN(paidAtDate.getTime())) {
+      throw callableError("invalid-paidAt", "invalid-argument");
+    }
+    const reviewTimestamp = current.reviewedAt
+      || (paidAtDate ? admin.firestore.Timestamp.fromDate(paidAtDate) : admin.firestore.FieldValue.serverTimestamp());
+
+    await payrollRef.set({
+      reviewedAt: reviewTimestamp,
+      reviewedByUid: String(current.reviewedByUid || actor.uid || "").trim(),
+      reviewedByName: String(current.reviewedByName || actor.displayName || "").trim(),
+      reviewedByEmail: String(current.reviewedByEmail || actor.email || "").trim().toLowerCase(),
+      paidAt: paidAtDate ? admin.firestore.Timestamp.fromDate(paidAtDate) : admin.firestore.FieldValue.serverTimestamp(),
+      paidByUid: String(actor.uid || "").trim(),
+      paidByName: String(actor.displayName || "").trim(),
+      paidByEmail: String(actor.email || "").trim().toLowerCase(),
+      paymentReference: String(data.paymentReference || "").trim(),
+      paymentNote: String(data.paymentNote || data.note || "").trim(),
+      status: "PAID",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    const updatedSnap = await payrollRef.get();
+    return {
+      ok: true,
+      payroll: teacherPayrollDocResponse(updatedSnap.data() || {}, updatedSnap.id),
+    };
+  } catch (err) {
+    logger.error("markTeacherPayrollPaid failed", err);
+    return payrollCallableFailureFromError(err);
+  }
+});
+
+exports.generateTeacherMonthlyPayrollScheduled = onSchedule({
+  region: "asia-southeast1",
+  schedule: "0 1 1 * *",
+  timeZone: ATTENDANCE_TIME_ZONE,
+}, async () => {
+  const period = teacherPayrollDefaultPeriod(new Date());
+  const result = await generateTeacherMonthlyPayrollInternal({
+    period,
+    actor: teacherPayrollSystemActor(),
+    generatedByKind: "scheduled",
+  });
+  logger.info("generateTeacherMonthlyPayrollScheduled success", {
+    period,
+    payrollCount: result.payrollCount,
+    createdCount: result.createdCount,
+    updatedCount: result.updatedCount,
+  });
+  return result;
 });
 
 function startOfMonth(d) {

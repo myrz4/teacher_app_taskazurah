@@ -2,8 +2,8 @@
 //
 // ✅ Firestore SDK version (uses FirebaseFirestore directly)
 // ✅ Reads teacher profile directly from Firestore under current teacher permissions
-// ✅ Fixes Timestamp display issue for join_date
-// ✅ Displays profile photo, name, email, phone, class, experience, join date, salary & tips
+// ✅ Fixes Timestamp display issue for joinedDate and join_date fallbacks
+// ✅ Displays profile photo, name, email, phone, experience, join date, salary & bonus summary
 
 import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
@@ -14,7 +14,8 @@ class ProfileScreen extends StatefulWidget {
   final String teacherUsername;
   final String teacherDocId;
 
-  const ProfileScreen({super.key, required this.teacherUsername, required this.teacherDocId});
+  const ProfileScreen(
+      {super.key, required this.teacherUsername, required this.teacherDocId});
 
   @override
   State<ProfileScreen> createState() => _ProfileScreenState();
@@ -82,12 +83,30 @@ class _ProfileScreenState extends State<ProfileScreen> {
       final date = value.toDate();
       return "${date.day} ${DateFormat('MMMM yyyy').format(date)}";
     }
+    if (value is DateTime) {
+      return "${value.day} ${DateFormat('MMMM yyyy').format(value)}";
+    }
+    final parsed = DateTime.tryParse(value.toString());
+    if (parsed != null) {
+      return "${parsed.day} ${DateFormat('MMMM yyyy').format(parsed)}";
+    }
     return value.toString();
+  }
+
+  String _formatSalary(Map<String, dynamic> data) {
+    final salaryBaseSen = data['salaryBaseSen'];
+    if (salaryBaseSen != null) {
+      return 'RM${(_safeToDouble(salaryBaseSen) / 100).toStringAsFixed(2)}';
+    }
+
+    final legacyBaseSalary = _safeToDouble(data['base_salary']);
+    return 'RM${legacyBaseSalary.toStringAsFixed(2)}';
   }
 
   @override
   Widget build(BuildContext context) {
     final data = teacherData ?? {};
+    final displayHandle = (data['email'] ?? '').toString().trim();
 
     return Scaffold(
       appBar: AppBar(
@@ -157,25 +176,29 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       ),
                       const SizedBox(height: 8),
 
-                      // 🧾 Username
-                      Text(
-                        "@${data['username'] ?? '-'}",
-                        style: const TextStyle(
-                          color: Colors.black54,
-                          fontSize: 16,
+                      if (displayHandle.isNotEmpty) ...[
+                        Text(
+                          displayHandle,
+                          style: const TextStyle(
+                            color: Colors.black54,
+                            fontSize: 16,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 30),
+                        const SizedBox(height: 30),
+                      ] else
+                        const SizedBox(height: 30),
 
                       // 📋 Info Tiles
                       _infoTile("Email", data['email'] ?? '-'),
                       _infoTile("Phone", data['phone'] ?? '-'),
                       _infoTile("Experience", data['experience'] ?? '-'),
-                      _infoTile("Joined Date", _formatDate(data['join_date'])),
-                      _infoTile("Base Salary",
-                          "RM${data['base_salary']?.toString() ?? '0'}"),
+                      _infoTile(
+                        "Joined Date",
+                        _formatDate(data['joinedDate'] ?? data['join_date']),
+                      ),
+                      _infoTile("Base Salary", _formatSalary(data)),
 
-                        // 💰 Tips value already stored on teacher profile if available
+                      // 💰 Bonus value already stored on teacher profile if available
                       _infoTile("Tips (Total Bonus)",
                           "RM${totalBonus.toStringAsFixed(2)}"),
                     ],
